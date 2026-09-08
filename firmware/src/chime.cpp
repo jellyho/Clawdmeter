@@ -12,10 +12,15 @@ static I2SClass      i2s;
 static ChimeConfig   cfg;
 static bool          ready   = false;
 static volatile bool playing = false;
+// Kept past init so the volume register stays reachable: the codec is the
+// only place the level lives, and re-creating the handle would re-run the
+// whole init sequence just to write one register.
+static es8311_handle_t codec = nullptr;
 
 static bool es8311_setup(void) {
     es8311_handle_t es = es8311_create(0, cfg.es8311_addr);   // I2C port 0 (shared Wire bus)
     if (!es) return false;
+    codec = es;
     // mclk_inverted, sclk_inverted, mclk_from_mclk_pin, mclk_frequency, sample_frequency
     const es8311_clock_config_t clk = {
         false, false, true, cfg.sample_rate * 256, cfg.sample_rate
@@ -61,6 +66,13 @@ void chime_play(void) {
     playing = true;
     if (xTaskCreatePinnedToCore(chime_task, "chime", 4096, nullptr, 1, nullptr, 0) != pdPASS)
         playing = false;   // couldn't spawn — stay silent rather than wedge the flag
+}
+
+void chime_set_volume(uint8_t volume) {
+    if (!codec) return;                       // no codec on this board, or init failed
+    if (volume > 100) volume = 100;
+    cfg.volume = volume;                      // so a later re-init keeps the level
+    es8311_voice_volume_set(codec, (int)volume, NULL);
 }
 
 void chime_tick(void) {}   // playback runs in chime_task; nothing to poll

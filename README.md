@@ -28,7 +28,7 @@ The **Sessions** tab shows every Claude Code chat you have open: what it is doin
 
 This tab needs the session sidecar on the host — see [`daemon/SESSIONS.md`](daemon/SESSIONS.md). Without it the tab is still in the swipe ring but has nothing to list ("No active sessions"); boards too small to host chat cards never have it in their swipe order at all. More than three live sessions scroll: drag the list vertically — the swipe ring only listens to horizontal drags, so the two never fight.
 
-The **Settings** tab holds the preferences that used to require a reflash: the reset chime, auto-jump, whether the device boots to the splash, the clock format, and screen brightness. Each one is written to flash the moment you change it, so they survive a power cut.
+The **Settings** tab holds the preferences that used to require a reflash: the reset chime and its volume, auto-jump, whether the device boots to the splash, the clock format, and screen brightness. Each one is written to flash the moment you change it, so they survive a power cut. Rows that a board cannot honour are not shown at all, so a port with no speaker has no chime rows.
 
 While the splash is up, the PWR button cycles animations. **Hold the power button for 3 seconds, then release, to put the device into pairing mode** — this clears the saved Bluetooth bond and re-advertises. The firmware also auto-rotates animations every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
 

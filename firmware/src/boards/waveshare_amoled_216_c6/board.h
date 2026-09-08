@@ -51,11 +51,32 @@
 #define BTN_BACK_GPIO        9
 #define BTN_FWD_GPIO         10
 
+// ---- Audio (ES8311 codec + hardwired amplifier + speaker) ----
+// Same codec part as the S3 2.16, so the shared chime engine drives it
+// unchanged. Pins from Waveshare's own 07_Audio_Test examples (Arduino and
+// ESP-IDF) and the XiaoZhi board config, which agree with each other and
+// with every display/touch/I2C pin already verified on this hardware.
+// An ES7210 mic ADC also sits at 0x40; unused here.
+//
+// There is NO power-amp enable line on this board -- Waveshare's configs all
+// give pa = -1 / GPIO_NUM_NC -- so the amp is always on and sound.cpp passes
+// a null amp_enable hook, which chime.cpp explicitly supports.
+#define SND_I2S_MCLK         19
+#define SND_I2S_BCLK         20
+#define SND_I2S_WS           22     // LRCK
+#define SND_I2S_DOUT         23     // ESP -> ES8311 (speaker)
+#define SND_I2S_DIN          21     // ES8311 -> ESP (mic; unused, set for STD mode)
+#define SND_SAMPLE_RATE      44100  // must match the embedded PCM in bell_pcm.h
+#define SND_ES8311_ADDR      0x18
+
 // ---- Capability flags ----
 #define BOARD_HAS_SECONDARY_BUTTON 1
 #define BOARD_HAS_ROTATION         0    // C6 has no PSRAM headroom for the rotation strip
 #define BOARD_HAS_IMU              1    // present + initialized for I2C bus health
 #define BOARD_HAS_BATTERY          1
-#define BOARD_HAS_IO_EXPANDER      0    // TCA9554 exists on board but only services audio
-#define BOARD_HAS_SOUND            0    // no audio path wired up (sound.cpp no-ops)
-#define BOARD_HAS_SESSION_VIEWS    0   // same geometry as the S3 2.16; flip after a reorder-smoothness check on hardware
+#define BOARD_HAS_IO_EXPANDER      0    // no expander: audio needs no enable line either
+#define BOARD_HAS_SOUND            1    // ES8311 + amp + speaker; see SND_* above
+#define BOARD_HAS_SESSION_VIEWS    1   // same 480x480 geometry as the S3 2.16, so the
+                                       // chat cards lay out unchanged. Costs a bigger LVGL
+                                       // pool (see -DLV_MEM_SIZE in this board's env) out of
+                                       // internal SRAM, since the C6 has no PSRAM.

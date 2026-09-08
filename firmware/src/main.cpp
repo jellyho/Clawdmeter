@@ -249,6 +249,7 @@ void setup() {
     power_hal_init();
     imu_hal_init();
     sound_hal_init();
+    sound_hal_set_volume(settings_volume());   // no-op where there is no codec
     touch_hal_init();
 
     // ---- LVGL ----
@@ -428,6 +429,18 @@ void loop() {
         last_pct = pct;
         last_charging = charging;
         ui_update_battery(pct, charging);
+    }
+
+    // The settings screen writes straight to NVS, so the cheapest way to notice
+    // a volume change is to compare it here rather than thread a callback back
+    // out of the UI. One byte compare per iteration.
+    {
+        static uint8_t applied_volume = 0xFF;
+        uint8_t v = settings_volume();
+        if (v != applied_volume) {
+            applied_volume = v;
+            sound_hal_set_volume(v);
+        }
     }
 
     check_serial_cmd();

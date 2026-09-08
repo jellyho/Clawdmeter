@@ -29,5 +29,10 @@ bool chime_init(const ChimeConfig& cfg);
 // or already playing.
 void chime_play(void);
 
+// Set the codec's output volume, 0..100. Takes effect on the next playback
+// (and immediately for a clip already streaming). No-op if the codec never
+// came up, so a caller never has to ask whether the board has a speaker.
+void chime_set_volume(uint8_t volume);
+
 // Currently a no-op (playback runs in its own task); kept for HAL symmetry.
 void chime_tick(void);

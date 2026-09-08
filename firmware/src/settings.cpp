@@ -13,6 +13,11 @@
 // value; entry 0 is the default and must be the "don't override anything"
 // option wherever the firmware had a behaviour before the setting existed.
 static const char* const CLOCK_CHOICES[] = { "Auto", "24h", "12h" };
+static const char* const VOLUME_CHOICES[] = { "Low", "Med", "High" };
+
+// ES8311 output-register levels behind those three labels. Med is the value
+// every board's ChimeConfig used to hard-code, so an upgrade sounds the same.
+static const uint8_t VOLUME_LEVELS[] = { 40, 65, 90 };
 
 // The single source of truth for the settings surface. One row per entry, in
 // screen order; adding a setting is a line here plus a member in setting_id_t.
@@ -31,6 +36,8 @@ struct SettingSpec {
 static const SettingSpec SPECS[] = {
     { SETTING_KIND_BOOL,   "snd_en",  1, 2, NULL, "Sound",
       "Chime when the session limit resets" },
+    { SETTING_KIND_CHOICE, "snd_vol", 1, 3, VOLUME_CHOICES, "Volume",
+      "How loud the chime is" },
     { SETTING_KIND_BOOL,   "jump_en", 1, 2, NULL, "Auto-jump",
       "Open sessions when one needs you" },
     { SETTING_KIND_BOOL,   "splash",  1, 2, NULL, "Boot splash",
@@ -126,6 +133,12 @@ void settings_init(void) {
 // ---- Typed accessors ----
 
 bool settings_sound_enabled(void)     { return get_raw(SETTING_SOUND) != 0; }
+
+uint8_t settings_volume(void) {
+    uint8_t i = get_raw(SETTING_VOLUME);
+    if (i >= sizeof(VOLUME_LEVELS)) i = 1;   // corrupt byte -> Med
+    return VOLUME_LEVELS[i];
+}
 bool settings_auto_jump_enabled(void) { return get_raw(SETTING_AUTO_JUMP) != 0; }
 bool settings_splash_boot(void)       { return get_raw(SETTING_SPLASH_BOOT) != 0; }
 

@@ -230,6 +230,9 @@ static void compute_layout(const BoardCaps& c) {
 // the chat views (it stays null elsewhere, and the tab ring skips it).
 static lv_obj_t* sessions_container = nullptr;
 static lv_obj_t* settings_container = nullptr;
+// The rows live in their own scroll region so the list can outgrow the panel.
+// It already does: six rows do not fit 480x480, and a 240x240 board fits three.
+static lv_obj_t* set_rows_cont = nullptr;
 
 // ---- Usage screen widgets ----
 static lv_obj_t* usage_container;
@@ -1734,6 +1737,7 @@ static uint8_t       set_row_count = 0;
 static bool setting_row_visible(setting_id_t id) {
     switch (id) {
     case SETTING_SOUND:     return board_caps().has_sound;
+    case SETTING_VOLUME:    return board_caps().has_sound;
     case SETTING_AUTO_JUMP: return board_caps().has_session_views;
     default:                return true;
     }
@@ -1795,7 +1799,29 @@ static void init_settings_screen(lv_obj_t* scr) {
     }
     const int text_w = L.content_w - 2 * L.panel_pad_x - pill_w - 12;
 
-    int y = L.content_y;
+    // Scrollable row column below the title, mirroring the chat list on the
+    // sessions tab: vertical only, so a horizontal swipe is still delivered as
+    // a gesture and keeps changing tabs. The AUTO scrollbar is the standing cue
+    // that there are more rows, and it disappears when they all fit.
+    set_rows_cont = lv_obj_create(settings_container);
+    lv_obj_set_pos(set_rows_cont, 0, L.content_y);
+    lv_obj_set_size(set_rows_cont, L.scr_w, L.scr_h - L.content_y);
+    lv_obj_set_style_bg_opa(set_rows_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(set_rows_cont, 0, 0);
+    lv_obj_set_style_pad_all(set_rows_cont, 0, 0);
+    lv_obj_add_flag(set_rows_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(set_rows_cont, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(set_rows_cont, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_color(set_rows_cont, COL_DIM, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(set_rows_cont, LV_OPA_50, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(set_rows_cont, 4, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(set_rows_cont, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_right(set_rows_cont, 6, LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_top(set_rows_cont, 6, LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_bottom(set_rows_cont, 6, LV_PART_SCROLLBAR);
+    lv_obj_add_flag(set_rows_cont, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    int y = 0;
     set_row_count = 0;
     for (uint8_t i = 0; i < settings_count(); i++) {
         SettingRow s;
@@ -1804,7 +1830,7 @@ static void init_settings_screen(lv_obj_t* scr) {
 
         SettingsRowUi* r = &set_rows[set_row_count];
         r->id = s.id;
-        r->panel = make_panel(settings_container, L.margin, y, L.content_w, L.set_row_h);
+        r->panel = make_panel(set_rows_cont, L.margin, y, L.content_w, L.set_row_h);
         lv_obj_set_style_pad_top(r->panel, L.set_row_pad_y, 0);
         lv_obj_set_style_pad_bottom(r->panel, L.set_row_pad_y, 0);
         // The row owns its click; nothing above it needs to hear about it.
