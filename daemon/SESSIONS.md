@@ -99,7 +99,8 @@ The payload is `{"ss":[...]}` with one positional row per session, already
 sorted attention-first (waiting, working, idle; most recent first within each):
 
 ```
-[sid, label, state, ctx, elapsed_s, model, tool, ntools, nagents, tdone, ttotal, tok]
+[sid, label, state, ctx, elapsed_s, model, tool, ntools, nagents, tdone, ttotal, tok,
+ remote]
 ```
 
 | # | Field | Meaning |
@@ -115,9 +116,43 @@ sorted attention-first (waiting, working, idle; most recent first within each):
 | 8 | `nagents` | Subagents currently in flight |
 | 9–10 | `tdone` / `ttotal` | Todo counts; badge hidden when `ttotal` is 0 |
 | 11 | `tok` | Context tokens used, in 1k units (rounded to nearest) — the absolute number behind `ctx`, from the same transcript read. `-1` exactly when `ctx` is `-1` |
+| 12 | `remote` | Remote Control **enabled** for this session: `1` on, `0` off, `-1` unknown (the roster hasn't been read yet, or couldn't be). Read the honesty note below before putting a badge on it |
 
 Fields are append-only: firmware ignores indices it doesn't know, and new
-fields only ever go on the end.
+fields only ever go on the end. Each appended field costs ~2–3 bytes per row
+out of `sessions_budget_bytes`; the fitter measures the encoded row, so the
+cost is paid in label eliding and, past the 8-char floor, in dropping the
+least-urgent row — never by going over budget.
+
+### What the Remote Control flag does and doesn't mean
+
+Claude Code writes a per-session record to `<config-dir>/sessions/<pid>.json`.
+When a bridge handle is installed — Remote Control proper, the SDK-hosted
+bridge, or a supervised child of a bridge session — that record gains a
+`bridgeSessionId`; tearing the bridge down or switching Remote Control off
+writes it back to `null`. The sidecar reads that field on the same roster pass
+it already does for liveness, turns it into a boolean, and drops the id (it is
+a server-side identifier the device has no use for).
+
+So the flag is precise about one thing and silent about two others:
+
+- **It says Remote Control is enabled**, i.e. this session has a bridge and
+  could be driven remotely.
+- **It cannot say whether anyone is attached right now.** Whether a phone or a
+  browser tab is actually connected lives only on Anthropic's servers (their
+  sessions API reports it as `connection_status` / `worker_status`); there is
+  no local signal for it, and the sidecar makes no network calls to find out.
+  A `1` does not mean "someone is watching this chat".
+- **It may be uniformly true.** On accounts where the server-side auto-start
+  rollout is active, Remote Control starts for *every* interactive session, so
+  every row reports `1` and the flag stops distinguishing anything. Treat it as
+  a property of the account as much as of the session.
+
+`-1` means the roster could not be consulted (no readable
+`<config-dir>/sessions/`, or the first sweep hasn't run yet) — it is
+deliberately distinct from a confirmed `0`, the same way `ctx`/`tok` use `-1`.
+An unreadable roster freezes the last reading rather than downgrading it to
+`0`, matching how liveness and roster-supplied labels behave.
 
 ## Config reference
 
@@ -140,6 +175,9 @@ rosters and transcripts across several Claude config dirs.
   activity timeout, so a chat parked on a permission prompt survives
   indefinitely. Roster absence is acted on after a 30 s grace; a 6 h staleness
   sweep backstops an unreadable roster.
+- **Remote Control is "enabled", not "attached".** See the wire-format note
+  above: the flag comes from the roster's `bridgeSessionId`, and no local
+  signal exists for whether a remote client is connected.
 - **Context % is a heuristic** read from the transcript tail
   (`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`),
   re-read on SessionStart/Stop/PostCompact. Good for a glanceable bar, not for

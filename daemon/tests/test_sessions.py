@@ -15,8 +15,10 @@ from daemon.clawdmeter_sessions import (
     STATE_STARTING, STATE_IDLE, STATE_THINKING, STATE_RESPONDING,
     STATE_RUNNING_TOOL, STATE_COMPACTING, STATE_WAITING_PERMISSION,
     STATE_WAITING_QUESTION, STATE_WAITING_INPUT, STATE_ERROR,
+    REMOTE_OFF, REMOTE_ON, REMOTE_UNKNOWN,
     SessionTable, compute_window, context_percent, elide_label,
-    encode_payload, fit_payload, model_code, state_bucket, tokens_k, tool_code,
+    encode_payload, fit_payload, model_code, remote_flag, state_bucket,
+    tokens_k, tool_code,
 )
 
 SID = "a3f10c2e-0000-4000-8000-000000000001"
@@ -296,12 +298,16 @@ def test_elide_noop_when_short():
 
 
 def test_elide_middle_preserves_trailing_discriminator():
+    # ELLIPSIS is the 3-char ASCII "..." and comes out of the budget, so at the
+    # 8-char floor a label keeps 3 head + 2 tail. What must hold is that the
+    # trailing discriminator still separates two sibling names -- not that any
+    # particular number of characters survives.
     a = elide_label("clawdmeter-36", 8)
     b = elide_label("clawdmeter-2c", 8)
     assert len(a) == 8 and len(b) == 8
-    assert a != b                       # must not both become "clawdmete…"
-    assert a.endswith("-36") and b.endswith("-2c")
-    assert a.startswith("claw") and mod.ELLIPSIS in a
+    assert a != b                       # must not both become "clawdme..."
+    assert a.endswith("36") and b.endswith("2c")
+    assert a.startswith("cla") and mod.ELLIPSIS in a
 
 
 def test_elide_floor_is_eight_chars():
@@ -309,8 +315,9 @@ def test_elide_floor_is_eight_chars():
     assert len(elide_label(label, 8)) == 8
     for cap in (10, 14, 20):
         out = elide_label(label, cap)
-        assert len(out) == cap
-        assert out.endswith(label[-((cap - 1) // 2):])
+        assert len(out) == cap          # the cap is a cap, ellipsis included
+        tail = (cap - len(mod.ELLIPSIS)) // 2
+        assert out.endswith(label[-tail:])
 
 
 # ---------------------------------------------------------------------------
@@ -494,9 +501,9 @@ def test_wire_row_shape_and_codes():
     rows = json.loads(t.project(4096))["ss"]
     assert len(rows) == 1
     row = rows[0]
-    assert len(row) == 12
+    assert len(row) == 13           # index 12 = remote-control flag, appended
     (sid, label, state, ctx, elapsed, model, tool,
-     ntools, nagents, tdone, ttotal, tok) = row
+     ntools, nagents, tdone, ttotal, tok, remote) = row
     assert sid == SID[:2] and len(sid) == 2
     assert label == "clawdmeter"          # basename(cwd) fallback
     assert state == STATE_RUNNING_TOOL
@@ -527,12 +534,17 @@ def test_model_and_tool_code_tables():
 # Roster liveness — §4.2: grace, unreadable roster, name pickup
 # ---------------------------------------------------------------------------
 
-def _write_roster(cdir, session_id, pid, name=None):
+_NO_BRIDGE = object()   # sentinel: key absent, which is not the same as null
+
+
+def _write_roster(cdir, session_id, pid, name=None, bridge=_NO_BRIDGE):
     sdir = cdir / "sessions"
     sdir.mkdir(parents=True, exist_ok=True)
     rec = {"pid": pid, "sessionId": session_id}
     if name:
         rec["name"] = name
+    if bridge is not _NO_BRIDGE:
+        rec["bridgeSessionId"] = bridge
     (sdir / f"{pid}.json").write_text(json.dumps(rec))
 
 
@@ -604,3 +616,160 @@ def test_roster_entry_with_dead_pid_is_not_liveness(tmp_path):
     clock.tick(mod.ROSTER_GRACE_S + 1)
     assert t.sweep() is True
     assert SID not in t.sessions
+
+
+# ---------------------------------------------------------------------------
+# Remote Control — roster `bridgeSessionId`, wire index 12
+#
+# The roster is the only local place Remote Control shows up at all. A bridge
+# id means a bridge handle is installed (Remote Control enabled); teardown and
+# switching it off write null. Whether a phone/browser is ATTACHED right now is
+# server-side only and deliberately not modelled here.
+# ---------------------------------------------------------------------------
+
+BRIDGE_ID = "bridge-9f2c-must-not-reach-the-device"
+
+
+def test_remote_flag_reads_bridge_session_id():
+    assert remote_flag({"bridgeSessionId": BRIDGE_ID}) == REMOTE_ON
+    assert remote_flag({"bridgeSessionId": None}) == REMOTE_OFF   # teardown / off
+    assert remote_flag({"pid": 42}) == REMOTE_OFF                 # key absent == off
+    assert remote_flag({"bridgeSessionId": ""}) == REMOTE_OFF
+    assert remote_flag({"bridgeSessionId": "  "}) == REMOTE_OFF
+    # A shape we don't recognise is reported as unknown, never guessed either way.
+    assert remote_flag({"bridgeSessionId": 7}) == REMOTE_UNKNOWN
+    assert remote_flag({"bridgeSessionId": {"id": "x"}}) == REMOTE_UNKNOWN
+    assert remote_flag(None) == REMOTE_UNKNOWN
+    assert remote_flag("not a record") == REMOTE_UNKNOWN
+
+
+def _remote_table(tmp_path, clock, **roster_kw):
+    """A live session whose roster entry says what `roster_kw` says."""
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    _write_roster(tmp_path, SID, os.getpid(), name="clawdmeter-c5", **roster_kw)
+    t.handle_event(ev("UserPromptSubmit", cwd="/home/x/clawdmeter"))
+    return t
+
+
+def test_remote_on_when_roster_carries_a_bridge_id(tmp_path):
+    t = _remote_table(tmp_path, FakeClock(1000.0), bridge=BRIDGE_ID)
+    t.sweep()
+    assert t.sessions[SID].remote == REMOTE_ON
+    assert json.loads(t.project(4096))["ss"][0][12] == 1
+
+
+def test_remote_off_when_bridge_is_null(tmp_path):
+    t = _remote_table(tmp_path, FakeClock(1000.0), bridge=None)
+    t.sweep()
+    assert t.sessions[SID].remote == REMOTE_OFF
+    assert json.loads(t.project(4096))["ss"][0][12] == 0
+
+
+def test_remote_off_when_bridge_key_is_absent(tmp_path):
+    t = _remote_table(tmp_path, FakeClock(1000.0))    # no bridgeSessionId at all
+    t.sweep()
+    assert t.sessions[SID].remote == REMOTE_OFF
+    assert json.loads(t.project(4096))["ss"][0][12] == 0
+
+
+def test_remote_unknown_before_the_first_roster_read(tmp_path):
+    t = _remote_table(tmp_path, FakeClock(1000.0), bridge=BRIDGE_ID)
+    # No sweep yet: the roster hasn't been read, so "off" would be a lie.
+    assert t.sessions[SID].remote == REMOTE_UNKNOWN
+    assert json.loads(t.project(4096))["ss"][0][12] == -1
+
+
+def test_remote_unknown_when_the_roster_is_unreadable(tmp_path):
+    """Same convention as ctx/tok: -1 is "couldn't tell", not "off"."""
+    clock = FakeClock(1000.0)
+    t = SessionTable(config_dirs=[str(tmp_path / "missing")], now_fn=clock)
+    t.handle_event(ev("UserPromptSubmit", cwd="/home/x/clawdmeter"))
+    assert t.sweep() is False
+    assert t.sessions[SID].remote == REMOTE_UNKNOWN
+    assert json.loads(t.project(4096))["ss"][0][12] == -1
+
+
+def test_remote_holds_its_last_reading_when_the_roster_goes_away(tmp_path):
+    """An unreadable roster freezes the flag exactly as it freezes liveness and
+    the roster-supplied label — it never silently downgrades to "off"."""
+    clock = FakeClock(1000.0)
+    t = _remote_table(tmp_path, clock, bridge=BRIDGE_ID)
+    t.sweep()
+    assert t.sessions[SID].remote == REMOTE_ON
+    for fn in (tmp_path / "sessions").iterdir():
+        fn.unlink()
+    (tmp_path / "sessions").rmdir()
+    clock.tick(60)
+    t.sweep()
+    assert t.sessions[SID].remote == REMOTE_ON
+
+
+def test_remote_is_read_from_the_record_not_gated_on_liveness(tmp_path):
+    # A roster entry whose pid is dead still tells the truth about the bridge;
+    # the session is retired by the grace timer, not by this flag.
+    clock = FakeClock(1000.0)
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    _write_roster(tmp_path, SID, None, bridge=BRIDGE_ID)
+    t.handle_event(ev("SessionStart"))
+    t.sweep()
+    assert t.sessions[SID].remote == REMOTE_ON
+
+
+def test_remote_change_is_wire_visible(tmp_path):
+    """Turning Remote Control off must publish, not wait for another hook."""
+    clock = FakeClock(1000.0)
+    t = _remote_table(tmp_path, clock, bridge=BRIDGE_ID)
+    assert t.sweep() is True                       # first reading (and the name)
+    assert t.sweep() is False                      # steady state: no republish
+    _write_roster(tmp_path, SID, os.getpid(), name="clawdmeter-c5", bridge=None)
+    assert t.sweep() is True                       # flipped off -> republish
+    assert json.loads(t.project(4096))["ss"][0][12] == 0
+
+
+def test_bridge_id_never_reaches_the_wire(tmp_path):
+    """It is a server-side identifier; the device gets a boolean, not an id."""
+    t = _remote_table(tmp_path, FakeClock(1000.0), bridge=BRIDGE_ID)
+    t.sweep()
+    payload = t.project(4096)
+    assert BRIDGE_ID not in payload
+    assert "bridge" not in payload.lower()
+
+
+def test_remote_appends_at_index_12_leaving_the_older_row_intact(tmp_path):
+    """Append-only: indices 0-11 are byte-identical to the pre-remote row, so
+    firmware that stops reading at 11 keeps working."""
+    clock = FakeClock(1000.0)
+    t = _remote_table(tmp_path, clock, bridge=BRIDGE_ID)
+    t.sweep()
+    row = json.loads(t.project(4096))["ss"][0]
+    assert len(row) == 13
+    assert row[11] == -1                # tok still at 11 (no transcript here)
+    assert row[12] == 1                 # remote appended after it
+    assert row[:12] == [t.sessions[SID].sid, "clawdmeter-c5", STATE_THINKING,
+                        -1, 0, 0, 0, 0, 0, 0, 0, -1]
+
+
+# --- budget: the extra field is paid for, never overflowed -------------------
+
+# FIT_ROWS above is the pre-remote wire shape; this is the same table one field
+# wider, so the two can be fitted against the same budget and compared.
+FIT_ROWS_REMOTE = [r + [REMOTE_OFF] for r in FIT_ROWS]
+
+
+def test_fit_accounts_for_the_appended_remote_field():
+    for budget in (100, 120, 140, mod.DEFAULT_BUDGET_BYTES, 4096):
+        payload = fit_payload(FIT_ROWS_REMOTE, budget)
+        assert len(payload.encode("utf-8")) <= budget      # never over budget
+        rows = json.loads(payload)["ss"]
+        assert all(len(r) == 13 for r in rows)
+        # The cost comes out of labels and, past the floor, the tail rows —
+        # a wider row can never fit MORE rows than the narrower one did.
+        assert len(rows) <= len(json.loads(fit_payload(FIT_ROWS, budget))["ss"])
+
+
+def test_default_budget_still_carries_the_waiting_row():
+    payload = fit_payload(FIT_ROWS_REMOTE, mod.DEFAULT_BUDGET_BYTES)
+    rows = json.loads(payload)["ss"]
+    assert len(rows) >= 1
+    assert rows[0][0] == "a3"           # the waiting chat is still first
+    assert rows[0][12] == REMOTE_OFF    # ...and still carries the new field

@@ -83,6 +83,13 @@ TOOL_CODES = {
     "WebSearch": 9,
 }
 
+# Remote Control, derived from the roster's `bridgeSessionId` (see
+# remote_flag()). Same "unknown" convention as `ctx` / `tok`, so a roster we
+# could not read stays distinguishable from a confirmed "off".
+REMOTE_UNKNOWN = -1
+REMOTE_OFF = 0
+REMOTE_ON = 1
+
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
@@ -213,10 +220,14 @@ def elide_label(label, max_chars):
     discriminator — `clawdmeter-36` and `clawdmeter-2c` must stay distinct."""
     if len(label) <= max_chars:
         return label
-    if max_chars < 3:
+    if max_chars <= len(ELLIPSIS):
         return label[:max_chars]
-    tail = (max_chars - 1) // 2
-    head = (max_chars - 1) - tail
+    # The ellipsis itself has to come out of the budget. ELLIPSIS was a 1-char
+    # "…" when this was written; it is now the 3-char ASCII "...", so
+    # budgeting a single character for it overshot max_chars by 2.
+    budget = max_chars - len(ELLIPSIS)
+    tail = budget // 2
+    head = budget - tail
     return label[:head] + ELLIPSIS + label[len(label) - tail:]
 
 
@@ -227,7 +238,12 @@ def encode_payload(rows):
 def fit_payload(rows, budget):
     """Fit already-sorted rows into `budget` bytes (UTF-8): first shrink labels
     (middle-elide, 8-char floor), then drop rows from the tail — never from the
-    front, so a waiting chat is never the one dropped (§5)."""
+    front, so a waiting chat is never the one dropped (§5).
+
+    The measurement is of the fully encoded row, so every appended field (`tok`,
+    `remote`, whatever comes next) is paid for out of the same budget: a longer
+    row elides labels sooner and, past the floor, drops the least urgent row.
+    Nothing is ever emitted over budget."""
     def nbytes(s):
         return len(s.encode("utf-8"))
 
@@ -409,6 +425,33 @@ def load_roster(config_dirs):
     return roster, readable
 
 
+def remote_flag(rec):
+    """Remote Control for one roster record: 1 = on, 0 = off, -1 = unknown.
+
+    Claude Code writes `bridgeSessionId` into the roster entry once a bridge
+    handle is installed — Remote Control proper, the SDK-hosted bridge, or a
+    supervised child of a bridge session. Teardown and switching Remote Control
+    off write it back to `null`, so null/absent is a sound "off".
+
+    What it deliberately does NOT claim: that a phone or browser is attached
+    right now (that state lives only on Anthropic's servers — there is no local
+    signal), nor that the session is unusual — where the auto-start rollout is
+    active, every interactive session carries a bridge id. An unrecognised
+    value shape reports unknown rather than guessing. The id itself never
+    leaves the host: it is a server-side identifier the device has no use for.
+    """
+    if not isinstance(rec, dict):
+        return REMOTE_UNKNOWN
+    if "bridgeSessionId" not in rec:
+        return REMOTE_OFF
+    bridge = rec["bridgeSessionId"]
+    if bridge is None:
+        return REMOTE_OFF
+    if isinstance(bridge, str):
+        return REMOTE_ON if bridge.strip() else REMOTE_OFF
+    return REMOTE_UNKNOWN
+
+
 # ---------------------------------------------------------------------------
 # The session table + state machine (§4.1)
 # ---------------------------------------------------------------------------
@@ -418,6 +461,7 @@ class Session:
         "session_id", "sid", "state", "state_since", "last_event_at",
         "roster_name", "cwd", "transcript_path", "current_tool", "open_tools",
         "nagents", "tdone", "ttotal", "ctx", "tok", "model", "missing_since",
+        "remote",
     )
 
     def __init__(self, session_id, now):
@@ -437,6 +481,7 @@ class Session:
         self.ctx = -1
         self.tok = -1  # context tokens in 1k units; -1 whenever ctx is -1
         self.model = 0
+        self.remote = REMOTE_UNKNOWN  # Remote Control; filled by the roster read
         self.missing_since = None  # first time the roster didn't vouch for us
 
     def label(self):
@@ -640,6 +685,15 @@ class SessionTable:
                     # wrongly.
                     continue
                 rec = roster.get(session_id)
+                if rec is not None:
+                    # Remote Control rides along with the liveness read — same
+                    # file, no extra I/O, and the roster is the only local place
+                    # this shows up at all. Unknown (-1) until a roster record
+                    # is actually seen, exactly like ctx/tok.
+                    remote = remote_flag(rec)
+                    if remote != sess.remote:
+                        sess.remote = remote
+                        changed = True
                 if rec is not None and pid_alive(rec.get("pid"), rec.get("procStart")):
                     sess.missing_since = None
                     name = rec.get("name")
@@ -659,7 +713,8 @@ class SessionTable:
     def rows(self):
         """Full-label rows, already sorted: (bucket, -last_event_at).
         Row: [sid, label, state, ctx, elapsed_s, model, tool, ntools,
-              nagents, tdone, ttotal, tok] — append-only, like the codes."""
+              nagents, tdone, ttotal, tok, remote] — append-only, like the
+        codes: new fields go on the end and old firmware just ignores them."""
         now = self.now_fn()
         with self._lock:
             ordered = sorted(
@@ -680,6 +735,7 @@ class SessionTable:
                     s.tdone,
                     s.ttotal,
                     s.tok,
+                    s.remote,
                 ]
                 for s in ordered
             ]
