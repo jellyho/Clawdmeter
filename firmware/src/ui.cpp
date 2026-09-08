@@ -727,7 +727,17 @@ static void session_state_text(const SessionRow* r, char* buf, size_t n) {
                       session_tool_names[r->tool <= SESSION_TOOL_WEBSEARCH ? r->tool : 0]);
         return;
     case SESSION_COMPACTING:         snprintf(buf, n, "compacting");       return;
-    case SESSION_WAITING_PERMISSION: snprintf(buf, n, "needs permission"); return;
+    case SESSION_WAITING_PERMISSION:
+        // Name the tool when the host knows it: "needs permission" tells you
+        // to go look, "allow Bash?" tells you what you are being asked. Tool
+        // code 0 is the generic "other/none", so fall back rather than
+        // print "allow tool?". Happens to be shorter than the old string for
+        // every tool name but WebSearch.
+        if (r->tool != SESSION_TOOL_NONE && r->tool <= SESSION_TOOL_WEBSEARCH)
+            snprintf(buf, n, "allow %s?", session_tool_names[r->tool]);
+        else
+            snprintf(buf, n, "needs permission");
+        return;
     case SESSION_WAITING_QUESTION:   snprintf(buf, n, "asking you");       return;
     case SESSION_WAITING_INPUT:      snprintf(buf, n, "needs input");      return;
     case SESSION_ERROR:              snprintf(buf, n, "error");            return;

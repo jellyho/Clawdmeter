@@ -596,6 +596,13 @@ class SessionTable:
                 )
 
         elif event == "PermissionRequest":
+            # Keep the tool name so the device can say what is being asked
+            # for, not just that something is. PreToolUse normally fires
+            # first and has already set current_tool, but the permission
+            # payload carries it too on some paths -- prefer the fresher one.
+            tool = payload.get("tool_name")
+            if isinstance(tool, str) and tool:
+                sess.current_tool = tool
             self._set_state(sess, STATE_WAITING_PERMISSION, now)
 
         elif event == "PermissionDenied":
@@ -604,6 +611,9 @@ class SessionTable:
         elif event == "Notification":
             ntype = payload.get("notification_type")
             if ntype == "permission_prompt":
+                tool = payload.get("tool_name")
+                if isinstance(tool, str) and tool:
+                    sess.current_tool = tool
                 self._set_state(sess, STATE_WAITING_PERMISSION, now)
             elif ntype in ("agent_needs_input", "elicitation_dialog"):
                 self._set_state(sess, STATE_WAITING_INPUT, now)
