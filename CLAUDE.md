@@ -138,6 +138,15 @@ sudo apt install libsdl2-dev   # once (macOS: brew install sdl2)
 pio run -d firmware -e sim && (cd firmware && .pio/build/sim/program)
 ```
 
+Windows works too: the `native` platform is GCC-only, so install a MinGW-w64
+GCC with SDL2 (MSYS2 `pacman -S mingw-w64-ucrt-x86_64-{gcc,SDL2}`, or a
+winlibs zip + the SDL2 mingw dev zip) and put its `bin` on PATH; see
+`SIM-USAGE.md` § Windows. `firmware/sim/sdl2_flags.py` (an `extra_scripts`
+pre-script) locates SDL2 per OS, so there is no `!sdl2-config` backtick in
+`platformio.ini` any more; on Windows it also copies `SDL2.dll` next to
+`program.exe`. Note any `platformio.ini` edit makes PlatformIO wipe
+`.pio/build/` for every env on the next run (full rebuild).
+
 An SDL2 window stands in for the 480×480 panel; the **full firmware loop runs
 unmodified** — `main.cpp`, `ui.cpp`, `splash.cpp`, idle fade, pair gesture,
 JSON parsing, usage-rate/chime logic. Only `ble.cpp`/`chime.cpp` are swapped

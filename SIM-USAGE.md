@@ -18,6 +18,35 @@ cd firmware && .pio/build/sim/program
 Launch from the `firmware/` directory — the default scenario path
 (`sim/scenario.jsonl`) is resolved relative to it.
 
+### Windows
+
+PlatformIO's `native` platform is GCC-only, so the sim needs a **MinGW-w64
+GCC** with SDL2 installed into that toolchain. `firmware/sim/sdl2_flags.py`
+finds SDL2 next to the `gcc` on PATH (or via `SDL2_DIR`), links it as a
+console app without `SDL2main`, and copies `SDL2.dll` beside the executable.
+Pick one:
+
+- **MSYS2** (installer): `pacman -S mingw-w64-ucrt-x86_64-gcc
+  mingw-w64-ucrt-x86_64-SDL2`, then put `C:\msys64\ucrt64\bin` on PATH.
+- **No installer**: unzip a [winlibs](https://winlibs.com) GCC
+  (`winlibs-x86_64-posix-seh-gcc-*-ucrt-*.zip`) to e.g.
+  `%LOCALAPPDATA%\Programs\mingw64` and put its `bin` on PATH. Unzip
+  `SDL2-devel-<ver>-mingw.zip` from the
+  [SDL releases](https://github.com/libsdl-org/SDL/releases) and either set
+  `SDL2_DIR` to its `x86_64-w64-mingw32` folder, or copy that folder's
+  `include\SDL2`, `lib\libSDL2*.a`, and `bin\SDL2.dll` into the mingw64
+  prefix.
+
+Then, from a fresh terminal (PATH changes need one):
+
+```powershell
+pio run -d firmware -e sim
+cd firmware; .pio\build\sim\program.exe
+```
+
+Headless capture on Windows: `$env:SDL_VIDEODRIVER='dummy';
+$env:SIM_AUTOSHOT_MS='6000'; .pio\build\sim\program.exe`.
+
 ## Controls
 
 | Key | Action |

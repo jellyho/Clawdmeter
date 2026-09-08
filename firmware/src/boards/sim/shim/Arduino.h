@@ -8,6 +8,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+// MinGW's CRT has no strlcpy (on ESP32 it comes from newlib via Arduino.h).
+static inline size_t strlcpy(char* dst, const char* src, size_t size) {
+    size_t n = strlen(src);
+    if (size) {
+        size_t c = n < size - 1 ? n : size - 1;
+        memcpy(dst, src, c);
+        dst[c] = '\0';
+    }
+    return n;
+}
+#endif
+
 unsigned long millis(void);
 void delay(unsigned long ms);
 

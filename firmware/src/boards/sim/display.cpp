@@ -25,6 +25,11 @@ static void present(void) {
 }
 
 void display_hal_init(void) {
+#ifdef SDL_MAIN_HANDLED
+    // Windows build links without SDL2main (see sim/sdl2_flags.py), so
+    // tell SDL our own main() is the entry point before SDL_Init.
+    SDL_SetMainReady();
+#endif
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         exit(1);
