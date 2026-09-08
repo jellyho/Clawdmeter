@@ -268,6 +268,7 @@ sim`, then `cd firmware && .pio/build/sim/program`). See
 - Pixel-art Clawd animations are Anthropic's official mascot art (claude.ai/code, Claude Code desktop), archived and converted by the tooling in `tools/` and `research/clawd-official/`.
 - Lucide icon set ([lucide.dev](https://lucide.dev), MIT) for bluetooth and battery UI glyphs.
 - Anthropic brand fonts (Tiempos Text, Styrene B) — see licensing warning below.
+- **NanumGothic** by Sandoll Communications for Naver (NHN), under the [SIL Open Font License 1.1](assets/OFL.txt) — the Korean glyphs a message body falls back to (`firmware/src/font_nanum_kr_28.c`, derived from `assets/NanumGothic-Regular.ttf` as taken from Google Fonts' `ofl/nanumgothic/`). The OFL requires its text to travel with the font, so `assets/OFL.txt` ships beside it. See [`docs/fonts.md`](docs/fonts.md#korean-typeface--licence).
 
 ## Licensing gray area warning
 

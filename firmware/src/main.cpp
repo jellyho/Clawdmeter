@@ -128,6 +128,26 @@ static bool parse_json(const char* json, UsageData* out) {
 #if BOARD_HAS_SESSION_VIEWS
 static SessionList sessions = {};
 
+// snprintf() cuts by BYTES, and both host-side caps below it count CHARACTERS.
+// That cost nothing while the wire was ASCII 32..126; a Korean syllable is
+// three bytes, so a cut can leave a dangling partial character behind. LVGL's
+// decoder walks off the end of it and drops the remainder without drawing
+// anything, so the string is silently shortened — no ellipsis, no placeholder,
+// no sign that a character went missing. Drop the partial character here
+// instead, so what is kept is exactly what gets drawn.
+//
+// A no-op on a string that was not cut: a well-formed one already ends on a
+// complete character.
+static void utf8_drop_partial_tail(char* s) {
+    size_t n = strlen(s);
+    size_t k = n;
+    while (k > 0 && ((unsigned char)s[k - 1] & 0xC0) == 0x80) k--;
+    if (k == 0) { s[0] = '\0'; return; }          // continuation bytes only
+    unsigned char lead = (unsigned char)s[k - 1];
+    size_t need = lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+    if ((k - 1) + need > n) s[k - 1] = '\0';      // last character is cut short
+}
+
 // Parse a session payload (issue #135 §5) into a SessionList. Rows are
 // positional and arrive pre-sorted by the host:
 //   {"ss":[[sid,label,state,ctx,elapsed_s,model,tool,ntools,nagents,tdone,ttotal,tok,
@@ -155,7 +175,11 @@ static bool parse_sessions(const char* json, SessionList* out) {
         if (row.isNull() || row.size() < 11) continue;  // skip malformed rows
         SessionRow* r = &out->rows[out->count];
         snprintf(r->sid, sizeof(r->sid), "%s", (const char*)(row[0] | ""));
+        // The host middle-elides the label to 32 CHARACTERS, which is 32 bytes
+        // of Latin but 96 of Hangul, so this buffer really does cut Korean
+        // project names — on a character boundary, not mid-syllable.
         snprintf(r->label, sizeof(r->label), "%s", (const char*)(row[1] | ""));
+        utf8_drop_partial_tail(r->label);
         r->state     = (uint8_t)(int)(row[2]  | 0);
         r->ctx_pct   = (int8_t)(int)(row[3]   | -1);
         r->elapsed_s = (int32_t)(row[4]       | 0);
@@ -175,12 +199,20 @@ static bool parse_sessions(const char* json, SessionList* out) {
         // the same defaulting the short-row guard above relies on.
         const char* msg = (const char*)(row[13] | "");
         snprintf(r->msg, sizeof(r->msg), "%s", msg);
-        // The host elides to 40 chars, so the buffer has headroom; a host that
-        // ignores that would otherwise be cut mid-word with no sign of it.
-        // Say the words are missing rather than hand the panel a half-sentence
-        // it will render as if it were the whole message.
-        if (strlen(msg) >= sizeof(r->msg))
-            memcpy(r->msg + sizeof(r->msg) - 4, "...", 4);
+        // The host elides to a BYTE budget now (clawdmeter_inbox.MSG_TEXT_MAX),
+        // sized so a fitted body lands under this buffer — but an older host
+        // counting characters, or a third-party one, can still overrun it, so
+        // this cut stays load-bearing. Say the words are missing rather than
+        // hand the panel a half-sentence it renders as the whole message.
+        // Both the cut and the marker have to land on a UTF-8 character
+        // boundary: at three bytes per syllable a fixed-offset cut splits one
+        // two times in three, and LVGL draws the dangling bytes as placeholder
+        // boxes — an elide that makes the message less readable, not shorter.
+        if (strlen(msg) >= sizeof(r->msg)) {
+            size_t k = sizeof(r->msg) - 4;
+            while (k > 0 && ((unsigned char)r->msg[k] & 0xC0) == 0x80) k--;
+            memcpy(r->msg + k, "...", 4);
+        }
         out->count++;
     }
     return true;

@@ -383,15 +383,26 @@ def test_newest_message_is_the_first_row(projects):
 
 # --------------------------------------------------------------------------- non-ASCII
 
-def test_everything_that_reaches_the_panel_is_in_the_font():
-    """The Styrene/Tiempos fonts cover 32..126. This is the invariant the
-    whole folding layer exists for; a failure here is tofu on real hardware.
+# The panel has exactly two coverages, and they do not apply to every field:
+# the brand faces carry ASCII 32..126, and the message BODY's font adds the
+# 2,350 KS X 1001 Hangul syllables through lv_font_t::fallback. Any other
+# field has no fallback, so Hangul there would be an empty box.
+def _drawable(ch, body=False):
+    return 32 <= ord(ch) <= 126 or (body and ord(ch) in cs.KSX1001_HANGUL)
+
+
+def test_everything_that_reaches_the_panel_is_in_a_font_that_field_has():
+    """The invariant the whole folding layer exists for; a failure here is
+    tofu on real hardware.
 
     Both fields that carry free text: the body AND the sender. The sender used
     to skip the fold entirely, so a peer whose machine name is Korean shipped
-    a romanised body under five tofu boxes."""
+    a romanised body under five tofu boxes. The body may now keep Hangul --
+    but only the 2,350 syllables the device's font actually has, and only the
+    body."""
     bodies = [
-        "\ud55c\uae00 \uba54\uc2dc\uc9c0",       # Korean
+        "\ud55c\uae00 \uba54\uc2dc\uc9c0",       # Korean, all in KS X 1001
+        "\ub620\ub620 \ubdc1 \ud655\uc778",       # Korean outside KS X 1001
         "caf\u00e9 na\u00efve \u2014 done\u2026",  # accented Latin + punctuation
         "\u30c6\u30b9\u30c8 \u4e2d\u6587 \u0440\u0443\u0441",  # ja / zh / ru
         "\U0001f600 build green \u2705",           # emoji
@@ -400,23 +411,52 @@ def test_everything_that_reaches_the_panel_is_in_the_font():
     ]
     for body in bodies:
         for translit in (True, False):
-            text = ib.elide_message(ib.to_panel_text(body, translit), 40)
-            assert all(32 <= ord(c) <= 126 for c in text), (body, translit, text)
-            # The same six scripts as SENDER names, through the whole row.
-            row = ib.message_row(ib.Message("aaaa1111", NOW, body, body),
-                                 NOW, translit=translit)
-            for field in (row[1], row[ib.MSG_FIELD_INDEX]):
-                assert all(32 <= ord(c) <= 126 for c in field), (body, row)
-            assert row[1], "a sender field is never empty"
-            assert len(row[1]) <= ib.LABEL_MAX
+            for keep in (True, False):
+                text = ib.elide_message(
+                    ib.to_panel_text(body, translit, keep), 40)
+                assert all(_drawable(c, keep) for c in text), (body, keep, text)
+                # The same scripts as SENDER names, through the whole row.
+                row = ib.message_row(ib.Message("aaaa1111", NOW, body, body),
+                                     NOW, translit=translit, keep_hangul=keep)
+                assert all(_drawable(c) for c in row[1]), (body, row)
+                assert all(_drawable(c, keep)
+                           for c in row[ib.MSG_FIELD_INDEX]), (body, row)
+                assert row[1], "a sender field is never empty"
+                assert len(row[1]) <= ib.LABEL_MAX
 
 
-def test_a_korean_sender_is_romanised_not_tofu():
+def test_only_the_syllables_the_font_has_pass_through():
+    """The font is the 2,350 KS X 1001 syllables, not all 11,172. A syllable
+    outside that set has to keep romanising or it is a box on the panel."""
+    assert 0xD55C in cs.KSX1001_HANGUL          #한, in KS X 1001
+    assert 0xB620 not in cs.KSX1001_HANGUL      # 똠, CP949 extension only
+    assert ib.to_panel_text("한 똠", keep_hangul=True) == "한 ttom"
+
+
+def test_a_pure_korean_body_is_not_declared_unreadable():
+    """Regression: the "did anything survive?" test was [A-Za-z0-9], so the
+    pass that made Korean readable was immediately overruled by it."""
+    assert ib.to_panel_text("안녕하세요", keep_hangul=True) == "안녕하세요"
+    assert ib.to_panel_text("안녕", keep_hangul=True) != ib.UNREADABLE_TEXT
+
+
+def test_hangul_can_be_put_back_for_older_firmware():
+    """`inbox_hangul = off`. Firmware without font_nanum_kr_28 draws Hangul as
+    empty boxes, and romanised is readable."""
+    m = ib.Message("aaaa1111", NOW, "peer", "안녕하세요")
+    assert ib.message_row(m, NOW, keep_hangul=False)[ib.MSG_FIELD_INDEX] \
+        == "annyeonghaseyo"
+
+
+def test_a_korean_sender_is_romanised_even_though_the_body_is_not():
+    """The asymmetry is the point: MSG_BODY_FONT has the Hangul fallback and
+    MSG_FROM_FONT does not, so passing a Korean sender through would put empty
+    boxes directly above a perfectly rendered Korean body."""
     m = ib.Message("aaaa1111", NOW, "안녕하세요",
                    "안녕하세요 - build done")
     row = ib.message_row(m, NOW)
     assert row[1] == "annyeonghaseyo"
-    assert row[ib.MSG_FIELD_INDEX] == "annyeonghaseyo - build done"
+    assert row[ib.MSG_FIELD_INDEX] == "안녕하세요 - build done"
 
 
 def test_a_sender_that_folds_to_nothing_says_peer_not_the_unreadable_marker():
@@ -444,6 +484,8 @@ def test_korean_is_transliterated_not_blanked():
 
 def test_transliteration_can_be_turned_off():
     assert ib.to_panel_text("\uc548\ub155", translit=False) == ib.UNREADABLE_TEXT
+    # keep_hangul is a separate axis; with it off the body romanises as before.
+    assert ib.to_panel_text("\uc548\ub155", keep_hangul=False) == "annyeong"
 
 
 def test_punctuation_folds_to_its_ascii_twin():
@@ -472,10 +514,22 @@ def test_message_text_elides_from_the_head():
 
 
 def test_text_length_scales_with_the_budget():
-    assert ib.text_max_for_budget(180) == ib.MSG_TEXT_MAX
+    """In BYTES. A quarter of the budget, floored and capped."""
+    assert ib.text_max_for_budget(180) == 45
     assert ib.text_max_for_budget(500) == ib.MSG_TEXT_MAX      # capped
     assert ib.text_max_for_budget(80) == 20
     assert ib.text_max_for_budget(20) == ib.MSG_TEXT_MIN        # floored
+
+
+def test_the_cap_counts_bytes_not_characters():
+    """40 CHARACTERS of Korean is 120 bytes: it overran the payload budget and
+    the device's msg buffer at the same time."""
+    text = ib.elide_message(ib.to_panel_text("가" * 40, keep_hangul=True), 45)
+    assert len(text.encode("utf-8")) <= 45
+    # ...and the cut lands on a character boundary, or LVGL draws the dangling
+    # continuation bytes as placeholder boxes.
+    assert text.encode("utf-8").decode("utf-8") == text
+    assert text.endswith(cs.ELLIPSIS)
 
 
 # --------------------------------------------------------------------------- the wire row

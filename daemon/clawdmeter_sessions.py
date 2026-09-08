@@ -47,6 +47,7 @@ import signal
 import sys
 import threading
 import time
+import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
@@ -100,9 +101,11 @@ REMOTE_ON = 1
 
 DEFAULT_BUDGET_BYTES = 180   # conservative fit target; see sessions_budget_bytes
 LABEL_FLOOR = 8              # labels never elide below this many characters
-# ASCII on purpose: the firmware's Styrene fonts cover 32..126 only, so a real
-# U+2026 renders as tofu on the device. Same UTF-8 byte count (3), so the
-# payload byte-budget math is unaffected.
+# ASCII on purpose. This elides LABELS, which render in the Styrene faces, and
+# those cover 32..126 only -- a real U+2026 is a placeholder box there. (The
+# Hangul fallback does carry U+2026, but that font is reachable only from the
+# message BODY; see fold_to_ascii below.) Same UTF-8 byte count (3), so the
+# payload byte-budget math is unaffected either way.
 ELLIPSIS = "..."
 
 ROSTER_GRACE_S = 30          # roster absence tolerated this long (first hook may
@@ -305,6 +308,190 @@ def elide_label(label, max_chars):
     return label[:head] + ELLIPSIS + label[len(label) - tail:]
 
 
+# ---------------------------------------------------------------------------
+# Folding text into what the panel can actually draw
+# ---------------------------------------------------------------------------
+# The device's fonts are the constraint, and there are exactly two coverages:
+# the brand faces (Styrene, Tiempos) carry ASCII 32..126, and the message
+# body's fallback face (firmware/src/font_nanum_kr_28.c) carries the 2,350
+# KS X 1001 Hangul syllables. A codepoint in neither draws as a placeholder
+# box.
+#
+# This lives HERE rather than in clawdmeter_inbox because EVERY label on the
+# wire passes through fit_payload() below, and every label needs folding: a
+# Korean project directory name used to arrive as a row of empty boxes in the
+# largest font on the screen, while the inbox's own sender field -- the only
+# label anyone had thought about -- was already being folded. clawdmeter_inbox
+# re-exports these names, and adds the message-body policy on top (it is the
+# one field allowed to keep its Hangul).
+
+# Punctuation that has an obvious ASCII equivalent. NFKD does not fold these
+# (an em dash is not a decomposable hyphen), so they need naming.
+_PUNCT = {
+    "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-",
+    "―": "-", "−": "-", "•": "-", "·": "-",
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "′": "'", "‹": "'", "›": "'",
+    "“": '"', "”": '"', "„": '"', "‟": '"',
+    "«": '"', "»": '"', "″": '"',
+    "…": "...", "\u00a0": " ", "\u200b": "", "\ufeff": "",
+    "、": ",", "。": ".", "，": ",", "．": ".",
+    "：": ":", "；": ";", "！": "!", "？": "?",
+    "×": "x", "→": "->", "←": "<-", "✓": "ok",
+}
+
+# Hangul -> Revised Romanization, syllable by syllable. The owner writes
+# Korean, and a Korean message rendered as "?" is useless where "polring
+# jugi" is readable. Tables are the standard RR initial / medial / final sets.
+_HANGUL_BASE = 0xAC00
+_HANGUL_LAST = 0xD7A3
+_INITIALS = ("g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "",
+             "j", "jj", "ch", "k", "t", "p", "h")
+_MEDIALS = ("a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae",
+            "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i")
+_FINALS = ("", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "p", "l",
+           "l", "p", "l", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t",
+           "p", "t")
+
+
+def romanize_hangul(ch):
+    """One precomposed Hangul syllable -> Revised Romanization, or None.
+
+    Syllable-wise and therefore APPROXIMATE: RR's inter-syllable assimilation
+    rules are not applied, so 학년 comes out "haknyeon" where the standard
+    spells it "hangnyeon". Readable, not authoritative -- and the alternative
+    on this panel is a blank.
+    """
+    code = ord(ch)
+    if not (_HANGUL_BASE <= code <= _HANGUL_LAST):
+        return None
+    idx = code - _HANGUL_BASE
+    return _INITIALS[idx // 588] + _MEDIALS[(idx % 588) // 28] + _FINALS[idx % 28]
+
+
+def _ksx1001_hangul():
+    """The 2350 precomposed Hangul syllables of KS X 1001 -- EXACTLY the set
+    firmware/src/font_nanum_kr_28.c contains, derived the same way it was so
+    the two cannot drift.
+
+    The lead-byte test is what does the work, not the encode: CPython's
+    `euc_kr` codec is really CP949 and encodes all 11,172 precomposed
+    syllables without error, so "does it encode?" filters nothing. The KS X
+    1001 wansung syllables are the ones in rows 0xB0..0xC8.
+
+    Passing a syllable the font lacks would put a placeholder box on the panel
+    -- the exact failure the Hangul font was added to remove -- so this set is
+    the contract between host and firmware, and tools/ttf_to_lvgl.py's
+    --ksx1001 is the other half of it.
+    """
+    out = set()
+    for cp in range(_HANGUL_BASE, _HANGUL_LAST + 1):
+        try:
+            enc = chr(cp).encode("euc_kr")
+        except UnicodeEncodeError:
+            continue
+        if len(enc) == 2 and 0xB0 <= enc[0] <= 0xC8:
+            out.add(cp)
+    return frozenset(out)
+
+
+KSX1001_HANGUL = _ksx1001_hangul()
+
+# Shown when folding leaves nothing legible at all (a body that is pure emoji,
+# or pure CJK). Honest: says something arrived and that the panel cannot show
+# it.
+UNREADABLE_TEXT = "[non-ASCII msg]"
+
+_DROP = "\x00"  # internal placeholder for one untranslatable character
+
+
+def fold_to_ascii(text, translit=True, keep_hangul=False):
+    """Make `text` renderable on the panel, honestly.
+
+    Passes, most faithful first:
+
+    1. ASCII passes through untouched.
+    2. Named punctuation maps to its ASCII twin (em dash -> "-", curly quotes
+       -> straight, U+2026 -> "...").
+    3. With `keep_hangul`, a syllable the device's Hangul font actually has
+       passes through AS ITSELF. Off by default, and it must stay off for
+       every field except the message body: the body is the only one whose
+       font has the Hangul fallback (see MSG_BODY_FONT in ui.cpp), so Hangul
+       in a sender or a session label would be placeholder boxes.
+    4. Hangul is transliterated (see romanize_hangul) when `translit`. This is
+       what catches the 8,822 syllables outside KS X 1001 even when
+       `keep_hangul` is on -- the font does not have them.
+    5. Anything else is NFKD-normalised and stripped of combining marks, which
+       is a genuine transliteration for accented Latin ("café" -> "cafe")
+       and nothing at all for CJK, Cyrillic or emoji.
+
+    What survives none of that is DROPPED, and each dropped RUN is replaced by
+    a single "?" -- so the reader can see that something was there and that
+    the panel could not show it. That is the whole point: a blank would lie by
+    omission and per-character "?????" would drown the words that did survive.
+    """
+    out = []
+    for ch in text:
+        if " " <= ch <= "~":
+            out.append(ch)
+            continue
+        if ch.isspace():
+            # Newlines, tabs, NBSP, ideographic space: whitespace, not
+            # untranslatable. Dropping them would put a "?" between every
+            # paragraph of a perfectly ASCII message.
+            out.append(" ")
+            continue
+        rep = _PUNCT.get(ch)
+        if rep is not None:
+            out.append(rep)
+            continue
+        if keep_hangul and ord(ch) in KSX1001_HANGUL:
+            out.append(ch)
+            continue
+        if translit:
+            rom = romanize_hangul(ch)
+            if rom is not None:
+                out.append(rom)
+                continue
+        keep = "".join(c for c in unicodedata.normalize("NFKD", ch)
+                       if " " <= c <= "~")
+        out.append(keep if keep else _DROP)
+    # Collapse each run of dropped characters to one marker.
+    return re.sub(_DROP + "+", "?", "".join(out))
+
+
+def to_panel_text(body, translit=True, keep_hangul=False):
+    """A body -> one folded, single-line string a card can hold."""
+    body = body or ""
+    folded = fold_to_ascii(body, translit, keep_hangul)
+    single = re.sub(r"\s+", " ", folded).strip()
+    # "Did anything readable survive?" -- Hangul counts as readable exactly
+    # when it was allowed through, or a pure-Korean message would be declared
+    # unreadable by the very pass that made it readable.
+    survivors = r"[A-Za-z0-9가-힣]" if keep_hangul else r"[A-Za-z0-9]"
+    if not re.search(survivors, single):
+        # Nothing readable left. Say so -- but only if the folding is what ate
+        # it: a body that was always just ":)" is not unreadable, it is short.
+        if any(not (" " <= c <= "~") and not c.isspace() for c in body):
+            return UNREADABLE_TEXT
+    return single
+
+
+def panel_label(label):
+    """A row's label field, folded to what the panel can draw.
+
+    ALWAYS folds Hangul away: labels render in font_styrene_20/24/28/48 and
+    none of those has a Hangul fallback, so a Korean project name would be a
+    row of empty boxes in the biggest font on the screen. Romanised is not
+    ideal; boxes are useless.
+
+    Returns "?" rather than "" for a label that folds to nothing -- a card
+    with no name at all reads as a rendering bug, and the sid is not shown.
+    """
+    single = re.sub(r"\s+", " ", fold_to_ascii(label or "")).strip()
+    return single or "?"
+
+
 def encode_payload(rows):
     return json.dumps({"ss": rows}, separators=(",", ":"), ensure_ascii=False)
 
@@ -317,13 +504,20 @@ def fit_payload(rows, budget):
     The measurement is of the fully encoded row, so every appended field (`tok`,
     `remote`, whatever comes next) is paid for out of the same budget: a longer
     row elides labels sooner and, past the floor, drops the least urgent row.
-    Nothing is ever emitted over budget."""
+    Nothing is ever emitted over budget.
+
+    Labels are folded here (panel_label) rather than where they are produced,
+    because there are two producers — `Session.label()` for local chats and
+    `clawdmeter_fleet._label_of()` for remote ones — and this is the single
+    funnel both go through on the way to the wire. It also has to happen
+    BEFORE the elide loop: folding changes the character count (한 -> "han"),
+    so eliding first would blow the cap it was measured against."""
     def nbytes(s):
         return len(s.encode("utf-8"))
 
     for n in range(len(rows), -1, -1):
         subset = [list(r) for r in rows[:n]]
-        originals = [r[1] for r in subset]
+        originals = [panel_label(r[1]) for r in subset]
         max_label = max((len(lbl) for lbl in originals), default=LABEL_FLOOR)
         for cap in range(max(max_label, LABEL_FLOOR), LABEL_FLOOR - 1, -1):
             for row, orig in zip(subset, originals):

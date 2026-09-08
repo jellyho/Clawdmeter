@@ -160,36 +160,59 @@ development box, 16 of them real sessions).
 
 ### Non-ASCII, and why the panel does not just go blank
 
-The firmware's Styrene/Tiempos fonts cover **U+0020..U+007E and nothing else**.
-A Korean or Japanese body would render as blanks. Shipping that silently would
-be a lie, so the text is folded before it goes on the wire, most-faithful rule
-first:
+The firmware's fonts are the constraint, and the coverage is **not the same
+for every field**:
+
+| field | font | covers |
+| --- | --- | --- |
+| message **body** | `font_styrene_28` + `font_nanum_kr_28` fallback | ASCII 32..126 **and** the 2,350 KS X 1001 Hangul syllables |
+| sender name | `font_styrene_20` / `24` | ASCII 32..126 |
+| session label | `font_styrene_28` / `48` | ASCII 32..126 |
+
+So Korean **bodies** go out as real Hangul, and everything else is folded
+before it goes on the wire, most-faithful rule first:
 
 | Input | On the panel | Why |
 | --- | --- | --- |
 | ASCII | unchanged | — |
 | `—` `“ ”` `…` NBSP | `-` `" "` `...` space | Named ASCII twins; NFKD does not fold these |
 | `café` | `cafe` | NFKD, combining marks dropped — a real transliteration |
-| `안녕하세요` | `annyeonghaseyo` | Revised Romanization, syllable by syllable |
+| `안녕하세요` **in a body** | `안녕하세요` | The device has those glyphs |
+| `안녕하세요` **in a name** | `annyeonghaseyo` | It does not have them *there* |
+| `똠` (Hangul outside KS X 1001) | `ttom` | Not in the font, even in a body |
 | `中文` `テスト` `😀` | `?` | Nothing faithful to fall back on |
 | a body with none of it legible | `[non-ASCII msg]` | Says a message arrived and that the panel cannot show it |
 
-The Hangul pass is there because the owner of this device writes Korean, and
-`?` would make the feature useless for him. It is **approximate**: RR's
-inter-syllable assimilation rules are not applied, so `학년` comes out
-`haknyeon` where the standard spells it `hangnyeon`. Readable, not
-authoritative. Set `inbox_translit = off` to drop non-ASCII instead.
+The romanisation is **approximate**: RR's inter-syllable assimilation rules are
+not applied, so `학년` comes out `haknyeon` where the standard spells it
+`hangnyeon`. Readable, not authoritative — and it is now the fallback rather
+than the normal path for a body. Set `inbox_hangul = off` to romanise bodies
+too, which is what firmware older than the Korean font needs (it would draw
+the Hangul as empty boxes). Set `inbox_translit = off` to drop non-ASCII
+instead of romanising it at all.
 
 Untranslatable characters collapse per **run**, not per character, so one `?`
 stands in for a dropped phrase rather than `?????` drowning the words that did
 survive.
 
-**The sender name goes through the same fold**, so the fallback actually holds:
-an unrenderable body still tells you who it came from. (It did not always —
+**The sender name goes through the fold**, so the fallback actually holds: an
+unrenderable body still tells you who it came from. (It did not always —
 folding the body and not the label shipped `annyeonghaseyo …` under five tofu
 boxes for a peer whose machine name is Korean.) A name that folds to nothing at
 all becomes `peer`, and a long one is middle-elided to the device's 32-char
 label buffer so the tail that distinguishes two machines survives.
+
+**So do session labels.** A Korean project directory name used to reach the
+panel unfolded and draw as empty boxes in the 48 px name font. The fold lives
+in `clawdmeter_sessions.panel_label()` and is applied inside `fit_payload()`,
+which is the one funnel both label producers (the hook sidecar and the remote
+fleet) go through.
+
+Korean costs **3 bytes per syllable** on the wire, so the message length cap
+counts bytes, not characters — `budget // 4` bytes, which is 15 syllables at
+the default 180-byte budget and 21 at `sessions_budget_bytes = 260`. See
+[`docs/fonts.md`](../docs/fonts.md#byte-budget-honestly) for the full chain of
+caps.
 
 ### What it costs on the wire
 
@@ -301,6 +324,7 @@ python3 daemon/clawdmeter_inbox.py --once --freshness 86400   # look back a day
 | `inbox_freshness_s` | `120` | How far back a fresh start looks. Also the cold-start baseline. |
 | `inbox_max_rows` | `2` | Concurrent message rows. The per-message text shortens when two are live so both fit — and the count is capped to **1** while `sessions_budget_bytes` is under 200, because two rows there leave no room for a session card. |
 | `inbox_translit` | `on` | `off` drops non-ASCII instead of transliterating it. |
+| `inbox_hangul` | `on` | `off` romanises Korean message bodies instead of sending them as Hangul. Set it when the device is running firmware older than `font_nanum_kr_28`, which draws Hangul as empty boxes. Sender names and session labels are always romanised — their fonts have no Hangul fallback. |
 
 The watcher reads `config_dirs` (shared with the daemons) the same way the hook
 sidecar does, so extra Claude config dirs are watched too.

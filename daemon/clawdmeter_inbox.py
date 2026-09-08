@@ -38,11 +38,18 @@ children, not another human's session reaching this machine, and there are an
 order of magnitude more of them (193 files here, ~30 of them real sessions).
 Surfacing them would turn the panel into a log of a workflow's internals.
 
-ASCII ONLY -- SEE fold_to_ascii()
----------------------------------
-The panel's Styrene/Tiempos fonts cover U+0020..U+007E. Anything else renders
-as blanks. This module transliterates rather than shipping mojibake; the
-rules and their honesty caveats are documented on fold_to_ascii().
+WHAT THE PANEL CAN DRAW -- SEE cs.fold_to_ascii()
+-------------------------------------------------
+The brand fonts (Styrene, Tiempos) cover U+0020..U+007E and nothing else, so
+the host folds everything else away rather than shipping mojibake. ONE field
+is wider than that: the message BODY renders in a font that carries a Hangul
+fallback (font_nanum_kr_28, the 2,350 KS X 1001 syllables), so Korean bodies
+go out as real Hangul instead of `annyeonghaseyo`. The SENDER does not -- its
+font has no fallback -- so panel_sender() keeps romanising. Both halves of
+that asymmetry are load-bearing; see panel_sender() and docs/fonts.md.
+
+`inbox_hangul = off` puts the body back to romanised, which is what firmware
+older than the Korean font needs (it would draw Hangul as empty boxes).
 
 PRIVACY -- READ THIS
 --------------------
@@ -62,7 +69,6 @@ import os
 import re
 import sys
 import time
-import unicodedata
 
 # The sidecar owns the wire format, the eliding, the byte fitting and the
 # state codes. Reuse them rather than growing a second, drifting copy.
@@ -112,11 +118,20 @@ DEFAULT_EXPIRE_S = 180
 # byte budget stops being able to hold a session card at all.
 DEFAULT_MAX_ROWS = 2
 
-# Message text length, in characters, after folding and eliding. 40 keeps a
-# message row near 75 bytes; MSG_TEXT_MIN is the floor the adaptive cap
-# (text_max_for_budget) will not go below, because below it the text stops
-# being a message and becomes a shrug.
-MSG_TEXT_MAX = 40
+# Message text length in BYTES after folding and eliding — not characters,
+# which is the distinction the Hangul support turns on: ASCII spends one byte
+# per character and Korean spends three, so a character cap silently means
+# three different things.
+#
+# 96 is the panel's two-line ceiling, measured rather than guessed: a list
+# card gives the body two 422 px lines and Hangul advances 26.31 px at 28 px,
+# so two full lines are 32 syllables = 96 B. It is a ceiling, not the usual
+# answer — text_max_for_budget() below almost always binds first (45 B at the
+# 180-byte default budget), so this only becomes reachable once
+# `sessions_budget_bytes` is raised. MSG_TEXT_MIN is the floor that cap will
+# not go below, because under it the text stops being a message and becomes a
+# shrug.
+MSG_TEXT_MAX = 96
 MSG_TEXT_MIN = 16
 
 # The sender goes in the label field, and the label field is a 32-char buffer
@@ -133,11 +148,6 @@ LABEL_MAX = 32
 # one has already had its own card and its own notification, and a Sessions
 # tab with no sessions on it is a worse answer than a message you already saw.
 MULTI_ROW_MIN_BUDGET = 200
-
-# Shown when folding leaves nothing legible at all (a body that is pure emoji,
-# or pure CJK with transliteration off). Honest: says a message arrived and
-# that the panel cannot show it.
-UNREADABLE_TEXT = "[non-ASCII msg]"
 
 # On first sight of a transcript, read at most this much of its tail. Bounds
 # the cold-start cost: transcripts reach many MB, and the freshness window
@@ -188,125 +198,55 @@ def log(msg):
 
 
 # ---------------------------------------------------------------------------
-# ASCII folding -- the panel's fonts are 32..126 and nothing else
+# Folding -- the panel's fonts are the constraint
 # ---------------------------------------------------------------------------
+# The fold itself now lives in clawdmeter_sessions, next to elide_label and
+# fit_payload, because EVERY label on the wire needs it and not just this
+# module's sender field (a Korean session label was arriving as empty boxes).
+# Re-exported here so the names this module documents and its tests exercise
+# keep working, and so the message-body policy below reads in one place.
+fold_to_ascii = cs.fold_to_ascii
+to_panel_text = cs.to_panel_text
+romanize_hangul = cs.romanize_hangul
+panel_label = cs.panel_label
+KSX1001_HANGUL = cs.KSX1001_HANGUL
 
-# Punctuation that has an obvious ASCII equivalent. NFKD does not fold these
-# (an em dash is not a decomposable hyphen), so they need naming.
-_PUNCT = {
-    "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-",
-    "―": "-", "−": "-", "•": "-", "·": "-",
-    "‘": "'", "’": "'", "‚": "'", "‛": "'",
-    "′": "'", "‹": "'", "›": "'",
-    "“": '"', "”": '"', "„": '"', "‟": '"',
-    "«": '"', "»": '"', "″": '"',
-    "\u2026": "...", "\u00a0": " ", "\u200b": "", "\ufeff": "",
-    "、": ",", "。": ".", "，": ",", "．": ".",
-    "：": ":", "；": ";", "！": "!", "？": "?",
-    "×": "x", "→": "->", "←": "<-", "✓": "ok",
-}
-
-# Hangul -> Revised Romanization, syllable by syllable. The owner writes
-# Korean, and a Korean message rendered as "?" is useless where "polring
-# jugi" is readable. Tables are the standard RR initial / medial / final sets.
-_HANGUL_BASE = 0xAC00
-_HANGUL_LAST = 0xD7A3
-_INITIALS = ("g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "",
-             "j", "jj", "ch", "k", "t", "p", "h")
-_MEDIALS = ("a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae",
-            "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i")
-_FINALS = ("", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "p", "l",
-           "l", "p", "l", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t",
-           "p", "t")
+# Shown when folding leaves nothing legible at all (a body that is pure emoji,
+# or pure CJK with transliteration off). Honest: says a message arrived and
+# that the panel cannot show it.
+UNREADABLE_TEXT = cs.UNREADABLE_TEXT
 
 
-def romanize_hangul(ch):
-    """One precomposed Hangul syllable -> Revised Romanization, or None.
+def _cut_bytes(text, nbytes):
+    """`text` truncated to at most `nbytes` UTF-8 bytes, never mid-character.
 
-    Syllable-wise and therefore APPROXIMATE: RR's inter-syllable assimilation
-    rules are not applied, so 학년 comes out "haknyeon" where the standard
-    spells it "hangnyeon". Readable, not authoritative -- and the alternative
-    on this panel is a blank.
-    """
-    code = ord(ch)
-    if not (_HANGUL_BASE <= code <= _HANGUL_LAST):
-        return None
-    idx = code - _HANGUL_BASE
-    return _INITIALS[idx // 588] + _MEDIALS[(idx % 588) // 28] + _FINALS[idx % 28]
-
-
-_DROP = "\x00"  # internal placeholder for one untranslatable character
-
-
-def fold_to_ascii(text, translit=True):
-    """Make `text` renderable in the panel's 32..126 font, honestly.
-
-    Four passes, most faithful first:
-
-    1. ASCII passes through untouched.
-    2. Named punctuation maps to its ASCII twin (em dash -> "-", curly quotes
-       -> straight, U+2026 -> "...").
-    3. Hangul is transliterated (see romanize_hangul) when `translit`.
-    4. Anything else is NFKD-normalised and stripped of combining marks, which
-       is a genuine transliteration for accented Latin ("café" -> "cafe")
-       and nothing at all for CJK, Cyrillic or emoji.
-
-    What survives none of that is DROPPED, and each dropped RUN is replaced by
-    a single "?" -- so the reader can see that something was there and that
-    the panel could not show it. That is the whole point: a blank would lie by
-    omission and per-character "?????" would drown the words that did survive.
-    """
-    out = []
-    for ch in text:
-        if " " <= ch <= "~":
-            out.append(ch)
-            continue
-        if ch.isspace():
-            # Newlines, tabs, NBSP, ideographic space: whitespace, not
-            # untranslatable. Dropping them would put a "?" between every
-            # paragraph of a perfectly ASCII message.
-            out.append(" ")
-            continue
-        rep = _PUNCT.get(ch)
-        if rep is not None:
-            out.append(rep)
-            continue
-        if translit:
-            rom = romanize_hangul(ch)
-            if rom is not None:
-                out.append(rom)
-                continue
-        keep = "".join(c for c in unicodedata.normalize("NFKD", ch)
-                       if " " <= c <= "~")
-        out.append(keep if keep else _DROP)
-    # Collapse each run of dropped characters to one marker.
-    return re.sub(_DROP + "+", "?", "".join(out))
-
-
-def to_panel_text(body, translit=True):
-    """A message body -> one folded, single-line string a card can hold."""
-    body = body or ""
-    folded = fold_to_ascii(body, translit)
-    single = re.sub(r"\s+", " ", folded).strip()
-    if not re.search(r"[A-Za-z0-9]", single):
-        # Nothing readable left. Say so -- but only if the folding is what ate
-        # it: a body that was always just ":)" is not unreadable, it is short.
-        if any(not (" " <= c <= "~") and not c.isspace() for c in body):
-            return UNREADABLE_TEXT
-    return single
-
-
-def elide_message(text, max_chars):
-    """Head-elide. Unlike cs.elide_label (which middle-elides to keep a name's
-    trailing discriminator), a message's information is front-loaded: the
-    first words are the ones worth the pixels."""
-    if max_chars <= 0:
+    `errors="ignore"` is doing the work: a cut that lands inside a multi-byte
+    sequence leaves an undecodable tail, and dropping it is exactly the
+    character-boundary rule. Everything downstream (the wire, the firmware's
+    48->104 byte buffer, LVGL's decoder) counts bytes, so this is the honest
+    unit even though `len()` is not."""
+    if nbytes <= 0:
         return ""
-    if len(text) <= max_chars:
+    return text.encode("utf-8")[:nbytes].decode("utf-8", "ignore")
+
+
+def elide_message(text, max_bytes):
+    """Head-elide to a BYTE budget. Unlike cs.elide_label (which middle-elides
+    to keep a name's trailing discriminator), a message's information is
+    front-loaded: the first words are the ones worth the pixels.
+
+    Bytes, not characters, since the body stopped being ASCII: one Hangul
+    syllable is three bytes, so a 40-CHARACTER cap is 120 bytes on the wire
+    and overruns both the payload budget and the device's buffer. The
+    ellipsis is paid for out of the same budget."""
+    if max_bytes <= 0:
+        return ""
+    if len(text.encode("utf-8")) <= max_bytes:
         return text
-    if max_chars <= len(cs.ELLIPSIS):
-        return text[:max_chars]
-    return text[:max_chars - len(cs.ELLIPSIS)].rstrip() + cs.ELLIPSIS
+    ell = len(cs.ELLIPSIS)          # ASCII "...", so bytes == characters
+    if max_bytes <= ell:
+        return _cut_bytes(text, max_bytes)
+    return _cut_bytes(text, max_bytes - ell).rstrip() + cs.ELLIPSIS
 
 
 def panel_sender(sender, translit=True):
@@ -321,6 +261,14 @@ def panel_sender(sender, translit=True):
     A name that folds to nothing legible becomes DEFAULT_SENDER: "peer" says
     less than the real name but it is a name, where "[non-ASCII msg]" in the
     sender slot would just be noise.
+
+    NOTE the missing `keep_hangul`: this one always romanises, deliberately.
+    The sender renders in font_styrene_20/24 and the session card's name in
+    font_styrene_28/48, and none of those has the Hangul fallback the message
+    BODY got -- only MSG_BODY_FONT does. A Korean sender passed through would
+    be a row of empty boxes above a perfectly rendered Korean body. Fixing
+    that properly means Hangul faces at 20/24/48 px, ~262 KB of extra flash
+    (measured, docs/fonts.md), which is not worth it for a machine name.
     """
     folded = to_panel_text(sender or "", translit)
     if not folded or folded == UNREADABLE_TEXT:
@@ -342,12 +290,21 @@ def max_rows_for_budget(budget, configured=DEFAULT_MAX_ROWS):
 
 
 def text_max_for_budget(budget):
-    """Message length that leaves room for a session card beside it.
+    """Message length, in BYTES, that leaves room for a session card beside it.
 
-    Scales with the payload budget instead of hard-coding 40, so raising
+    Scales with the payload budget instead of hard-coding a length, so raising
     sessions_budget_bytes (the firmware buffer is 1 KB and it asks for a
     517-byte MTU) buys longer messages up to MSG_TEXT_MAX, and shrinking it
     shortens them rather than blanking the panel.
+
+    A quarter of the budget is the share that leaves room for session cards;
+    it used to be a quarter of the budget in CHARACTERS, which for Korean was
+    three times too generous — one message then ate the whole payload and
+    fit_payload() dropped every session row to pay for it. Practical
+    consequence for Korean: 45 B (15 syllables) at the 180-byte default, 65 B
+    (21 syllables) at the 260 that daemon/SESSIONS.md recommends once the link
+    has a real MTU. The default stays 180 because it is sized for the 185-byte
+    minimum an unlucky host stack may hand you, not because Korean fits in it.
     """
     try:
         budget = int(budget)
@@ -497,13 +454,15 @@ class InboxWatcher(object):
 
     def __init__(self, roots=None, freshness_s=DEFAULT_FRESHNESS_S,
                  expire_s=DEFAULT_EXPIRE_S, max_rows=DEFAULT_MAX_ROWS,
-                 text_max=MSG_TEXT_MAX, translit=True, now_fn=time.time):
+                 text_max=MSG_TEXT_MAX, translit=True, keep_hangul=True,
+                 now_fn=time.time):
         self.roots = list(roots) if roots is not None else default_roots()
         self.freshness_s = freshness_s
         self.expire_s = expire_s
         self.max_rows = max_rows
         self.text_max = text_max
         self.translit = translit
+        self.keep_hangul = keep_hangul
         self._now = now_fn
         self._files = {}       # path -> [offset, inode, cold]
         self._messages = []    # live, newest last
@@ -701,18 +660,25 @@ class InboxWatcher(object):
         live = list(reversed(self._messages))
         if len(live) > 1:
             cap = max(MSG_TEXT_MIN, cap // len(live))
-        return [message_row(m, now, cap, self.translit) for m in live]
+        return [message_row(m, now, cap, self.translit, self.keep_hangul)
+                for m in live]
 
 
-def message_row(msg, now, text_max=MSG_TEXT_MAX, translit=True):
+def message_row(msg, now, text_max=MSG_TEXT_MAX, translit=True,
+                keep_hangul=True):
     """One Message -> the positional wire row.
 
     Indices 0..12 carry exactly what they always have; index 13 is new.
     Unknown fields go out as the documented "unknown" values so the device
     hides those elements instead of drawing a confident zero.
+
+    The BODY is the one field that keeps its Hangul (`keep_hangul`), because
+    it is the one field whose font has the Hangul fallback. The sender does
+    not -- see panel_sender.
     """
     elapsed = int(max(0.0, now - msg.ts)) if msg.ts else 0
-    text = elide_message(to_panel_text(msg.body, translit), text_max)
+    text = elide_message(to_panel_text(msg.body, translit, keep_hangul),
+                         text_max)
     return [
         msg.mid[:2],                     # 0  sid: stable, keys the card
         panel_sender(msg.sender, translit),  # 1  label: who sent it, in the
@@ -779,6 +745,7 @@ def watcher_from_config(budget=cs.DEFAULT_BUDGET_BYTES, config_path=None, roots=
         max_rows=rows,
         text_max=text_max_for_budget(budget),
         translit=_config_flag("inbox_translit", True, config_path),
+        keep_hangul=_config_flag("inbox_hangul", True, config_path),
     )
 
 
@@ -800,6 +767,10 @@ def main(argv=None):
     parser.add_argument("--budget", type=int, default=cs.DEFAULT_BUDGET_BYTES)
     parser.add_argument("--no-translit", action="store_true",
                         help="drop non-ASCII instead of transliterating it")
+    parser.add_argument("--no-hangul", action="store_true",
+                        help="romanise Korean instead of sending it as "
+                             "Hangul (for firmware older than the Korean "
+                             "font, which would draw it as empty boxes)")
     parser.add_argument("--root", action="append", default=None,
                         help="projects dir to watch (repeatable; default from config)")
     args = parser.parse_args(argv)
@@ -811,13 +782,15 @@ def main(argv=None):
         max_rows=max_rows_for_budget(args.budget, DEFAULT_MAX_ROWS),
         text_max=text_max_for_budget(args.budget),
         translit=not args.no_translit,
+        keep_hangul=not args.no_hangul,
     )
 
     def report():
         msgs = watcher.poll()
         for m in msgs:
             log(f"{time.strftime('%H:%M:%S', time.localtime(m.ts))} "
-                f"<{m.sender}> {to_panel_text(m.body, watcher.translit)[:120]}")
+                f"<{m.sender}> "
+                f"{to_panel_text(m.body, watcher.translit, watcher.keep_hangul)[:120]}")
         rows = watcher.rows()
         print(cs.encode_payload(rows))
         return rows

@@ -378,6 +378,46 @@ def test_fit_respects_utf8_byte_budget():
 
 
 # ---------------------------------------------------------------------------
+# Label folding — the panel's label fonts have no Hangul fallback
+# ---------------------------------------------------------------------------
+
+def test_a_korean_label_is_folded_not_shipped_as_boxes():
+    """Only the message BODY's font has the Hangul fallback. A session label
+    renders in font_styrene_28/48, so Korean there would be a row of empty
+    boxes in the LARGEST font on the screen — which is what a Korean project
+    directory name used to produce."""
+    payload = fit_payload([_row("a3", "클로드미터-워크트리")], 4096)
+    label = json.loads(payload)["ss"][0][1]
+    assert label == "keulrodeumiteo-wokeuteuri"
+    assert all(32 <= ord(c) <= 126 for c in label)
+
+
+def test_every_label_producer_goes_through_the_fold():
+    """There are two (Session.label() and clawdmeter_fleet._label_of()), and
+    fit_payload is the single funnel both reach the wire through."""
+    for raw in ("한글", "cafés", "ascii-only", "🚀"):
+        label = json.loads(fit_payload([_row("a3", raw)], 4096))["ss"][0][1]
+        assert all(32 <= ord(c) <= 126 for c in label), (raw, label)
+        assert label, "a card with no name at all reads as a rendering bug"
+
+
+def test_folding_happens_before_eliding_not_after():
+    """Folding changes the character count (한 -> "han"), so a label elided
+    first would blow the cap it was measured against."""
+    payload = fit_payload([_row("a3", "한" * 20)], 4096)
+    label = json.loads(payload)["ss"][0][1]
+    assert len(label) <= max(mod.LABEL_FLOOR, 60) and "han" in label
+    # measured after folding: 20 syllables romanise to 60 characters
+    assert len(label) == 60
+
+
+def test_panel_label_never_returns_empty():
+    assert mod.panel_label("") == "?"
+    assert mod.panel_label("🚀") == "?"
+    assert mod.panel_label("  spaced   out  ") == "spaced out"
+
+
+# ---------------------------------------------------------------------------
 # Context window heuristic — §4.3
 # ---------------------------------------------------------------------------
 

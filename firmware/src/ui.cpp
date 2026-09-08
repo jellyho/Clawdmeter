@@ -763,9 +763,11 @@ static void session_state_text(const SessionRow* r, char* buf, size_t n) {
     switch (r->state) {
     // A message row's "state line" is the message itself — the one place on
     // the card where a session says what it is doing is where a message says
-    // what it says. Body text arrives host-folded to ASCII 32..126 (the panel
-    // fonts cover nothing else) and head-elided. Empty means a host that
-    // sends state 11 without index 13: say so rather than draw a blank line.
+    // what it says. Body text arrives host-folded and head-elided; what it is
+    // folded TO is ASCII 32..126 plus the KS X 1001 Hangul the message body's
+    // fallback font carries, so this string is UTF-8, not ASCII (see
+    // MSG_BODY_FONT and docs/fonts.md). Empty means a host that sends state 11
+    // without index 13: say so rather than draw a blank line.
     case SESSION_MESSAGE:
         snprintf(buf, n, "%s", r->msg[0] ? r->msg : "(no message text)");
         return;
@@ -813,6 +815,17 @@ static void session_tok_text(int32_t tok_k, char* buf, size_t n) {
                                (int)((tok_k % 1000) / 100));
 }
 
+// Back a byte count up to a UTF-8 character boundary. Both elide helpers
+// below shrink a byte count until the text fits and then cut there, which was
+// safe while the wire was ASCII 32..126. Korean is three bytes per character,
+// so an unaligned cut hands LVGL a dangling continuation byte — it decodes as
+// U+FFFD-ish garbage and draws a run of placeholder boxes *after* the text
+// that did fit, i.e. the elide makes the message less readable, not more.
+static size_t utf8_floor(const char* s, size_t n) {
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+    return n;
+}
+
 // Ellipsize in firmware: measure, then middle-elide with "..." (three dots),
 // keeping the label's trailing characters — that tail is the host's session
 // discriminator ("clawdmeter-36" vs "clawdmeter-2c" must stay distinct, §5).
@@ -829,10 +842,15 @@ static void label_set_ellipsized(lv_obj_t* lbl, const char* txt,
     }
     char buf[SESSION_LABEL_MAX + 4];
     size_t len = strlen(txt);
-    if (len >= SESSION_LABEL_MAX) len = SESSION_LABEL_MAX - 1;
-    const size_t tail = len > 8 ? 4 : 0;   // keep the sid discriminator
+    if (len >= SESSION_LABEL_MAX) len = utf8_floor(txt, SESSION_LABEL_MAX - 1);
+    // The tail is 4 bytes of the ORIGINAL string, so it has to start on a
+    // character boundary too — grow it to the next one (at most 6 bytes,
+    // which `buf` still holds) rather than splitting a syllable.
+    size_t tail = len > 8 ? 4 : 0;
+    if (tail) tail = len - utf8_floor(txt, len - tail);
     size_t head = len - tail;
     while (head > 0) {
+        head = utf8_floor(txt, head);
         memcpy(buf, txt, head);
         buf[head] = '\0';
         strcat(buf, "...");
@@ -874,10 +892,12 @@ static int label_set_clamped(lv_obj_t* lbl, const char* txt,
     char buf[SESSION_MSG_MAX + 4];
     size_t len = strlen(txt);
     if (len >= SESSION_MSG_MAX) len = SESSION_MSG_MAX - 1;
+    len = utf8_floor(txt, len);
     while (len > 0) {
         len--;
         // Don't leave the ellipsis floating after a space ("both  ...").
         while (len > 0 && txt[len - 1] == ' ') len--;
+        len = utf8_floor(txt, len);
         memcpy(buf, txt, len);
         strcpy(buf + len, "...");
         lv_text_get_size(&sz, buf, font, ls, lsp, max_w, LV_TEXT_FLAG_NONE);
@@ -1047,6 +1067,37 @@ static void build_chat_card(ChatCard* c, lv_obj_t* parent, int x, int y, bool fo
     c->text_dy   = text_dy;
 }
 
+// ---- Korean in the message body ----
+// The brand faces are generated over ASCII 32..126, so Hangul in a message
+// used to draw as nothing at all, and the host romanised Korean before it
+// reached the wire. font_nanum_kr_28 is NanumGothic (SIL OFL) over the 2,350
+// KS X 1001 syllables at 28 px / 1 bpp (plus the nine punctuation marks a
+// Korean IME emits that ASCII has no twin for); LVGL 9 resolves a codepoint
+// the primary font lacks through lv_font_t::fallback, so ASCII still comes
+// out of Styrene and only Hangul falls through.
+//
+// The host half ships with it: clawdmeter_inbox passes a body's Hangul
+// through instead of romanising it, but ONLY the body — see MSG_FROM_FONT
+// below. A syllable outside those 2,350 keeps romanising, because it is not
+// in this font either. See docs/fonts.md.
+LV_FONT_DECLARE(font_nanum_kr_28);
+
+// A runtime COPY of font_styrene_28 rather than an edit to
+// font_styrene_28.c's `.fallback`: the generated fonts are `const` (.rodata,
+// i.e. memory-mapped flash on ESP32 — a const_cast store there faults), the
+// generated files are meant to be regenerable, and font_styrene_28 is shared
+// with the usage screen and the splash, which have no Korean to render.
+// Costs one lv_font_t (~40 B of .bss). Composed lazily so it cannot depend on
+// ui_init() having run first.
+static const lv_font_t* msg_body_font(void) {
+    static lv_font_t kr;                    // font_styrene_28 + Hangul fallback
+    if (!kr.get_glyph_dsc) {
+        kr = font_styrene_28;
+        kr.fallback = &font_nanum_kr_28;
+    }
+    return &kr;
+}
+
 // ---- The two card anatomies ----
 // Message-card metrics. The hierarchy inverts against the session card: there
 // the identity is the headline and the status is the footnote, here the words
@@ -1054,14 +1105,24 @@ static void build_chat_card(ChatCard* c, lv_obj_t* parent, int x, int y, bool fo
 // name font would shout the wrong word) and the BODY is the largest, brightest
 // text on the card — COL_TEXT at full opacity where a state line is COL_DIM.
 //
-// Sizes, plainly, because "the size the name gets" would not be true: on a
-// list card the body is styrene_24 — the same size as a session card's state
-// line, one step under its 28px name — over a styrene_20 sender. It is the
-// biggest text on a message card because the 28px slot is not used at all.
-// Going to 28 would cost the second body line the 104px list card has room
-// for, which a 40-character message needs.
+// Sizes, plainly, because "the size the name gets" would not be true: the
+// body is styrene_28 on BOTH card kinds — the session card's name size — over
+// a styrene_24 / styrene_20 sender. One fixed size is not a stylistic choice:
+// there is exactly one Hangul face and it is 28 px, and 28 px Hangul (ink 24
+// px above the baseline) does not fit a styrene_24 line box (20 px of ascent)
+// without colliding with the line above it. A second Hangul face at 24 px is
+// a measured 150,729 B of flash for a 4 px difference.
+// It costs the list card nothing: 88 px of content less a 21 px sender row
+// and the 4 px gap leaves 63 px, which is still two 30 px lines.
+//
+// MSG_FROM_FONT gets NO Hangul fallback, and that is deliberate rather than
+// an omission: a Korean sender would need faces at 20 and 24 px, and the
+// session card's own name font would need 48 as well — 785,424 B measured,
+// four times the font already here, for a machine name. The host romanises
+// those fields instead (clawdmeter_inbox.panel_sender /
+// clawdmeter_sessions.panel_label). See docs/fonts.md § "Fallback fonts".
 #define MSG_FROM_FONT(c) ((c)->focus ? &font_styrene_24 : &font_styrene_20)
-#define MSG_BODY_FONT(c) ((c)->focus ? &font_styrene_28 : &font_styrene_24)
+#define MSG_BODY_FONT(c) msg_body_font()
 #define MSG_DOT_SZ   10    // a marker on a metadata line, not a status dot
 #define MSG_GUTTER   18    // dot column; the body hangs under the sender text
 #define MSG_ROW_GAP  4     // sender row ↓ body
