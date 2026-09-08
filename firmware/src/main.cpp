@@ -130,8 +130,12 @@ static SessionList sessions = {};
 
 // Parse a session payload (issue #135 §5) into a SessionList. Rows are
 // positional and arrive pre-sorted by the host:
-//   {"ss":[[sid,label,state,ctx,elapsed_s,model,tool,ntools,nagents,tdone,ttotal,tok],...]}
-// (tok is optional — appended in a later wire revision.)
+//   {"ss":[[sid,label,state,ctx,elapsed_s,model,tool,ntools,nagents,tdone,ttotal,tok,
+//           remote,msg],...]}
+// Trailing fields are optional — the wire is append-only, so each was added by
+// a later host and every index past the guard below defaults to "unknown"
+// rather than to a confident value. `msg` (13) rides only on SESSION_MESSAGE
+// rows; `remote` (12) is parsed by nothing here yet and is skipped on purpose.
 // Returns false on a malformed payload — caller keeps the last good list.
 static bool parse_sessions(const char* json, SessionList* out) {
     JsonDocument doc;
@@ -164,6 +168,19 @@ static bool parse_sessions(const char* json, SessionList* out) {
         // Index 11 (tok, 1k units) was appended after the first host release —
         // absent on older hosts, so out-of-range reads default to "unknown".
         r->tok       = (int32_t)(row[11]      | -1);
+        // Index 13 (message body) rides ONLY on SESSION_MESSAGE rows: session
+        // rows stay 13 fields long, and a host without the inbox watcher never
+        // sends it at all. An out-of-range or non-string index yields "" here,
+        // so absent means empty rather than whatever was in the row before —
+        // the same defaulting the short-row guard above relies on.
+        const char* msg = (const char*)(row[13] | "");
+        snprintf(r->msg, sizeof(r->msg), "%s", msg);
+        // The host elides to 40 chars, so the buffer has headroom; a host that
+        // ignores that would otherwise be cut mid-word with no sign of it.
+        // Say the words are missing rather than hand the panel a half-sentence
+        // it will render as if it were the whole message.
+        if (strlen(msg) >= sizeof(r->msg))
+            memcpy(r->msg + sizeof(r->msg) - 4, "...", 4);
         out->count++;
     }
     return true;

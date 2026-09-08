@@ -41,6 +41,14 @@ enum session_state_t : uint8_t {
     SESSION_WAITING_INPUT      = 8,   // waiting bucket — accent + pulse
     SESSION_ERROR              = 9,   // waiting bucket — accent + pulse
     SESSION_ENDED              = 10,  // never sent to the device
+    // Not a session at all. Another Claude Code session sent THIS MACHINE a
+    // message (the SendMessage / ListAgents peer channel); the host's inbox
+    // watcher turns it into a row so the panel can show it. `label` carries
+    // the sender, `msg` (wire index 13) the body, and every session-shaped
+    // field arrives as "not applicable" (-1 / 0) to be hidden, not drawn as a
+    // confident zero. Its own bucket in the UI: never the waiting pulse (a
+    // message is something to read, not a chat blocked on you).
+    SESSION_MESSAGE            = 11,
 };
 
 enum session_model_t : uint8_t {
@@ -69,6 +77,17 @@ enum session_tool_t : uint8_t {
 #define SESSION_MAX_ROWS  6
 #define SESSION_LABEL_MAX 32     // host middle-elides to fit the MTU budget;
                                  // the UI ellipsizes to the card width itself
+// Message body (wire index 13, SESSION_MESSAGE rows only). The host caps the
+// folded body at 40 characters and head-elides ("first words..."), so 48 is
+// the cap plus headroom, and it keeps the row 4-byte aligned. It is a fixed
+// field on EVERY row rather than a side pool: rows are filled positionally by
+// index and matched by sid, and a pool would buy 4 rows' worth of bytes at the
+// price of an indirection in the hottest render path. Static cost of the
+// choice: 48 B x SESSION_MAX_ROWS = 288 B, taking the one SessionList
+// instance (main.cpp) from 340 B to 628 B — affordable even on the
+// PSRAM-free C6 boards, where it is internal SRAM that is already carrying
+// LVGL.
+#define SESSION_MSG_MAX   48
 
 struct SessionRow {
     char    sid[3];                  // 2 hex chars + NUL, stable for the session's
@@ -86,6 +105,11 @@ struct SessionRow {
     int32_t tok;                     // context tokens used, in units of 1k
                                      // (190 = 190k, 1200 = 1.2M); -1 = unknown.
                                      // Wire index 11; absent (older host) → -1.
+    char    msg[SESSION_MSG_MAX];    // SESSION_MESSAGE body: already folded to
+                                     // ASCII 32..126 and head-elided by the
+                                     // host (the panel fonts cover no more).
+                                     // Wire index 13; empty on session rows
+                                     // and on every host older than the inbox.
 };
 
 struct SessionList {

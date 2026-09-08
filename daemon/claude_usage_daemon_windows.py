@@ -134,6 +134,19 @@ class AuthError(Exception):
     must NOT be mislabeled as a token problem (SC#5: a boot-time `getaddrinfo
     failed` DNS blip wrongly fired the 'token expired' toast)."""
 
+def _read_config_text():
+    """The config file's text, or "" — never an exception.
+
+    Decoded as utf-8-sig so a BOM (which Notepad adds by default) is stripped
+    rather than fatal, with errors replaced so a stray byte in a comment can
+    never crash a background daemon the user cannot see.
+    """
+    try:
+        return CONFIG_FILE.read_text(encoding="utf-8-sig", errors="replace")
+    except (OSError, ValueError):
+        return ""
+
+
 def read_chime_setting() -> str:
     """Read the `chime` option from the config file. One of: off|on.
 
@@ -141,7 +154,10 @@ def read_chime_setting() -> str:
     """
     try:
         if CONFIG_FILE.exists():
-            for line in CONFIG_FILE.read_text().splitlines():
+            # utf-8-sig, not the locale default: Notepad writes a BOM by
+            # default, and on a non-UTF-8 locale (cp949 here) read_text()
+            # crashes on those three bytes and takes the daemon with it.
+            for line in _read_config_text().splitlines():
                 line = line.split("#", 1)[0].strip()
                 if "=" not in line:
                     continue
@@ -162,7 +178,10 @@ def read_clock_setting() -> str:
     """
     try:
         if CONFIG_FILE.exists():
-            for line in CONFIG_FILE.read_text().splitlines():
+            # utf-8-sig, not the locale default: Notepad writes a BOM by
+            # default, and on a non-UTF-8 locale (cp949 here) read_text()
+            # crashes on those three bytes and takes the daemon with it.
+            for line in _read_config_text().splitlines():
                 line = line.split("#", 1)[0].strip()
                 if "=" not in line:
                     continue

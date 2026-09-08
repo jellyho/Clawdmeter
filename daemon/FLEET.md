@@ -5,20 +5,26 @@ by hooks. This is the other half: the sessions you drive through **Remote
 Control**, running on machines you are not sitting at.
 
 It produces the same wire payload and writes the same handoff file, so the BLE
-daemons ship it unchanged and **the firmware needs no changes at all** — a
-remote session renders exactly like a local one, including the auto-jump when
-one starts waiting on you.
+daemons ship it unchanged and **a remote session needs no firmware changes at
+all** — it renders exactly like a local one, including the auto-jump when one
+starts waiting on you. (The message rows added below do need one new trailing
+wire field; see [Wire format additions](#wire-format-additions).)
 
 ```
 Anthropic sessions API ──30 s poll──▶ clawdmeter_fleet.py
                                           │ bridge rows only
-                                          │ this machine's own rows removed
+~/.claude/projects/**/*.jsonl ─2 s tail─▶ │ this machine's own rows removed
+  (messages other sessions sent here)     │ messages first, then sessions
                                           │ sorted attention-first, fitted
                                           ▼
                                 ~/.clawdmeter/sessions.json
                                           │ on change
                         BLE daemon ──────▶ device SS characteristic
 ```
+
+Two sources, one payload. The remote-session rows come from the API poll
+below; the message rows come from `clawdmeter_inbox.py`, which is documented
+in [its own section](#messages-from-other-claude-code-sessions).
 
 ## Read this before you turn it on
 
@@ -101,6 +107,222 @@ subagent counts — go out as the documented "unknown" values, so the device
 **hides** those elements rather than drawing a confident zero. The label is the
 session `title`, falling back to the git repo name, then to "remote"; these
 rows carry no usable working directory.
+
+## Messages from other Claude Code sessions
+
+Claude Code sessions can message each other: one calls `SendMessage` naming a
+peer from `ListAgents`. When a message arrives on this machine, the device
+shows it — sender on the card, message text under it.
+
+This is a **documented first-party feature**, which makes it a sounder
+foundation than the undocumented listing endpoint the rest of this file has to
+apologise for.
+
+What the device does with it: a new message pulls the panel to the Sessions tab
+once (the same auto-jump a session blocked on a permission prompt fires, and
+the same Settings switch turns both off), holds it for the 10 s dwell, and then
+returns to whatever screen you were on. The card itself stays for
+`inbox_expire_s`, one swipe away — being *pulled* to the tab is the
+notification, and a message is something to read, not something to keep
+flashing at you, so it never gets the waiting card's accent or pulse.
+
+### How the message is found
+
+A received message is appended to the **receiving** session's transcript
+(`~/.claude/projects/<munged-cwd>/<session-id>.jsonl`) as a `user` record whose
+content begins:
+
+```
+Another Claude session sent a message:
+<cross-session-message from="uds:..." from-name="CLAWDMETER" from-mode="prompting">
+...the body...
+</cross-session-message>
+```
+
+`clawdmeter_inbox.py` tails those files and reads only the bytes appended since
+its last pass. Sender comes from `from-name`, the body from between the tags.
+Parsing is deliberately loose: attribute order, the preamble wording and the
+string-vs-block-list shape of `content` are all things a Claude Code release
+can change, so none of them is treated as a contract.
+
+**Watching transcripts is the zero-cost approach**, and the reason is worth
+stating: a session only writes the message when it is alive to process it, so
+there is no host-side spool to read instead. Watching the sessions you already
+have open adds no session and no model turns. A dedicated always-on "inbox"
+session would work too, and would burn a model turn per message on a device
+whose entire purpose is watching quota.
+
+Only **top-level** transcripts are watched — `<project>/<id>.jsonl`, no
+recursion. `subagents/` and `workflows/` are excluded: those are an
+orchestrator talking to its own children, not another person's session reaching
+this machine, and there are far more of them (193 `.jsonl` files on the
+development box, 16 of them real sessions).
+
+### Non-ASCII, and why the panel does not just go blank
+
+The firmware's Styrene/Tiempos fonts cover **U+0020..U+007E and nothing else**.
+A Korean or Japanese body would render as blanks. Shipping that silently would
+be a lie, so the text is folded before it goes on the wire, most-faithful rule
+first:
+
+| Input | On the panel | Why |
+| --- | --- | --- |
+| ASCII | unchanged | — |
+| `—` `“ ”` `…` NBSP | `-` `" "` `...` space | Named ASCII twins; NFKD does not fold these |
+| `café` | `cafe` | NFKD, combining marks dropped — a real transliteration |
+| `안녕하세요` | `annyeonghaseyo` | Revised Romanization, syllable by syllable |
+| `中文` `テスト` `😀` | `?` | Nothing faithful to fall back on |
+| a body with none of it legible | `[non-ASCII msg]` | Says a message arrived and that the panel cannot show it |
+
+The Hangul pass is there because the owner of this device writes Korean, and
+`?` would make the feature useless for him. It is **approximate**: RR's
+inter-syllable assimilation rules are not applied, so `학년` comes out
+`haknyeon` where the standard spells it `hangnyeon`. Readable, not
+authoritative. Set `inbox_translit = off` to drop non-ASCII instead.
+
+Untranslatable characters collapse per **run**, not per character, so one `?`
+stands in for a dropped phrase rather than `?????` drowning the words that did
+survive.
+
+**The sender name goes through the same fold**, so the fallback actually holds:
+an unrenderable body still tells you who it came from. (It did not always —
+folding the body and not the label shipped `annyeonghaseyo …` under five tofu
+boxes for a peer whose machine name is Korean.) A name that folds to nothing at
+all becomes `peer`, and a long one is middle-elided to the device's 32-char
+label buffer so the tail that distinguishes two machines survives.
+
+### What it costs on the wire
+
+A message row is worth about **two session cards** at the default 180-byte
+budget. Measured against `cs.fit_payload` with five remote sessions:
+
+```
+budget 180, 0 messages: 159 B — 3 session cards
+budget 180, 1 message : 180 B — the message + 2 session cards
+budget 260, 2 messages: 245 B — 2 messages   + 2 session cards
+```
+
+Messages are placed **first** and `fit_payload` drops from the tail, so what
+gets evicted is the least urgent session card and never the message.
+
+**Two message rows cost ~146 B whatever the text cap** (the per-message length
+already halves when two are live), which at the 180-byte default leaves room
+for *no session card at all* — a Sessions tab with no sessions on it, for the
+whole expiry window. So the row count is derived from the budget as well as
+from `inbox_max_rows`: below **200 bytes only the newest message is shown**,
+and the poller logs the cap when it applies it. An older message has already
+had its own card and its own notification, so the thing given up is smaller
+than the thing protected.
+
+Messages also **expire after 3 minutes** (`inbox_expire_s`): without a window
+the panel would fill with mail and never show a session again. Three minutes
+covers a glance cycle on a desk device; a message you have not noticed in three
+minutes is one you will read on the computer.
+
+If you would rather keep more session cards — and get two message rows —
+raise `sessions_budget_bytes` to **260**. Mind the MTU note in SESSIONS.md: the
+budget has to stay under the ATT MTU the link negotiates, and 260 needs an MTU
+of at least 263. The firmware asks for 517 and its buffer is 1 KB, so a normal
+stack is fine; the conservative 180 default exists for host stacks that
+negotiate the 185-byte minimum.
+
+### Latency
+
+Messages do **not** wait for the 30 s listing poll. The loop ticks every 2 s,
+re-reading only the transcript bytes that are new, and writes the handoff file
+as soon as something meaningful changes — so a message is on the panel within
+the BLE daemon's own 5 s tick.
+
+"Meaningful" excludes the clock: every row carries an `elapsed` field that
+advances on its own, and comparing whole payloads on a 2 s loop would look like
+a change every 2 s and turn into a BLE write every 5 s forever. The loop
+compares the payload with `elapsed` blanked, and refreshes anyway once per
+listing interval so the ages on screen do not freeze.
+
+**Retraction matters as much as publication.** The loop stays silent until it
+has something to say — a machine with no token and no mail never blanks a panel
+some other producer filled — but only *until*. Once it has written the file it
+owns it, and an expired message must be writable back to `{"ss":[]}` even when
+the listing is unavailable (no token, or an endpoint that has moved). Otherwise
+the row ships forever at a frozen age: the sessions view could never show a
+session again, and on the device the message would sit in the notify set with
+no falling edge to hand the screen back.
+
+### Privacy — this one is different
+
+Every other row this project sends the device carries names, states and counts.
+SESSIONS.md says so explicitly: *"Nothing from the payload text ever reaches the
+device."*
+
+**Message rows break that rule on purpose** — the message body is the feature.
+It is read from local disk, folded to ASCII, truncated to ~40 characters, and
+sent over your own BLE link to your own device on your own desk. Nothing leaves
+the machine over the network. But if a desk device that can be read over your
+shoulder is not somewhere you want message text, turn it off:
+
+```ini
+inbox = off
+```
+
+### First run
+
+The watcher establishes a baseline instead of dumping backlog: on a cold start
+it tail-reads each transcript and discards anything older than
+`inbox_freshness_s` (120 s), so starting the poller never floods the panel with
+this morning's mail. A cold pass over 16 transcripts takes ~40 ms.
+
+That guarantee does **not** rest on the transcript timestamp format. A record
+whose date is missing, `null`, or written some other way has an unknown age —
+and unknown age inside a 256 KB tail of history is not news, so on a first
+sight of a file (and on a re-read after rotation) those records are dropped
+rather than dated "now". On a later pass they *are* dated "now", which is true:
+they arrived in bytes that were not there before. Everything else in this
+module treats Claude Code's transcript prose as non-contractual, and the one
+guarantee that keeps old private message text off a desk panel should not be
+the exception.
+
+### Checking it without the device
+
+`clawdmeter_inbox.py` runs standalone and read-only — it never writes the
+handoff file:
+
+```bash
+python3 daemon/clawdmeter_inbox.py --once        # what is live right now
+python3 daemon/clawdmeter_inbox.py --watch       # keep printing as mail arrives
+python3 daemon/clawdmeter_inbox.py --once --freshness 86400   # look back a day
+```
+
+### Config
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `inbox` | `on` | Set `off` to stop showing messages. Only ever active when `fleet = on`. |
+| `inbox_expire_s` | `180` | How long a message stays on the panel. |
+| `inbox_freshness_s` | `120` | How far back a fresh start looks. Also the cold-start baseline. |
+| `inbox_max_rows` | `2` | Concurrent message rows. The per-message text shortens when two are live so both fit — and the count is capped to **1** while `sessions_budget_bytes` is under 200, because two rows there leave no room for a session card. |
+| `inbox_translit` | `on` | `off` drops non-ASCII instead of transliterating it. |
+
+The watcher reads `config_dirs` (shared with the daemons) the same way the hook
+sidecar does, so extra Claude config dirs are watched too.
+
+## Wire format additions
+
+A message row is the same positional row the firmware already parses, with one
+new **trailing** field:
+
+| # | Field | Value on a message row |
+| - | --- | --- |
+| 1 | `label` | the sender's `from-name` |
+| 2 | `state` | **11** — new state code, `SESSION_MESSAGE`. Appended after `SESSION_ENDED = 10` in `firmware/src/data.h`; the codes are append-only because they cross the BLE boundary |
+| 3, 11 | `ctx`, `tok` | `-1` — not applicable to a message |
+| 4 | `elapsed_s` | age of the message |
+| 12 | `remote` | `-1` (unknown) — Remote Control is meaningless for a message |
+| **13** | **message text** | **new**: the folded, elided body |
+
+Indices 0..12 are byte-identical to what they have always been, so firmware
+that stops reading at index 12 sees a normal row and ignores the tail. Only
+message rows carry index 13 — session rows stay 13 fields long, because a field
+nobody reads is pure byte budget.
 
 ## Limits
 

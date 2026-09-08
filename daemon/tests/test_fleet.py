@@ -71,6 +71,25 @@ def test_strip_id_prefix_handles_both_spellings():
     assert fleet.strip_id_prefix(None) == ""
 
 
+def test_sids_are_distinct_for_ulid_shaped_ids():
+    """Caught live: every server-side id in this listing is ULID-shaped and
+    starts "01", and cs.short_sid() keeps a leading hex pair verbatim -- so
+    four different machines all came back as card "01" and the firmware could
+    not tell the cards apart. fleet_sid must hash instead."""
+    ids = ["session_01ABCDEF", "session_01GHIJKL", "session_01MNOPQR", "cse_01STUVWX"]
+    sids = [fleet.fleet_sid(i) for i in ids]
+    assert len(set(sids)) == len(ids), sids
+    assert all(len(s) == 2 for s in sids)
+    # and stable across polls
+    assert fleet.fleet_sid(ids[0]) == sids[0]
+
+
+def test_wire_rows_from_one_listing_have_distinct_sids():
+    rows = [api_row(rid=f"session_01ROW{i}", title=f"box-{i}") for i in range(4)]
+    out = fleet.select_rows(rows)
+    assert len({r[0] for r in out}) == 4
+
+
 def test_local_sessions_are_excluded(tmp_path):
     """The machine the owner is sitting at must not fill the panel."""
     (tmp_path / "111.json").write_text(

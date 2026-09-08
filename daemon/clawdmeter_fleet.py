@@ -39,6 +39,7 @@ daemon ships that straight to hardware.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -51,13 +52,23 @@ import urllib.request
 # write. Reuse all of it rather than growing a second, drifting copy.
 try:
     from . import clawdmeter_sessions as cs
+    from . import clawdmeter_inbox as inbox
 except ImportError:  # run as a script, not a package
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import clawdmeter_sessions as cs
+    import clawdmeter_inbox as inbox
 
 API_URL = "https://api.anthropic.com/v1/code/sessions"
 API_TIMEOUT_S = 10
 POLL_INTERVAL_S = 30      # what the official client uses for its own roster
+# The loop ticks faster than it polls. Remote session status genuinely cannot
+# be fresher than the 30 s listing, but a cross-session MESSAGE is already on
+# disk the moment it arrives -- making it wait for the next listing would add
+# up to 30 s of latency for nothing. On a 2 s tick a message reaches the
+# handoff file almost immediately and the BLE daemon's own 5 s tick ships it,
+# so the panel lights up within seconds. See _significant() for why this does
+# not turn into a GATT write every two seconds.
+TICK_S = 2
 PAGE_LIMIT = 100
 MAX_PAGES = 10            # the client's own cap
 MAX_ROWS = 50             # ditto
@@ -133,6 +144,18 @@ def local_bridge_ids(sessions_dir=None):
         if isinstance(bid, str) and bid:
             out.add(strip_id_prefix(bid))
     return out
+
+
+def fleet_sid(row_id):
+    """2 hex chars keying a card's identity across polls.
+
+    NOT cs.short_sid(): that takes the first two characters when they are
+    already hex, which is right for local UUID session ids but degenerate
+    here -- every server-side id in this listing is ULID-shaped and begins
+    "01", so four different machines all came back as card "01" and the
+    firmware's reorder animation could not tell them apart. Hash always.
+    """
+    return hashlib.md5((row_id or "").encode("utf-8")).hexdigest()[:2]
 
 
 def strip_id_prefix(sid):
@@ -284,7 +307,7 @@ def to_wire_row(row, now=None):
     last = _epoch(row.get("last_event_at") or row.get("updated_at") or row.get("created_at"))
     elapsed = int(max(0.0, now - last)) if last else 0
     return [
-        cs.short_sid(strip_id_prefix(row.get("id") or "")),
+        fleet_sid(row.get("id") or ""),
         _label_of(row),
         row_state(row),
         -1,                 # ctx: not exposed by this API
@@ -327,21 +350,127 @@ def select_rows(api_rows, exclude_ids=None, show_offline=False):
 # Poll loop
 # ---------------------------------------------------------------------------
 
-def build_payload(api_rows, budget, exclude_ids=None, show_offline=False):
-    rows = select_rows(api_rows, exclude_ids, show_offline)
-    return cs.fit_payload(rows, budget)
+def merge_rows(api_rows, exclude_ids=None, show_offline=False, inbox_rows=None):
+    """Message rows FIRST, then the remote sessions.
+
+    Messages jump the attention-first sort rather than being fed through it:
+    a message is a person asking for something, which outranks any machine
+    state, and the sort key it would need does not exist (state_bucket() lives
+    in the sidecar and puts an unknown code in the idle bucket).
+
+    Order matters for more than looks -- cs.fit_payload() drops from the TAIL
+    when the byte budget runs out, so putting messages first is also what
+    guarantees the message survives and a session card is what gets evicted.
+    """
+    return list(inbox_rows or []) + select_rows(api_rows, exclude_ids, show_offline)
 
 
-def poll_once(budget, show_offline=False, opener=None, token=None):
+def build_payload(api_rows, budget, exclude_ids=None, show_offline=False,
+                  inbox_rows=None):
+    return cs.fit_payload(
+        merge_rows(api_rows, exclude_ids, show_offline, inbox_rows), budget)
+
+
+def _significant(rows):
+    """The part of a payload that means something changed.
+
+    Every row carries `elapsed`, which ticks up on its own, so comparing whole
+    payloads on a 2 s loop would look like a change every 2 s and turn into a
+    BLE write every 5 s. Blank index 4 and compare the rest: a new message, a
+    state change or a reorder is significant; a clock advancing is not.
+    """
+    return json.dumps([[0 if i == 4 else c for i, c in enumerate(r)] for r in rows],
+                      separators=(",", ":"), ensure_ascii=False)
+
+
+def poll_once(budget, show_offline=False, opener=None, token=None, watcher=None):
     """One cycle. Returns the wire payload, or None when nothing can be said."""
+    inbox_rows = []
+    if watcher is not None:
+        watcher.poll()
+        inbox_rows = watcher.rows()
     token = token or read_token()
     if not token:
         log("no OAuth token found -- log in with `claude` first")
-        return None
+        # A message needs no token: it was read off local disk. Publishing
+        # just the messages is better than publishing nothing.
+        return build_payload([], budget, set(), show_offline, inbox_rows) \
+            if inbox_rows else None
     api_rows = fetch_sessions(token, opener)
     if api_rows is None:
         return None       # transport or shape failure: keep the last good panel
-    return build_payload(api_rows, budget, local_bridge_ids(), show_offline)
+    return build_payload(api_rows, budget, local_bridge_ids(), show_offline,
+                         inbox_rows)
+
+
+def run_loop(budget, show_offline=False, watcher=None, tick_s=TICK_S,
+             poll_interval_s=POLL_INTERVAL_S, sessions_file=None,
+             iterations=None, sleep_fn=time.sleep, now_fn=time.time):
+    """The service loop: poll the listing slowly, the inbox quickly.
+
+    Publishes only when something actually changed (see _significant), with a
+    refresh no less often than the listing interval so `elapsed` on the panel
+    does not freeze. Stays completely silent until it has something real to
+    say, so a machine with no token and no messages never blanks a panel some
+    other producer filled.
+    """
+    sessions_file = sessions_file or cs.DEFAULT_SESSIONS_FILE
+    api_rows = []
+    exclude = set()
+    have_listing = False
+    warned_token = False
+    next_poll = 0.0
+    last_payload = last_sig = None
+    last_write = 0.0
+    count = 0
+
+    while iterations is None or count < iterations:
+        count += 1
+        now = now_fn()
+
+        if now >= next_poll:
+            next_poll = now + poll_interval_s
+            token = read_token()
+            if token:
+                warned_token = False
+                fetched = fetch_sessions(token)
+                if fetched is not None:
+                    api_rows = fetched
+                    exclude = local_bridge_ids()
+                    have_listing = True
+            elif not warned_token:
+                warned_token = True
+                log("no OAuth token found -- remote sessions off "
+                    "(messages, which need none, still work)")
+
+        inbox_rows = []
+        if watcher is not None:
+            watcher.poll()
+            inbox_rows = watcher.rows(now)
+        rows = merge_rows(api_rows, exclude, show_offline, inbox_rows)
+
+        # Stay quiet only until this loop has published something. The guard
+        # exists so a machine with no token and no mail never blanks a panel
+        # the hook sidecar filled -- but ONCE WE HAVE WRITTEN THE FILE WE OWN
+        # IT, and an expired message has to be retractable. Without the
+        # `last_payload is None` half, a run with no usable listing (no token,
+        # or an endpoint that 404s -- two of the three transport states) would
+        # publish a message and then never be able to take it back: the row
+        # would ship forever, at a frozen age, and the sessions view could
+        # never show a session again.
+        if not rows and not have_listing and last_payload is None:
+            sleep_fn(tick_s)          # nothing to say yet: do not blank anything
+            continue
+
+        payload = cs.fit_payload(rows, budget)
+        sig = _significant(rows)
+        stale = (now - last_write) >= poll_interval_s
+        if payload != last_payload and (sig != last_sig or stale):
+            cs.write_sessions_file(sessions_file, payload)
+            last_payload, last_sig, last_write = payload, sig, now
+
+        sleep_fn(tick_s)
+    return last_payload
 
 
 def _enabled(config_path=None):
@@ -359,6 +488,8 @@ def main(argv=None):
                         help="include bridge sessions whose machine is disconnected")
     parser.add_argument("--budget", type=int, default=None,
                         help=f"payload byte budget (default {cs.DEFAULT_BUDGET_BYTES})")
+    parser.add_argument("--no-inbox", action="store_true",
+                        help="do not show messages other Claude sessions send here")
     args = parser.parse_args(argv)
 
     if not args.force and not _enabled():
@@ -373,21 +504,22 @@ def main(argv=None):
         except ValueError:
             budget = cs.DEFAULT_BUDGET_BYTES
 
+    watcher = None
+    if not args.no_inbox and inbox.enabled():
+        watcher = inbox.watcher_from_config(budget)
+
     if args.once:
-        payload = poll_once(budget, args.show_offline)
+        payload = poll_once(budget, args.show_offline, watcher=watcher)
         if payload is None:
             return 1
         print(payload)
         return 0
 
-    log(f"polling every {POLL_INTERVAL_S}s -> {cs.DEFAULT_SESSIONS_FILE}")
-    last = None
-    while True:
-        payload = poll_once(budget, args.show_offline)
-        if payload is not None and payload != last:
-            cs.write_sessions_file(cs.DEFAULT_SESSIONS_FILE, payload)
-            last = payload
-        time.sleep(POLL_INTERVAL_S)
+    log(f"listing every {POLL_INTERVAL_S}s, inbox every {TICK_S}s "
+        f"-> {cs.DEFAULT_SESSIONS_FILE}")
+    if watcher is None:
+        log("inbox off (set `inbox = on` in the config, or drop --no-inbox)")
+    run_loop(budget, args.show_offline, watcher)
 
 
 if __name__ == "__main__":

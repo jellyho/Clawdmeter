@@ -39,7 +39,9 @@ static const SettingSpec SPECS[] = {
     { SETTING_KIND_CHOICE, "snd_vol", 1, 3, VOLUME_CHOICES, "Volume",
       "How loud the chime is" },
     { SETTING_KIND_BOOL,   "jump_en", 1, 2, NULL, "Auto-jump",
-      "Open sessions when one needs you" },
+      // Two things fire it now: a session in the waiting bucket and a message
+      // from another Claude session. The old wording promised only the first.
+      "Open sessions on alerts, messages" },
     { SETTING_KIND_BOOL,   "splash",  1, 2, NULL, "Boot splash",
       "Start on Clawd instead of usage" },
     // Defaults to Auto: the host's clock hint drove the title clock before

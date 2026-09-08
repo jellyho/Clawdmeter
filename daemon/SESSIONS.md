@@ -213,7 +213,7 @@ An unreadable roster freezes the last reading rather than downgrading it to
 | --- | --- | --- |
 | `hook_port` | unset | Loopback port for the hook listener. **Unset = feature off** — the sidecar exits, the daemon sends nothing. |
 | `context_window_k` | unset | Pin the context window in kilotokens (e.g. `200`, `1000`). Blank = heuristic: 200k default, 1M on a `[1m]` model marker, snap up to the next 1M multiple when observed usage exceeds the assumption. A pinned value disables the snap-up. |
-| `sessions_budget_bytes` | `180` | Byte budget for the fitted payload. Labels middle-elide down to an 8-char floor first, then the least-urgent rows drop from the tail. Keep below the BLE MTU the device negotiates. |
+| `sessions_budget_bytes` | `180` | Byte budget for the fitted payload. Labels middle-elide down to an 8-char floor first, then the least-urgent rows drop from the tail. Keep below the BLE MTU the device negotiates: an N-byte payload needs an MTU of at least N+3, so the `180` default is sized for the 185-byte minimum an unlucky host stack may hand you. The firmware asks for 517 and buffers 1 KB, so on a normal stack `260` is fine — and `260` is what the message rows in [FLEET.md](FLEET.md#what-it-costs-on-the-wire) want. |
 
 The sidecar also honors `config_dirs` (shared with the daemons) to find session
 rosters and transcripts across several Claude config dirs.

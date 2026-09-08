@@ -228,13 +228,17 @@ def read_config_value(key, path=None):
     pattern = re.compile(r"^\s*" + re.escape(key) + r"\s*=\s*(.*)$")
     val = None
     try:
-        with open(path, encoding="utf-8") as fh:
+        # utf-8-sig strips a BOM, which Notepad writes by default and which
+        # would otherwise glue itself to the first key and stop it matching.
+        # ValueError catches an undecodable file: a background process the
+        # user cannot see must not die over a stray byte in a comment.
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
             for line in fh:
                 m = pattern.match(line.rstrip("\r\n"))
                 if m:
                     v = re.sub(r"\s*(#.*)?$", "", m.group(1)).strip()
                     val = v
-    except OSError:
+    except (OSError, ValueError):
         return None
     return val or None
 

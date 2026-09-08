@@ -314,7 +314,7 @@ static bool s_gesture_used = false;
 static bool     s_auto_jumped     = false;
 static screen_t s_auto_jump_from  = SCREEN_USAGE;
 static uint32_t s_auto_jump_ms    = 0;      // lv_tick when the jump happened
-static bool     s_auto_return_due = false;  // waiting set cleared; dwell running
+static bool     s_auto_return_due = false;  // notify set cleared; dwell running
 #define AUTO_RETURN_DWELL_MS 10000u
 
 // Animation state
@@ -629,13 +629,28 @@ struct ChatCard {
     lv_obj_t* img_agents;
     lv_obj_t* lbl_agents;
     lv_obj_t* lbl_elapsed;
-    const lv_font_t* name_font;  // for the firmware-side name ellipsis
+    const lv_font_t* name_font;  // font ON lbl_name now — the firmware-side
+                                 // ellipsis measures with it, so it tracks the
+                                 // anatomy (session name vs message sender)
     int  name_w;
     char sid[3];
     int  target_y;          // slide destination (list cards)
     bool used;
     bool waiting;
     bool claimed;           // per-update matching scratch
+    // The card has two anatomies now — session and message (§ chat_card_apply
+    // _kind). Cards are pooled by sid, so the same widget set can be a session
+    // card one payload and a message card the next: the session geometry has
+    // to be restorable, which means remembering what build_chat_card chose
+    // rather than recomputing constants in two places.
+    bool focus;                  // built as the ONE-CHAT card
+    bool is_msg;                 // current anatomy
+    const lv_font_t* name_font_base;  // session name font (restore target)
+    const lv_font_t* line_font;  // session state/badge/timer font
+    int  content_h;              // card height minus its own padding
+    int  dot_sz;
+    int  dot_dy;                 // session dot align offset (BOTTOM_LEFT)
+    int  text_dy;                // session state-line align offset
 };
 
 static lv_obj_t* focus_group = nullptr;   // ONE-CHAT (§1.3)
@@ -666,18 +681,33 @@ static lv_image_dsc_t icon_agents_dsc, icon_agents_small_dsc;
 
 // Resolver inputs (§2.1), fed by ui_update_sessions()
 static uint8_t  s_live_count    = 0;      // rows in the last received list
-static bool     s_any_waiting   = false;  // any row in the waiting bucket
+// The LEVEL: a session still needs a human. Messages are deliberately not part
+// of it — see note_notify_set() — so the auto-return can hand the screen back
+// after the dwell instead of parking the panel here for the message's life.
+static bool     s_any_notify    = false;
 // The notification edge is per SESSION, not global. "Something is waiting" is a
 // level, and one parked permission prompt can hold it for an hour — during
 // which a SECOND session hitting its own prompt would produce no edge and no
 // notification, which is precisely the multi-session case this tab exists for.
-// So the waiting set is remembered by sid, and a jump fires for any sid that
-// has just entered it.
-static char     s_waiting_sids[SESSION_MAX_ROWS][3];  // committed set
-static uint8_t  s_waiting_n     = 0;
-static char     s_waiting_now[SESSION_MAX_ROWS][3];   // this payload's set
-static uint8_t  s_waiting_now_n = 0;
-static bool     s_new_waiting   = false;  // a sid entered the set this payload
+// So the notify set is remembered by sid, and a jump fires for any sid that
+// has just entered it — messages included (note_notify_set).
+//
+// A sid is only unique WITHIN its kind. Message sids are 2 hex chars of an md5
+// of the message id; session sids are 2 hex chars of a different hash of a
+// different id. Two independent namespaces, one 256-value key space: with 5
+// rows on screen there is a ~2% chance per payload that a message collides
+// with a session. Keyed on the string alone, that collision silently swallows
+// the notification (the sid is "already in the set", so no rising edge, and
+// the message expires unseen) — the worst failure mode a notifier has. So the
+// kind travels with the sid, here and in the card pool.
+static char     s_notify_sids[SESSION_MAX_ROWS][3];   // committed set
+static bool     s_notify_kind[SESSION_MAX_ROWS];      // …is that sid a message?
+static uint8_t  s_notify_n      = 0;
+static char     s_notify_now[SESSION_MAX_ROWS][3];    // this payload's set
+static bool     s_notify_now_kind[SESSION_MAX_ROWS];
+static uint8_t  s_notify_now_n  = 0;
+static bool     s_new_notify    = false;  // a sid entered the set this payload
+static bool     s_new_notify_msg = false; // …and one of them is a message
 static bool     s_focus_waiting = false;  // rows[0] waiting → drives the pulse
 static bool     s_chats_linger  = false;  // holding a chat view after the last chat closed
 static uint32_t s_chats_gone_ms = 0;
@@ -692,15 +722,25 @@ enum {
     SESSION_BUCKET_IDLE    = 0,
     SESSION_BUCKET_WORKING = 1,
     SESSION_BUCKET_WAITING = 2,
+    // A message from another Claude session is not a session at all, so it
+    // gets its own bucket rather than being filed under the closest lie. It
+    // is deliberately NOT the waiting bucket: the accent + pulse mean "this
+    // chat is blocked on you", and a message is something to read.
+    SESSION_BUCKET_MESSAGE = 3,
 };
 
-static bool sid_in_set(const char set[][3], uint8_t n, const char* sid) {
+// Membership is (sid, kind) — a message "79" and a session "79" are two
+// different things that happen to hash the same (see s_notify_sids).
+static bool sid_in_set(const char set[][3], const bool kind[], uint8_t n,
+                       const char* sid, bool is_msg) {
     for (uint8_t i = 0; i < n; i++)
-        if (strcmp(set[i], sid) == 0) return true;
+        if (kind[i] == is_msg && strcmp(set[i], sid) == 0) return true;
     return false;
 }
 
 static int session_bucket(uint8_t state) {
+    if (state == SESSION_MESSAGE)
+        return SESSION_BUCKET_MESSAGE;
     if (state >= SESSION_WAITING_PERMISSION && state <= SESSION_ERROR)
         return SESSION_BUCKET_WAITING;
     if (state >= SESSION_THINKING && state <= SESSION_COMPACTING)
@@ -710,6 +750,10 @@ static int session_bucket(uint8_t state) {
     return SESSION_BUCKET_WORKING;  // unknown future codes render neutral, never alarming
 }
 
+static bool session_is_message(const SessionRow* r) {
+    return r->state == SESSION_MESSAGE;
+}
+
 static const char* const session_tool_names[] = {
     "tool", "Bash", "Read", "Edit", "Write",
     "Grep", "Glob", "Task", "WebFetch", "WebSearch",
@@ -717,6 +761,14 @@ static const char* const session_tool_names[] = {
 
 static void session_state_text(const SessionRow* r, char* buf, size_t n) {
     switch (r->state) {
+    // A message row's "state line" is the message itself — the one place on
+    // the card where a session says what it is doing is where a message says
+    // what it says. Body text arrives host-folded to ASCII 32..126 (the panel
+    // fonts cover nothing else) and head-elided. Empty means a host that
+    // sends state 11 without index 13: say so rather than draw a blank line.
+    case SESSION_MESSAGE:
+        snprintf(buf, n, "%s", r->msg[0] ? r->msg : "(no message text)");
+        return;
     case SESSION_STARTING:   snprintf(buf, n, "starting");   return;
     case SESSION_IDLE:       snprintf(buf, n, "idle");       return;
     case SESSION_THINKING:   snprintf(buf, n, "thinking");   return;
@@ -791,6 +843,48 @@ static void label_set_ellipsized(lv_obj_t* lbl, const char* txt,
         head--;
     }
     set_label_if_changed(lbl, buf);
+}
+
+// The message-body sibling of label_set_ellipsized: same reason (LVGL's
+// LONG_DOT places its dots by line-box math and drops them outside a
+// tight box — on a two-line message body it truncated mid-word with no
+// ellipsis at all), same technique (measure, shrink, re-measure), different
+// rule at the ends. A name is elided in the MIDDLE to keep the tail that
+// tells two sessions apart; a message is elided at the TAIL, because a
+// message's information is front-loaded — which is also how the host elides
+// it before it ever reaches the wire.
+//
+// Wraps to `max_lines` at `max_w` and returns the number of lines actually
+// used, so the caller can center the block instead of leaving a hole where
+// the third line would have been.
+static int label_set_clamped(lv_obj_t* lbl, const char* txt,
+                             const lv_font_t* font, int max_w, int max_lines) {
+    const int32_t ls = lv_obj_get_style_text_letter_space(lbl, LV_PART_MAIN);
+    const int32_t lsp = lv_obj_get_style_text_line_space(lbl, LV_PART_MAIN);
+    const int line_h = lv_font_get_line_height(font);
+    const int max_h = max_lines * line_h + (max_lines - 1) * lsp;
+
+    lv_point_t sz;
+    lv_text_get_size(&sz, txt, font, ls, lsp, max_w, LV_TEXT_FLAG_NONE);
+    if (sz.y <= max_h) {
+        set_label_if_changed(lbl, txt);
+        return sz.y > line_h ? (sz.y + lsp) / (line_h + lsp) : 1;
+    }
+
+    char buf[SESSION_MSG_MAX + 4];
+    size_t len = strlen(txt);
+    if (len >= SESSION_MSG_MAX) len = SESSION_MSG_MAX - 1;
+    while (len > 0) {
+        len--;
+        // Don't leave the ellipsis floating after a space ("both  ...").
+        while (len > 0 && txt[len - 1] == ' ') len--;
+        memcpy(buf, txt, len);
+        strcpy(buf + len, "...");
+        lv_text_get_size(&sz, buf, font, ls, lsp, max_w, LV_TEXT_FLAG_NONE);
+        if (sz.y <= max_h) break;
+    }
+    set_label_if_changed(lbl, buf);
+    return sz.y > line_h ? (sz.y + lsp) / (line_h + lsp) : 1;
 }
 
 // ---- The pulse (§2.3) ----
@@ -938,6 +1032,139 @@ static void build_chat_card(ChatCard* c, lv_obj_t* parent, int x, int y, bool fo
     c->sid[0] = 0;
     c->target_y = -1;
     c->used = c->waiting = c->claimed = false;
+    // Remembered so chat_card_apply_kind can put the session anatomy back
+    // exactly as it is here after a message card has borrowed the widgets.
+    c->focus     = focus;
+    c->is_msg    = false;
+    c->name_font_base = f_name;
+    c->line_font = f_line;
+    // The two card types pad differently (list cards override the panel's
+    // pad_y); read it once instead of re-deriving the constants downstream.
+    lv_obj_update_layout(c->card);
+    c->content_h = lv_obj_get_content_height(c->card);
+    c->dot_sz    = dot_sz;
+    c->dot_dy    = dot_dy;
+    c->text_dy   = text_dy;
+}
+
+// ---- The two card anatomies ----
+// Message-card metrics. The hierarchy inverts against the session card: there
+// the identity is the headline and the status is the footnote, here the words
+// are the point. So the sender drops to a metadata line (the focus card's 48px
+// name font would shout the wrong word) and the BODY is the largest, brightest
+// text on the card — COL_TEXT at full opacity where a state line is COL_DIM.
+//
+// Sizes, plainly, because "the size the name gets" would not be true: on a
+// list card the body is styrene_24 — the same size as a session card's state
+// line, one step under its 28px name — over a styrene_20 sender. It is the
+// biggest text on a message card because the 28px slot is not used at all.
+// Going to 28 would cost the second body line the 104px list card has room
+// for, which a 40-character message needs.
+#define MSG_FROM_FONT(c) ((c)->focus ? &font_styrene_24 : &font_styrene_20)
+#define MSG_BODY_FONT(c) ((c)->focus ? &font_styrene_28 : &font_styrene_24)
+#define MSG_DOT_SZ   10    // a marker on a metadata line, not a status dot
+#define MSG_GUTTER   18    // dot column; the body hangs under the sender text
+#define MSG_ROW_GAP  4     // sender row ↓ body
+#define MSG_MAX_LINES 3    // past three the card is a wall of text
+
+// A message is not a session with holes in it, so it does not borrow the
+// session composition and hide four of its five parts. It restacks the same
+// widgets into a notification: a small sender line with the indicator in a
+// left gutter and the age on the right, and under it the message itself,
+// wrapped over as many lines as the card has room for and given the full
+// brightness the session card reserves for the chat's NAME (see the MSG_*
+// block above for what that does and does not mean about size).
+//
+// Called from chat_card_set_row and cheap: it re-lays out only when the kind
+// actually changes, which for a pooled card is when it is first claimed by a
+// message sid (or claimed back by a session sid after the message expires).
+static void chat_card_apply_kind(ChatCard* c, bool msg) {
+    if (c->is_msg == msg) return;
+    c->is_msg = msg;
+
+    const int cw = L.scr_w - 2 * CHAT_CARD_PAD_X;
+    const int line_h = lv_font_get_line_height(c->line_font);
+
+    if (!msg) {
+        // Back to the session anatomy build_chat_card laid down.
+        c->name_font = c->name_font_base;
+        lv_obj_set_style_text_font(c->lbl_name, c->name_font, 0);
+        lv_obj_set_style_text_color(c->lbl_name, COL_TEXT, 0);
+        lv_obj_set_height(c->lbl_name, lv_font_get_line_height(c->name_font));
+        lv_obj_align(c->lbl_name, LV_ALIGN_TOP_LEFT, 0, 0);
+
+        lv_obj_set_size(c->dot, c->dot_sz, c->dot_sz);
+        lv_obj_align(c->dot, LV_ALIGN_BOTTOM_LEFT, 0, c->dot_dy);
+
+        lv_obj_set_style_text_font(c->lbl_state, c->line_font, 0);
+        lv_obj_set_width(c->lbl_state, 200);
+        lv_obj_set_height(c->lbl_state, line_h);
+        lv_obj_align(c->lbl_state, LV_ALIGN_BOTTOM_LEFT, c->dot_sz + 8, c->text_dy);
+
+        lv_obj_set_style_text_font(c->lbl_elapsed, c->line_font, 0);
+        lv_obj_align(c->lbl_elapsed, LV_ALIGN_BOTTOM_RIGHT, 0, c->text_dy);
+        return;
+    }
+
+    // Message anatomy. The sender is metadata one step under the line font
+    // (the focus card's 48px name would shout the wrong word); the body is
+    // the card's largest text. Fonts and colors only — the
+    // vertical placement depends on how many lines the body actually needs,
+    // so it is done per update in msg_card_layout().
+    c->name_font = MSG_FROM_FONT(c);
+    lv_obj_set_style_text_font(c->lbl_name, c->name_font, 0);
+    lv_obj_set_style_text_color(c->lbl_name, COL_PURPLE, 0);
+    lv_obj_set_height(c->lbl_name, lv_font_get_line_height(c->name_font));
+
+    lv_obj_set_size(c->dot, MSG_DOT_SZ, MSG_DOT_SZ);
+
+    lv_obj_set_style_text_font(c->lbl_state, MSG_BODY_FONT(c), 0);
+    lv_obj_set_width(c->lbl_state, cw - MSG_GUTTER);
+
+    // The age rides on the sender line at the sender's size: a message's
+    // "elapsed" is how long ago it arrived, which belongs with the sender,
+    // not in the badge cluster the card no longer has.
+    lv_obj_set_style_text_font(c->lbl_elapsed, c->name_font, 0);
+}
+
+// How many body lines this card has room for under its sender row. Derived,
+// not tabulated: the list card and the ONE-CHAT card differ in height, in
+// padding and in both fonts, and a future panel geometry will differ again.
+static int msg_max_lines(ChatCard* c) {
+    const int from_h = lv_font_get_line_height(c->name_font);
+    const int body_h = lv_font_get_line_height(MSG_BODY_FONT(c));
+    const int lsp    = lv_obj_get_style_text_line_space(c->lbl_state, LV_PART_MAIN);
+    const int avail  = c->content_h - from_h - MSG_ROW_GAP;
+    int n = (avail + lsp) / (body_h + lsp);
+    if (n < 1) n = 1;
+    if (n > MSG_MAX_LINES) n = MSG_MAX_LINES;
+    return n;
+}
+
+// Place the message block. The sender row and the body are one unit, centered
+// in the card: a two-line message in a card sized for three would otherwise
+// leave a hole at the bottom exactly where a session card puts its state line,
+// which is the "session card with parts missing" look this anatomy exists to
+// avoid. Runs per update because `used_lines` is a property of the text.
+static void msg_card_layout(ChatCard* c, int used_lines) {
+    const lv_font_t* f_from = c->name_font;
+    const lv_font_t* f_body = MSG_BODY_FONT(c);
+    const int from_h = lv_font_get_line_height(f_from);
+    const int body_h = lv_font_get_line_height(f_body);
+    const int lsp    = lv_obj_get_style_text_line_space(c->lbl_state, LV_PART_MAIN);
+    const int body_block = used_lines * body_h + (used_lines - 1) * lsp;
+
+    lv_obj_set_height(c->lbl_state, body_block);
+
+    int top = (c->content_h - (from_h + MSG_ROW_GAP + body_block)) / 2;
+    if (top < 0) top = 0;
+
+    lv_obj_align(c->lbl_name,    LV_ALIGN_TOP_LEFT,  MSG_GUTTER, top);
+    lv_obj_align(c->lbl_elapsed, LV_ALIGN_TOP_RIGHT, 0,          top);
+    lv_obj_align(c->dot,         LV_ALIGN_TOP_LEFT,  0,
+                 top + (from_h - MSG_DOT_SZ) / 2);
+    lv_obj_align(c->lbl_state,   LV_ALIGN_TOP_LEFT,  MSG_GUTTER,
+                 top + from_h + MSG_ROW_GAP);
 }
 
 // Right-align the badge cluster: timer rightmost, subagent badge to its left,
@@ -964,8 +1191,53 @@ static void layout_badge_cluster(ChatCard* c) {
 static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
     const int bucket = session_bucket(r->state);
     c->waiting = (bucket == SESSION_BUCKET_WAITING);
+    chat_card_apply_kind(c, bucket == SESSION_BUCKET_MESSAGE);
 
+    // Body text can be a whole message now, so the buffer is sized for one.
+    char sbuf[SESSION_MSG_MAX + 8];
     char buf[24];
+
+    if (c->is_msg) {
+        // Everything a session card measures — context, tokens, todos,
+        // subagents — is "not applicable" on a message, and the host says so
+        // with -1 / 0. Hidden outright, the same way an unknown ctx hides the
+        // bar instead of drawing an empty one that reads as 0%.
+        lv_obj_add_flag(c->bar, LV_OBJ_FLAG_HIDDEN);
+        if (c->lbl_ctx) lv_obj_add_flag(c->lbl_ctx, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(c->img_todo, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(c->lbl_todo, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(c->img_agents, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(c->lbl_agents, LV_OBJ_FLAG_HIDDEN);
+
+        // Age first, so the sender's ellipsis budget can be measured against
+        // the width actually rendered next to it (same trick as the token
+        // label on a session card).
+        session_elapsed_text(r->elapsed_s, buf, sizeof(buf));
+        set_label_if_changed(c->lbl_elapsed, buf);
+        lv_point_t sz;
+        lv_text_get_size(&sz, buf, c->name_font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        const int cw = L.scr_w - 2 * CHAT_CARD_PAD_X;
+        const int nw = cw - MSG_GUTTER - sz.x - 12 /*min gap*/;
+        if (nw != c->name_w) {
+            c->name_w = nw;
+            lv_obj_set_width(c->lbl_name, nw);
+        }
+        // Sender keeps the session label's middle-elide: it is a name, and
+        // the host does not shorten it (SESSION_LABEL_MAX still applies).
+        label_set_ellipsized(c->lbl_name, r->label, c->name_font, c->name_w);
+
+        session_state_text(r, sbuf, sizeof(sbuf));
+        const int body_w = cw - MSG_GUTTER;
+        int lines = label_set_clamped(c->lbl_state, sbuf, MSG_BODY_FONT(c),
+                                      body_w, msg_max_lines(c));
+        msg_card_layout(c, lines);
+        lv_obj_set_style_text_color(c->lbl_state, COL_TEXT, 0);   // the words are the point
+        lv_obj_set_style_text_opa(c->lbl_state, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(c->dot, COL_PURPLE, 0);         // another Claude, as
+        lv_obj_set_style_bg_opa(c->dot, LV_OPA_COVER, 0);         // on the subagents badge
+        return;
+    }
+
     // Top-right label (list cards): token count when the host sends one,
     // ctx% as the older-host fallback, hidden when both are unknown. Set
     // BEFORE the name so the name's ellipsis budget can track the rendered
@@ -1008,7 +1280,6 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
         lv_bar_set_value(c->bar, r->ctx_pct, LV_ANIM_OFF);
     }
 
-    char sbuf[32];
     session_state_text(r, sbuf, sizeof(sbuf));
     set_label_if_changed(c->lbl_state, sbuf);
     lv_obj_set_style_text_color(c->lbl_state, c->waiting ? COL_ACCENT : COL_DIM, 0);
@@ -1050,7 +1321,12 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
 
 static void focus_set_content(const SessionRow* r) {
     static const char* const model_names[] = { "", "opus", "sonnet", "haiku", "fable" };
-    const char* model = r->model <= SESSION_MODEL_FABLE ? model_names[r->model] : "";
+    // A message has no model, no context and no token count. The host sends 0
+    // / -1 for all three and the branches below hide them on that alone; the
+    // explicit test is here so a host that ever fills a field it shouldn't
+    // can't put "opus" on a message card.
+    const char* model = (!session_is_message(r) && r->model <= SESSION_MODEL_FABLE)
+                        ? model_names[r->model] : "";
     set_label_if_changed(focus_lbl_model, model);
     // Budget the name against the pill actually rendered (its text width +
     // padding + a 12px gap) — not a worst case — so a long name runs right up
@@ -1078,14 +1354,14 @@ static void focus_set_content(const SessionRow* r) {
     // Context row: percentage (spelled out — it doubles as onboarding for
     // the terse multi-chat bars) on the left, token counter on the right.
     char buf[32];
-    if (r->ctx_pct < 0) {
+    if (r->ctx_pct < 0 || session_is_message(r)) {
         lv_obj_add_flag(focus_lbl_ctx, LV_OBJ_FLAG_HIDDEN);
     } else {
         snprintf(buf, sizeof(buf), "%d%% of context used", r->ctx_pct);
         set_label_if_changed(focus_lbl_ctx, buf);
         lv_obj_clear_flag(focus_lbl_ctx, LV_OBJ_FLAG_HIDDEN);
     }
-    if (r->tok < 0) {
+    if (r->tok < 0 || session_is_message(r)) {
         lv_obj_add_flag(focus_lbl_tok, LV_OBJ_FLAG_HIDDEN);
     } else {
         session_tok_text(r->tok, buf, sizeof(buf));
@@ -1113,9 +1389,17 @@ static void cards_scroll_cb(lv_event_t* e) { (void)e; chat_fade_update(); }
 
 // ---- Card pool: identity-stable matching + the reorder slide (§2.3) ----
 
-static ChatCard* chat_card_by_sid(const char* sid) {
+// Matched on (sid, anatomy), not on the sid alone: message sids and session
+// sids come from two independent hashes into the same 256-value space, and a
+// collision would otherwise alias a message row and a session row onto one
+// pooled card — the message flipping a session's card to the message anatomy
+// while the session fades in on a fresh one, and which row claims which card
+// changing from payload to payload. `is_msg` is what build_chat_card and
+// chat_card_apply_kind already maintain, so this costs one comparison.
+static ChatCard* chat_card_by_sid(const char* sid, bool want_msg) {
     for (auto& c : chat_cards)
-        if (c.used && !c.claimed && strcmp(c.sid, sid) == 0) return &c;
+        if (c.used && !c.claimed && c.is_msg == want_msg && strcmp(c.sid, sid) == 0)
+            return &c;
     return nullptr;
 }
 
@@ -1139,7 +1423,7 @@ static void chats_set_content(const SessionList* list) {
     for (int i = 0; i < list->count; i++) {
         const SessionRow* r = &list->rows[i];
         const int target_y = i * CHAT_CARD_PITCH;
-        ChatCard* c = chat_card_by_sid(r->sid);
+        ChatCard* c = chat_card_by_sid(r->sid, session_is_message(r));
         if (c) {
             c->claimed = true;
             chat_card_set_row(c, r);
@@ -1436,7 +1720,7 @@ static void build_session_views(lv_obj_t* parent) {
 // timer came with it and still earns its keep — it holds the last cards
 // (content frozen, waiting treatment dropped) instead of snapping to "No
 // active sessions" the instant a chat closes. What did NOT come along is the
-// s_any_waiting override: pinning mattered when a waiting chat had to fight
+// s_any_notify override: pinning mattered when a waiting chat had to fight
 // the usage screen for the panel, and it is now expressed as the auto-jump
 // below, which brings the user to this tab and then leaves them in control.
 static void update_session_view(void) {
@@ -1473,19 +1757,59 @@ static void update_session_view(void) {
 }
 
 // ---- Auto-jump on notification (requirement 4) ----
-// Fill this payload's waiting set and flag any sid that was not waiting last
+// Fill this payload's NOTIFY set and flag any sid that was not in it last
 // time. Called once per payload, before the resolver and the jump.
-static void note_waiting_set(const SessionList* list) {
-    s_waiting_now_n = 0;
-    s_new_waiting   = false;
-    for (int i = 0; list && i < list->count && s_waiting_now_n < SESSION_MAX_ROWS; i++) {
+//
+// Two different things earn a notification, and they share one edge detector
+// because they have the same answer — put this in front of the owner, once:
+//
+//   · a session that has entered the waiting bucket (it is blocked on a human)
+//   · a message another Claude Code session sent this machine
+//
+// A message is if anything the better fit for the machinery than the case it
+// was built for. The host mints the sid from the message id, so it is stable
+// across polls (one rising edge, not one per 5 s tick), and a message that
+// never surfaces is a message the owner has to go looking for, which is the
+// whole feature.
+//
+// It joins the SET but not the LEVEL (s_any_notify), so the auto-return still
+// works: the panel visits this tab, dwells, and goes back to what the owner
+// was looking at. Holding the level would pin the screen here for the message's
+// entire life — inbox_expire_s, three minutes by default, against a 10 s dwell
+// — and would make any host-side failure to retract a message a permanently
+// stuck panel rather than one stale card.
+//
+// What a message deliberately does NOT get is the waiting bucket itself: no
+// accent, no pulse (see SESSION_BUCKET_MESSAGE). Being pulled to the tab once
+// is the notification; a card that keeps pulsing for three minutes is nagging
+// about something already read.
+static void note_notify_set(const SessionList* list) {
+    s_notify_now_n = 0;
+    s_new_notify   = false;
+    s_new_notify_msg = false;
+    bool any_waiting = false;
+    for (int i = 0; list && i < list->count && s_notify_now_n < SESSION_MAX_ROWS; i++) {
         const SessionRow* r = &list->rows[i];
-        if (session_bucket(r->state) != SESSION_BUCKET_WAITING) continue;
-        snprintf(s_waiting_now[s_waiting_now_n], sizeof(s_waiting_now[0]), "%s", r->sid);
-        if (!sid_in_set(s_waiting_sids, s_waiting_n, r->sid)) s_new_waiting = true;
-        s_waiting_now_n++;
+        const int bucket = session_bucket(r->state);
+        if (bucket != SESSION_BUCKET_WAITING && bucket != SESSION_BUCKET_MESSAGE) continue;
+        const bool is_msg = (bucket == SESSION_BUCKET_MESSAGE);
+        snprintf(s_notify_now[s_notify_now_n], sizeof(s_notify_now[0]), "%s", r->sid);
+        s_notify_now_kind[s_notify_now_n] = is_msg;
+        if (!sid_in_set(s_notify_sids, s_notify_kind, s_notify_n, r->sid, is_msg)) {
+            s_new_notify = true;
+            if (is_msg) s_new_notify_msg = true;
+        }
+        if (!is_msg) any_waiting = true;
+        s_notify_now_n++;
     }
-    s_any_waiting = s_waiting_now_n > 0;
+    // A message joins the set (so it gets its one rising edge, and only one)
+    // but NOT the level. The level answers "is a session still blocked on
+    // you?", and it is what holds the panel on this tab: a message that held
+    // it would keep the screen off the usage view for its whole life — three
+    // minutes by default, against a 10 s auto-return dwell — for something
+    // already read. Being pulled here once is the notification; the card
+    // stays for as long as the host sends it, one swipe away.
+    s_any_notify = any_waiting;
 }
 
 // EDGES ONLY, and the rising edge is PER SESSION. "Something is waiting" is a
@@ -1494,7 +1818,7 @@ static void note_waiting_set(const SessionList* list) {
 // to navigate, while edging on the level as a whole (the first cut of this)
 // dropped the notification for a second session that started waiting while the
 // first still was — the multi-session case the tab is named for. So: one jump
-// per sid that enters the waiting set.
+// per sid that enters the notify set.
 //
 // It deliberately does NOT fire while the user is on the settings tab. They
 // are mid-edit on a screen whose every row is a tap target; moving the panel
@@ -1503,8 +1827,12 @@ static void note_waiting_set(const SessionList* list) {
 // notification is not lost — the sessions tab is one swipe away and the cards
 // are already rendered behind it.
 //
-// The return trip: when the LAST waiting session clears, a tab we jumped to
-// ourselves hands the screen back to where the user actually was. It is armed
+// The return trip: when the LAST waiting session clears — or right away for a
+// jump only a message caused, since a message is never "still waiting" and no
+// falling edge is ever coming for it (arming it at the jump also stops the
+// return from waiting on the next payload, which the host may not send for
+// 30 s) — a tab we jumped to ourselves hands the screen back
+// to where the user actually was. It is armed
 // here and executed by sessions_tick() once AUTO_RETURN_DWELL_MS has passed
 // since the jump — reading a notification produces no touch, so returning on
 // the very next payload (the daemon ticks every ~5 s) would take the screen
@@ -1512,10 +1840,11 @@ static void note_waiting_set(const SessionList* list) {
 // would flip the panel twice. Any touch or manual navigation clears
 // s_auto_jumped (see screen_press_cb / show_screen) and disarms the return.
 static void maybe_auto_jump(void) {
-    const bool rising  = s_new_waiting;
-    const bool falling = !s_any_waiting && s_waiting_n > 0;
-    memcpy(s_waiting_sids, s_waiting_now, sizeof(s_waiting_sids));
-    s_waiting_n = s_waiting_now_n;
+    const bool rising  = s_new_notify;
+    const bool falling = !s_any_notify && s_notify_n > 0;
+    memcpy(s_notify_sids, s_notify_now, sizeof(s_notify_sids));
+    memcpy(s_notify_kind, s_notify_now_kind, sizeof(s_notify_kind));
+    s_notify_n = s_notify_now_n;
 
     if (rising) {
         s_auto_return_due = false;                       // whatever was pending
@@ -1529,7 +1858,12 @@ static void maybe_auto_jump(void) {
         show_screen(SCREEN_SESSIONS, false);             // not manual: keeps the claim
         s_auto_jumped  = true;
         s_auto_jump_ms = lv_tick_get();
-        Serial.println("Session needs you — auto-jump to the sessions tab");
+        Serial.println(s_new_notify_msg
+            ? "Message from another Claude session — auto-jump to the sessions tab"
+            : "Session needs you — auto-jump to the sessions tab");
+        // Nothing is WAITING, so this jump was mail: arm the return now.
+        // sessions_tick() still holds the dwell, and any touch disarms it.
+        if (!s_any_notify) s_auto_return_due = true;
     } else if (falling && s_auto_jumped) {
         s_auto_return_due = true;                        // sessions_tick() finishes it
     }
@@ -1552,15 +1886,16 @@ static void sessions_tick(void) {
 
 // The link went away. Everything this tab knows arrived over it, so drop the
 // lot: the resolver falls to "Host disconnected", the frozen cards stop
-// pulsing, and emptying the waiting set re-arms the edge so a session
+// pulsing, and emptying the notify set re-arms the edge so a session
 // that is STILL waiting when the host comes back notifies again instead of
 // being swallowed as "no rising edge".
 static void sessions_link_lost(void) {
     s_live_count      = 0;
-    s_any_waiting     = false;
-    s_waiting_n       = 0;      // re-arms the edge for every still-waiting sid
-    s_waiting_now_n   = 0;
-    s_new_waiting     = false;
+    s_any_notify      = false;
+    s_notify_n        = 0;     // re-arms the edge for every sid still in the set
+    s_notify_now_n    = 0;
+    s_new_notify      = false;
+    s_new_notify_msg  = false;
     s_focus_waiting   = false;
     s_chats_linger    = false;
     s_auto_jumped     = false;
@@ -2305,7 +2640,7 @@ void ui_update_sessions(const SessionList* list) {
 
     const uint8_t prev_count = s_live_count;
     s_live_count = list->count;
-    note_waiting_set(list);
+    note_notify_set(list);
 
     if (list->count == 0) {
         if (prev_count > 0 && (session_view == 1 || session_view == 2)) {
