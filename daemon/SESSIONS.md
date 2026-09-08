@@ -17,7 +17,8 @@ Claude Code sessions ──HTTP hooks (127.0.0.1)──▶ clawdmeter_sessions.p
                                                         ▼ atomic write on change
                                             ~/.clawdmeter/sessions.json
                                                         │ 5 s tick, on change
-claude-usage-daemon.sh ──BLE GATT SS …0005─────────────▶ Clawdmeter firmware
+claude-usage-daemon.sh ──────BLE GATT SS …0005─────────▶ Clawdmeter firmware
+claude_usage_daemon_windows.py ─┘  (same file, same rule: send only on change)
 ```
 
 The sidecar (`daemon/clawdmeter_sessions.py`, Python 3 stdlib only) listens on
@@ -92,6 +93,58 @@ or approve a permission.
    curl -s http://127.0.0.1:45999/          # current wire payload (loopback debug)
    cat ~/.clawdmeter/sessions.json          # what the daemon will ship
    ```
+
+## Setup (Windows)
+
+Same three pieces as Linux — config, hook block, sidecar — with Windows paths
+and a Windows autostart. `install-windows.ps1 -Sessions` does all of it:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-windows.ps1 -Sessions
+# ...or pick the port: -Sessions -HookPort 45999
+```
+
+That switch (and only that switch — the installer is unchanged without it):
+
+1. writes `hook_port = 45999` into `%LOCALAPPDATA%\Clawdmeter\config`, the
+   same file the Windows daemon already reads (an existing `hook_port` is left
+   alone);
+2. merges the hook block into `%USERPROFILE%\.claude\settings.json` — add more
+   with `-SettingsPath` — via the same idempotent helper Linux uses:
+
+   ```powershell
+   .venv\Scripts\python.exe daemon\clawdmeter_sessions.py --install-hooks `
+       "$env:USERPROFILE\.claude\settings.json" http://127.0.0.1:45999/
+   ```
+
+3. registers a **second** `HKCU\...\Run` value, `ClawdmeterSessions`, that
+   starts the sidecar headlessly at logon (`daemon.autostart_windows`:
+   `enable_sessions()` / `disable_sessions()` / `is_sessions_enabled()`), and
+   starts it immediately.
+
+Verify:
+
+```powershell
+python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:45999/').read().decode())"
+type $env:USERPROFILE\.clawdmeter\sessions.json
+type $env:LOCALAPPDATA\Clawdmeter\sessions.log   # the sidecar has no console under pythonw
+```
+
+Turning it off: `python -c "import daemon.autostart_windows as a; a.disable_sessions()"`
+and remove `hook_port` from the config. Leaving the hooks installed is harmless
+— they POST to a port nobody is listening on, asynchronously, and Claude Code
+carries on.
+
+Windows-specific behaviour worth knowing:
+
+- **Liveness** uses `OpenProcess` + `GetProcessTimes` instead of `/proc`. The
+  roster's `procStart` is the process creation FILETIME on Windows, so the
+  pid-reuse guard works exactly as it does on Linux.
+- **Only one sidecar at a time.** `SO_REUSEADDR` is not set on Windows (where
+  it would let a second instance bind the same port and silently split the hook
+  POSTs); a duplicate fails to bind and says so.
+- **Already-open Claude Code sessions keep their old hook set** — the same rule
+  as Linux. Sessions started after the install are the ones that appear.
 
 ## Wire format
 
@@ -182,9 +235,13 @@ rosters and transcripts across several Claude config dirs.
   (`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`),
   re-read on SessionStart/Stop/PostCompact. Good for a glanceable bar, not for
   quoting numbers.
-- **macOS / Windows** — the Python daemons don't ship session data yet. The
-  sidecar is importable as a library (`SessionTable`, `fit_payload`, …) for
-  that integration; this round wires up Linux only.
+- **Windows** — fully wired: the sidecar runs as-is and
+  `claude_usage_daemon_windows.py` ships the payload on its own 5 s tick. See
+  "Setup (Windows)" above.
+- **macOS** — the macOS daemon doesn't ship session data yet. The sidecar is
+  importable as a library (`SessionTable`, `fit_payload`, …) for that
+  integration, and `read_sessions_payload()` in the Windows daemon is 20 lines
+  worth copying.
 - **Firmware support** — the device needs firmware with the SS characteristic
   (`…0005`) and a board with the session-views capability. Older firmware just
   never sees the data; the daemon stays silent about it.

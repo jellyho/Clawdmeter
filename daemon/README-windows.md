@@ -212,6 +212,47 @@ Use the tray menu toggle, or remove the registry value manually:
 reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 ```
 
+### Live session awareness (optional)
+
+Shows your open Claude Code chats on the device — what each is doing, how full
+its context is, and which one is waiting on you. **Off by default**; it needs a
+board with the session views in firmware, plus a hook sidecar on this machine.
+Full design and wire format: [SESSIONS.md](SESSIONS.md).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-windows.ps1 -Sessions
+```
+
+That adds three things to the normal install: `hook_port = 45999` in
+`%LOCALAPPDATA%\Clawdmeter\config`, the Clawdmeter hook block in
+`%USERPROFILE%\.claude\settings.json` (merged, never replacing what is there),
+and a second autostart entry, `ClawdmeterSessions`, that runs
+`daemon\clawdmeter_sessions.py` headlessly at logon.
+
+The daemon then reads `%USERPROFILE%\.clawdmeter\sessions.json` on its existing
+5 s tick and writes the payload to the device only when it changes. Without the
+sidecar the file never exists and the daemon does nothing at all; on a board
+whose firmware has no session characteristic it notices once, logs one line, and
+stays quiet for the rest of the connection.
+
+Logs: the sidecar runs under `pythonw.exe` (no console), so it writes
+`%LOCALAPPDATA%\Clawdmeter\sessions.log`. To see the current payload live:
+
+```powershell
+python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:45999/').read().decode())"
+```
+
+To turn it off:
+
+```powershell
+python -c "import daemon.autostart_windows as a; a.disable_sessions()"
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ClawdmeterSessions /f  # same thing, by hand
+```
+
+...and delete the `hook_port` line from the config, which is what actually stops
+the sidecar from listening. The installed hooks can stay: they POST
+asynchronously to a port nobody is listening on, which costs a session nothing.
+
 ### WSL independence
 
 The daemon operates fully independently of WSL. The token is read from native Windows

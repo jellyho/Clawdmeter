@@ -13,6 +13,10 @@ Runs two ways:
   127.0.0.1:<hook_port> and atomically writes `~/.clawdmeter/sessions.json`
   on every state change; the bash daemon ships that file's payload over BLE
   on its existing 5 s tick.
+- **Standalone (Windows)** — the same command under `python`/`pythonw`; the
+  Windows daemon reads the same `~/.clawdmeter/sessions.json` and ships it on
+  its own 5 s tick. Config is read from `%LOCALAPPDATA%\\Clawdmeter\\config`
+  when it exists. See daemon/README-windows.md.
 - **Library** — the Python daemon (macOS/Windows) can import `SessionTable`,
   `fit_payload`, etc. and run the listener in-process.
 
@@ -112,9 +116,29 @@ ONE_M = 1_000_000
 TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024
 MAX_BODY_BYTES = 8 * 1024 * 1024
 
-CONFIG_FILE = os.path.join(
-    os.path.expanduser("~"), ".config", "claude-usage-monitor", "config"
-)
+def default_config_file():
+    """The daemon config file this sidecar shares with the platform daemon.
+
+    Linux/macOS keep it at ~/.config/claude-usage-monitor/config. Windows has no
+    XDG dir and its daemon already keeps config (and daemon.log) under
+    %LOCALAPPDATA%\\Clawdmeter, so look there first — a Windows user should set
+    hook_port in exactly one place — and fall back to the POSIX-style path so a
+    config carried over from a Linux box still works.
+    """
+    posix = os.path.join(
+        os.path.expanduser("~"), ".config", "claude-usage-monitor", "config"
+    )
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local"
+        )
+        win = os.path.join(base, "Clawdmeter", "config")
+        if os.path.exists(win) or not os.path.exists(posix):
+            return win
+    return posix
+
+
+CONFIG_FILE = default_config_file()
 DEFAULT_SESSIONS_FILE = os.path.join(
     os.path.expanduser("~"), ".clawdmeter", "sessions.json"
 )
@@ -144,8 +168,54 @@ HOOK_EVENTS = (
 _HANDLED = frozenset(HOOK_EVENTS)
 
 
+_FILE_LOGGER = None
+
+
+def enable_file_log():
+    """Mirror log output into %LOCALAPPDATA%\\Clawdmeter\\sessions.log (Windows).
+
+    Autostart launches the sidecar under pythonw.exe, which has no console at
+    all: stdout is discarded and is in fact None. A rotating file is then the
+    only trail there is when something goes wrong in the field — the same
+    reasoning (and the same directory) as the Windows daemon's daemon.log.
+    Called from main() and never at import, so importing this module as a
+    library or unit-testing its helpers writes no files.
+    """
+    global _FILE_LOGGER
+    if sys.platform != "win32" or _FILE_LOGGER is not None:
+        return
+    import logging
+    import logging.handlers
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(
+        os.path.expanduser("~"), "AppData", "Local"
+    )
+    path = os.path.join(base, "Clawdmeter", "sessions.log")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=512 * 1024, backupCount=2, encoding="utf-8"
+        )
+    except OSError:
+        return  # best-effort: logging setup must never stop the sidecar
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logger = logging.getLogger("clawdmeter.sessions")
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    _FILE_LOGGER = logger
+
+
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    # Under pythonw.exe sys.stdout is None and print() raises AttributeError; a
+    # missing console must never take the sidecar down (same guard as the
+    # Windows daemon's log()).
+    try:
+        print(line, flush=True)
+    except (OSError, ValueError, AttributeError, RuntimeError):
+        pass
+    if _FILE_LOGGER is not None:
+        _FILE_LOGGER.info(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -369,11 +439,125 @@ def _proc_starttime(pid):
         return None
 
 
+# Win32 bits for _win_pid_alive(). PROCESS_QUERY_LIMITED_INFORMATION is the
+# least privilege that can read a process's times, and unlike
+# PROCESS_QUERY_INFORMATION it is granted across integrity levels.
+_WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WIN_ERROR_ACCESS_DENIED = 5
+_WIN_K32 = None
+
+
+def _win_kernel32():
+    """Lazily bind the kernel32 calls the Windows liveness check needs."""
+    global _WIN_K32
+    if _WIN_K32 is None:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # restype MUST be set: the default is c_int, which truncates a 64-bit
+        # HANDLE and would both misreport failure and leak the handle.
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k32.CloseHandle.restype = wintypes.BOOL
+        ft_p = ctypes.POINTER(wintypes.FILETIME)
+        k32.GetProcessTimes.argtypes = (wintypes.HANDLE, ft_p, ft_p, ft_p, ft_p)
+        k32.GetProcessTimes.restype = wintypes.BOOL
+        _WIN_K32 = (ctypes, wintypes, k32)
+    return _WIN_K32
+
+
+def _win_process_times(handle):
+    """(creation, exit) FILETIMEs as ints behind an open process handle, or None.
+
+    Both come from one GetProcessTimes call, which needs nothing beyond
+    PROCESS_QUERY_LIMITED_INFORMATION. Exit time is 0 for a running process and
+    non-zero once it has ended, which is the exact liveness answer — a process
+    handle can outlive the process (anything still holding one keeps the pid
+    resolvable), so "OpenProcess worked" on its own means nothing.
+    WaitForSingleObject would answer the same question but needs SYNCHRONIZE
+    access, which this handle deliberately does not ask for.
+    """
+    ctypes, wintypes, k32 = _win_kernel32()
+    created, exited = wintypes.FILETIME(), wintypes.FILETIME()
+    kernel, user = wintypes.FILETIME(), wintypes.FILETIME()
+    if not k32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                               ctypes.byref(kernel), ctypes.byref(user)):
+        return None
+    return ((created.dwHighDateTime << 32) | created.dwLowDateTime,
+            (exited.dwHighDateTime << 32) | exited.dwLowDateTime)
+
+
+def _win_proc_starttime(pid):
+    """Windows analogue of _proc_starttime(): the creation FILETIME (100 ns ticks
+    since 1601) of a RUNNING process, or None. Claude Code writes exactly this
+    value into the roster as `procStart` on Windows — verified against a live
+    roster on Windows 11 — so the pid-reuse check compares the two directly."""
+    try:
+        _ctypes, _wintypes, k32 = _win_kernel32()
+    except (OSError, AttributeError, ImportError):  # pragma: no cover - not Windows
+        return None
+    handle = k32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        times = _win_process_times(handle)
+    finally:
+        k32.CloseHandle(handle)
+    if times is None or times[1]:
+        return None  # unreadable, or already exited
+    return times[0]
+
+
+def _win_pid_alive(pid, proc_start=None):
+    """Windows counterpart of the /proc branch of pid_alive().
+
+    Same identity test as Linux — pid AND process start time — because a roster
+    file outlives its process and Windows recycles pids aggressively.
+
+    os.kill(pid, 0) is deliberately not used as the primary check: it cannot
+    tell the original process from whatever inherited its pid, and it reports an
+    exited-but-still-referenced process as alive. Anything that cannot be
+    determined resolves to "alive" — dropping a live session is the worse error,
+    and the 6 h staleness sweep is the backstop.
+    """
+    try:
+        ctypes, _wintypes, k32 = _win_kernel32()
+    except (OSError, AttributeError, ImportError):  # pragma: no cover - not Windows
+        return True
+    handle = k32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # ERROR_ACCESS_DENIED: the process exists but this token may not query it
+        # (the PermissionError branch of the POSIX path). Anything else
+        # (ERROR_INVALID_PARAMETER) means there is no process with that pid.
+        return ctypes.get_last_error() == _WIN_ERROR_ACCESS_DENIED
+    try:
+        times = _win_process_times(handle)
+    finally:
+        k32.CloseHandle(handle)
+    if times is None:
+        return True  # running, just not inspectable
+    created, exited = times
+    if exited:
+        return False
+    if proc_start is None:
+        return True
+    try:
+        # The roster writes procStart as a decimal string on Windows; compare
+        # numerically so an int would work too. A shape we do not recognise is
+        # not evidence of pid reuse — keep the session and let the staleness
+        # sweep deal with it.
+        return int(str(proc_start).strip()) == created
+    except (TypeError, ValueError):
+        return True
+
+
 def pid_alive(pid, proc_start=None):
     """Is this roster entry's process still running? Roster files can outlive a
     crashed process, so presence alone isn't liveness. The roster records
-    procStart (jiffies, /proc/<pid>/stat field 22) precisely so pid reuse can
-    be told apart from the original process."""
+    procStart (jiffies, /proc/<pid>/stat field 22 on Linux; the process creation
+    FILETIME on Windows) precisely so pid reuse can be told apart from the
+    original process."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -387,6 +571,8 @@ def pid_alive(pid, proc_start=None):
         if proc_start is not None and str(proc_start) != start:
             return False  # pid was reused by another process
         return True
+    if sys.platform == "win32":
+        return _win_pid_alive(pid, proc_start)
     try:
         os.kill(pid, 0)
         return True
@@ -758,9 +944,28 @@ class SessionTable:
 # sessions.json handoff (Linux sidecar -> bash daemon)
 # ---------------------------------------------------------------------------
 
+def _replace_with_retry(tmp, path, attempts=5, delay=0.02):
+    """os.replace, tolerating a reader that happens to hold the target open.
+
+    POSIX rename always wins. Windows MoveFileEx fails with a sharing violation
+    (PermissionError) while another process has the destination open without
+    FILE_SHARE_DELETE — which is exactly what a daemon reading sessions.json
+    does, for the microseconds it lasts. Retry briefly; if it still loses, the
+    caller logs it and the next publish rewrites the same content anyway.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def write_sessions_file(path, payload):
     """Atomic write (temp + rename). `payload` is the exact wire string; the
-    bash daemon ships it verbatim, so it is stored as a string, not re-encoded."""
+    daemon ships it verbatim, so it is stored as a string, not re-encoded."""
     doc = {"ts": round(time.time(), 3), "payload": payload}
     directory = os.path.dirname(path)
     if directory:
@@ -769,7 +974,7 @@ def write_sessions_file(path, payload):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, separators=(",", ":"), ensure_ascii=False)
         fh.write("\n")
-    os.replace(tmp, path)
+    _replace_with_retry(tmp, path)
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +983,12 @@ def write_sessions_file(path, payload):
 
 class HookServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # SO_REUSEADDR means opposite things on the two platforms. On POSIX it only
+    # skips the TIME_WAIT wait. On Windows it lets a SECOND process bind a port
+    # another process is already listening on, and the two then split the hook
+    # POSTs between them — two half-populated session tables, no error anywhere.
+    # Off there, so a duplicate sidecar fails loudly with "cannot bind".
+    allow_reuse_address = sys.platform != "win32"
 
     def __init__(self, addr, table, sessions_file, budget):
         super().__init__(addr, HookHandler)
@@ -955,6 +1165,8 @@ def main(argv=None):
     if args.install_hooks:
         return install_hooks(*args.install_hooks)
 
+    enable_file_log()  # no-op off Windows; see enable_file_log()
+
     config_path = args.config or CONFIG_FILE
 
     port = args.port
@@ -1009,8 +1221,21 @@ def main(argv=None):
         stop_event.set()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
+    # SIGTERM and SIGINT both exist on Windows and signal.signal() accepts both;
+    # SIGBREAK is Windows-only (Ctrl-Break, and what a console close sends), so
+    # it is picked up by name when present. Note that `taskkill /F` /
+    # Stop-Process uses TerminateProcess, which runs no handler at all — safe
+    # here, since all state is rebuilt from hooks and the roster on restart.
+    # signal.signal() raises ValueError off the main thread (library use), where
+    # the host owns shutdown.
+    for _signame in ("SIGTERM", "SIGINT", "SIGBREAK"):
+        _sig = getattr(signal, _signame, None)
+        if _sig is None:
+            continue
+        try:
+            signal.signal(_sig, _shutdown)
+        except (ValueError, OSError):
+            pass
 
     try:
         server.serve_forever(poll_interval=0.5)

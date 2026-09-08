@@ -40,7 +40,9 @@ clock = off
 #      (install.sh offers to write it, or run:
 #       daemon/clawdmeter_sessions.py --install-hooks ~/.claude/settings.json \
 #           http://127.0.0.1:45999/),
-#   3. the sidecar running (Linux: systemctl --user start clawdmeter-sessions).
+#   3. the sidecar running (Linux: systemctl --user start clawdmeter-sessions;
+#      Windows: install-windows.ps1 -Sessions does all three, and reads this
+#      config from %LOCALAPPDATA%\Clawdmeter\config instead).
 
 # Loopback port the hook listener serves on. Unset (default) = feature off:
 # the sidecar exits and the daemon never sends session data.

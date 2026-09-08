@@ -26,10 +26,25 @@ from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
+try:
+    # bleak >= 0.22 raises this precise BleakError subclass when a characteristic
+    # is absent from the peer's GATT table — the normal case here, since only
+    # boards with BOARD_HAS_SESSION_VIEWS build the SS characteristic at all.
+    from bleak.exc import BleakCharacteristicNotFoundError
+except ImportError:  # pragma: no cover - bleak < 0.22
+    class BleakCharacteristicNotFoundError(BleakError):
+        """Never raised by older bleak (it uses a plain BleakError); defined so
+        the except clause below stays valid. The proactive services probe in
+        Session.probe_session_support() covers those versions."""
+
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
+# Live session rows (issue #135). OPTIONAL on the device: the firmware only
+# creates it when BOARD_HAS_SESSION_VIEWS is set, so on most boards it is simply
+# absent and this daemon must stay quiet rather than error every tick.
+SS_CHAR_UUID = "4c41555a-4465-7669-6365-000000000005"
 
 POLL_INTERVAL = 60
 TICK = 5
@@ -45,6 +60,13 @@ RECONNECT_BACKOFF_CAP = 8  # D-05: fast-reconnect cap (seconds); keeps stacked r
 # Optional clock display. 
 # Config lives under the same Clawdmeter dir as daemon.log.
 CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Clawdmeter" / "config"
+
+# Live session awareness (issue #135; daemon/SESSIONS.md). The clawdmeter_sessions.py
+# sidecar owns this file and rewrites it — atomically — only when the fitted wire
+# payload actually changes. Home-relative on purpose: it is the one path the sidecar,
+# the bash daemon and this daemon all agree on without any config. Absent =
+# sidecar not installed = feature off, which is the default and must cost nothing.
+SESSIONS_FILE = Path.home() / ".clawdmeter" / "sessions.json"
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -350,6 +372,36 @@ def discover_bonded_address() -> str | None:
     return None
 
 
+def read_sessions_payload(path: Path | None = None) -> str | None:
+    """Return the wire payload string from the sidecar's sessions.json, or None.
+
+    None covers every "nothing to ship" case, all of them silent:
+      * the file does not exist — the sidecar is not installed (the default);
+      * it is unreadable or momentarily locked (Windows rename window);
+      * it is half-written, truncated or otherwise not the shape we expect.
+
+    The file holds {"ts": ..., "payload": "<wire string>"}; only the payload
+    string goes on the wire, byte for byte, so the exact bytes the sidecar fitted
+    to its budget are what the device receives. Pure and total — it never raises,
+    because a malformed handoff file must not be able to kill the poll loop.
+    """
+    path = path or SESSIONS_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None  # absent / unreadable / undecodable
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return None  # caught mid-write, or corrupt
+    if not isinstance(doc, dict):
+        return None
+    payload = doc.get("payload")
+    if not isinstance(payload, str) or not payload:
+        return None
+    return payload
+
+
 async def acquire_target():
     """Return a connectable handle for the Clawdmeter, or None.
 
@@ -374,6 +426,13 @@ class Session:
     def __init__(self, client: BleakClient) -> None:
         self.client = client
         self.refresh_requested = asyncio.Event()
+        # Live-session shipping state, deliberately per-connection — the same
+        # reset the bash daemon does (SS_CHAR_PATH + LAST_SESSIONS_SIG cleared on
+        # every reconnect): a device that just came back has an empty Sessions tab
+        # and needs the current payload resent even though the file never changed.
+        self.ss_supported = True            # until this device says otherwise
+        self.last_sessions_payload: str | None = None
+        self._ss_write_logged = False       # at most one write-failure log per link
 
     def _on_refresh(self, _char, _data: bytearray) -> None:
         log("Refresh requested by device")
@@ -390,6 +449,61 @@ class Session:
             await self.client.start_notify(REQ_CHAR_UUID, self._on_refresh)
         except (BleakError, ValueError, OSError) as e:
             log(f"Refresh subscription unavailable: {e}")
+
+    def probe_session_support(self) -> None:
+        """Decide once per connection whether this device has the SS characteristic.
+
+        Only boards built with BOARD_HAS_SESSION_VIEWS create it, so on most
+        devices it is absent and every session write would fail identically —
+        exactly the retry-spam this avoids. Services are already cached from
+        connect-time discovery, so this is a table lookup, not I/O. If the lookup
+        itself misbehaves (older bleak, a client that lost its service collection)
+        the flag stays optimistic: maybe_send_sessions() catches the missing
+        characteristic on the first write anyway."""
+        try:
+            found = self.client.services.get_characteristic(SS_CHAR_UUID)
+        except (BleakError, AttributeError, OSError):
+            return
+        if found is None:
+            self.ss_supported = False
+            log("Device has no session characteristic; live sessions off for this link")
+
+    async def maybe_send_sessions(self) -> None:
+        """Ship the sidecar's session payload to the device when it has changed.
+
+        Rides the existing TICK — no second timer, no extra thread. Three quiet
+        no-ops by design: this device has no SS characteristic, the sidecar is not
+        installed (no file), or the payload is byte-identical to the last one that
+        went over the air."""
+        if not self.ss_supported:
+            return
+        payload = read_sessions_payload()
+        if payload is None or payload == self.last_sessions_payload:
+            return
+        log(f"Sending sessions: {payload}")
+        try:
+            await self.client.write_gatt_char(
+                SS_CHAR_UUID, payload.encode("utf-8"), response=False
+            )
+        except BleakCharacteristicNotFoundError:
+            # Firmware without the session views (every board but the flagship):
+            # learn it once, then stay silent for the rest of this link.
+            self.ss_supported = False
+            log("Device has no session characteristic; live sessions off for this link")
+            return
+        except (BleakError, OSError, ValueError) as e:
+            # Same WinRT reality as write_payload(): a raw OSError/WinError can come
+            # out of a link that is going away. Log once per link, leave
+            # last_sessions_payload untouched so the next tick retries, and keep the
+            # zombie-link breaker out of it — session rows are a secondary feed and
+            # must never be the thing that forces a reconnect. A genuinely dead link
+            # still trips the breaker on the next usage write.
+            if not self._ss_write_logged:
+                self._ss_write_logged = True
+                log(f"Session write failed: {e}")
+            return
+        self.last_sessions_payload = payload
+        self._ss_write_logged = False
 
     async def write_payload(self, payload: dict) -> bool:
         data = json.dumps(payload, separators=(",", ":")).encode()
@@ -585,6 +699,7 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
     log("Connected")
     session = Session(client)
     await session.setup_refresh_subscription()
+    session.probe_session_support()
 
     last_poll = 0.0  # D-03: poll immediately on first connect
     used_successfully = False
@@ -665,6 +780,11 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                     # toast "token expired" — that mislabeled a boot-time DNS blip
                     # as an auth problem (SC#5). Leave tray state unchanged; the next
                     # tick retries and set_connected() recovers it.
+
+            # Live session rows (issue #135) ride the same tick as everything else:
+            # the sidecar has already done the work, so this is a file read that
+            # usually finds nothing and, when it does, one small GATT write.
+            await session.maybe_send_sessions()
 
             # Wake on a refresh request OR a stop, whichever comes first. Waking
             # promptly on stop_event is what lets the finally below run

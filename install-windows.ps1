@@ -10,11 +10,33 @@
 # Or, if you have already set a permissive execution policy:
 #   .\install-windows.ps1
 #
+# Live session awareness (off by default -- see daemon\SESSIONS.md) additionally
+# installs the Claude Code hook block and starts the sidecar at logon:
+#   powershell -ExecutionPolicy Bypass -File install-windows.ps1 -Sessions
+#   powershell -ExecutionPolicy Bypass -File install-windows.ps1 -Sessions -HookPort 45999
+#
 # To disable autostart later: right-click the tray icon -> uncheck "Start at login"
 # Or remove manually: reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 #
 # Security: this script downloads nothing from the internet. It installs only
 # the packages listed in the in-repo daemon\requirements-windows.txt.
+
+[CmdletBinding()]
+param(
+    # Opt in to live session awareness (issue #135, daemon\SESSIONS.md): sets
+    # hook_port, merges the Clawdmeter hook block into Claude Code's
+    # settings.json, and starts the sidecar now and at every logon.
+    # OFF unless asked for -- without it this installer behaves exactly as before.
+    [switch]$Sessions,
+
+    # Loopback port the hook listener binds. Only used with -Sessions.
+    [int]$HookPort = 45999,
+
+    # Extra Claude Code settings.json files to install the hook block into
+    # (e.g. a second CLAUDE_CONFIG_DIR). $HOME\.claude\settings.json is always
+    # included when -Sessions is given.
+    [string[]]$SettingsPath = @()
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -104,6 +126,54 @@ if ($LASTEXITCODE -ne 0) { throw "Autostart registration failed (exit $LASTEXITC
 Log "Autostart registered - Clawdmeter will launch automatically at next logon"
 
 # ------------------------------------------------------------------
+# Step 3b: Live session awareness (opt-in, -Sessions)
+# ------------------------------------------------------------------
+# Three separate things, all skipped entirely without -Sessions:
+#   1. hook_port in the daemon config -- the sidecar exits at once without it,
+#      so this is the single switch that turns the feature on;
+#   2. the Claude Code hook block, merged (never replacing) into settings.json;
+#   3. a second HKCU\Run value so the sidecar comes back at logon.
+if ($Sessions) {
+    Log "Enabling live session awareness (hook port $HookPort) ..."
+
+    $ConfigDir  = Join-Path $env:LOCALAPPDATA "Clawdmeter"
+    $ConfigFile = Join-Path $ConfigDir "config"
+    if (-not (Test-Path $ConfigDir)) {
+        New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+    }
+    if (-not (Test-Path $ConfigFile)) {
+        New-Item -ItemType File -Path $ConfigFile | Out-Null
+    }
+    # Never clobber an existing hook_port -- the user may have picked a port.
+    $ConfigText = Get-Content $ConfigFile -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $ConfigText) { $ConfigText = "" }
+    if ($ConfigText -match '(?m)^\s*hook_port\s*=') {
+        Log "  hook_port already set in $ConfigFile - leaving it alone"
+    } else {
+        Add-Content -Path $ConfigFile -Value "hook_port = $HookPort" -Encoding utf8
+        Log "  hook_port = $HookPort -> $ConfigFile"
+    }
+
+    $SidecarScript = Join-Path $RepoRoot "daemon\clawdmeter_sessions.py"
+    $HookUrl = "http://127.0.0.1:$HookPort/"
+    $Targets = @((Join-Path $env:USERPROFILE ".claude\settings.json")) + $SettingsPath
+    foreach ($Target in ($Targets | Select-Object -Unique)) {
+        Log "  installing hooks into $Target ..."
+        & $PythonExe $SidecarScript --install-hooks $Target $HookUrl
+        if ($LASTEXITCODE -ne 0) { throw "Hook installation failed for $Target (exit $LASTEXITCODE)" }
+    }
+
+    & $PythonExe -c @"
+import sys
+sys.path.insert(0, r'$RepoRoot')
+import daemon.autostart_windows as a
+a.enable_sessions(sidecar_script=r'$SidecarScript')
+"@
+    if ($LASTEXITCODE -ne 0) { throw "Session sidecar autostart registration failed (exit $LASTEXITCODE)" }
+    Log "Live session awareness enabled - already-open Claude Code sessions pick the hooks up when they restart"
+}
+
+# ------------------------------------------------------------------
 # Step 4: Launch the tray app (headless - BASE pythonw.exe, no console window)
 # ------------------------------------------------------------------
 # Use the BASE interpreter's pythonw.exe, NOT the venv's Scripts\pythonw.exe.
@@ -122,4 +192,13 @@ $StartArgs = @{
 }
 Start-Process @StartArgs
 Log "Tray app started - look for the Clawdmeter icon in your notification area"
+
+if ($Sessions) {
+    # Same base-pythonw trick as the tray: the venv redirector stub would pop a
+    # console window. The sidecar is stdlib-only, so it needs nothing from the venv.
+    Log "Launching session sidecar ..."
+    Start-Process -FilePath $BasePythonw -ArgumentList "`"$SidecarScript`"" -WorkingDirectory $RepoRoot
+    Log "Session sidecar started - check $env:LOCALAPPDATA\Clawdmeter\sessions.log"
+    Log 'To turn it off later: python -c "import daemon.autostart_windows as a; a.disable_sessions()" and remove hook_port from the config'
+}
 Log "=== Install complete ==="
