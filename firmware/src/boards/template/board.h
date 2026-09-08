@@ -48,4 +48,5 @@
 #define BOARD_HAS_IMU              0   // TODO
 #define BOARD_HAS_BATTERY          0   // TODO
 #define BOARD_HAS_IO_EXPANDER      0   // TODO
+#define BOARD_HAS_SOUND            0   // TODO: chime — see boards/waveshare_amoled_216/sound.cpp
 #define BOARD_HAS_SESSION_VIEWS    0   // TODO: chat card views — needs room for 3 cards + smooth animation

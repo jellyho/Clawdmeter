@@ -70,3 +70,4 @@
 #define BOARD_HAS_BATTERY          0
 #define BOARD_HAS_IO_EXPANDER      1
 #define BOARD_HAS_SOUND            0
+#define BOARD_HAS_SESSION_VIEWS    0   // needs a card-list pass on the RGB panel

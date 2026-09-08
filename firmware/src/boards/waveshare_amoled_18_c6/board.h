@@ -63,4 +63,5 @@
 #define BOARD_HAS_IMU              1    // present + initialized for I2C bus health
 #define BOARD_HAS_BATTERY          1
 #define BOARD_HAS_IO_EXPANDER      1
+#define BOARD_HAS_SOUND            0    // amp is TCA9554 P7, left off (sound.cpp no-ops)
 #define BOARD_HAS_SESSION_VIEWS    0   // no PSRAM; needs a portrait layout pass

@@ -9,6 +9,7 @@ static const BoardCaps caps = {
     .has_rotation = false,
     .has_battery = true,
     .has_imu = true,
+    .has_sound = (bool)BOARD_HAS_SOUND,
     .has_session_views = (bool)BOARD_HAS_SESSION_VIEWS,
 };
 

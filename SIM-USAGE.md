@@ -56,6 +56,7 @@ $env:SIM_AUTOSHOT_MS='6000'; .pio\build\sim\program.exe`.
 | `←` / `→` | step one scenario state (pauses playback) |
 | `1`–`9` | jump to scenario state N (pauses playback) |
 | `d` | toggle BLE connected/disconnected |
+| `w` | fire a session notification — injects a session payload whose top chat is waiting on you, cycling needs-permission → asking-you → needs-input → error on each press |
 | `b` (hold) | PRIMARY button (BOOT — HID Space PTT on hardware) |
 | `n` (hold) | SECONDARY button (HID Shift+Tab on hardware) |
 | `p` | PWR button (short press; hold ~3s + release = pair gesture) |
@@ -75,8 +76,12 @@ daemon payload plus two optional keys:
 - `"hold_ms"` — time on this state (default 3000)
 
 Lines starting with `#` are comments. Lines containing an `"ss"` array are
-**session payloads** (issue #135 wire format) and go out on the session
-characteristic path; everything else is a quota payload.
+**session payloads** (issue #135 wire format) and are delivered on the session
+channel — `ble_has_session_data()` / `ble_get_session_data()`, the stand-in for
+the SS GATT characteristic; every other line is a quota payload on
+`ble_has_data()` / `ble_get_data()`. One scenario interleaves both; the
+playback cursor, `name` and `hold_ms` work the same either way, and the window
+title marks session states with `SS`.
 
 Session row format:
 
@@ -86,7 +91,14 @@ Session row format:
 
 States: 0 starting · 1 idle · 2 thinking · 3 responding · 4 running-tool ·
 5 compacting · 6 needs-permission · 7 asking-you · 8 needs-input · 9 error.
-`tok` is context tokens in 1k units (190 = 190k); `-1`/absent = unknown.
+Models: 1 opus · 2 sonnet · 3 haiku · 4 fable. Tools: 1 Bash · 2 Read · 3 Edit ·
+4 Write · 5 Grep · 6 Glob · 7 Task · 8 WebFetch · 9 WebSearch.
+`tok` is context tokens in 1k units (190 = 190k); `-1`/absent = unknown (and
+`ctx` `-1` hides the bar). `{"ss":[]}` means "no chats".
+
+The shipped scenario puts the session cases on jump keys `1`–`9` (one chat,
+several chats, each waiting state, the 6-row cap, then no chats) and runs the
+quota sweep after them.
 
 Override the scenario file with `SIM_SCENARIO=<path>`. If the file is missing,
 a small built-in state list is used.
@@ -101,9 +113,20 @@ Saves `sim-autoshot.bmp` (override with `SIM_AUTOSHOT_PATH`) after the given
 delay and exits. Combine with `SIM_SCENARIO` pointing at a single-state file
 to capture any specific screen.
 
+`SIM_ALERT_MS=<ms>` is the headless twin of the `w` key: it fires one session
+notification after `<ms>`, so a screenshot can catch whatever the UI does with
+an incoming alert without anyone at a keyboard. Set it a second or two before
+`SIM_AUTOSHOT_MS`:
+
+```bash
+SDL_VIDEODRIVER=dummy SIM_ALERT_MS=5000 SIM_AUTOSHOT_MS=6000 \
+  .pio/build/sim/program
+```
+
 ## Caveat
 
-The sim mirrors the S3 2.16 geometry but renders with desktop LVGL and fake
-data. It's ideal for iterating UI layouts, but panel-level behavior — column
+The sim mirrors the S3 2.16 — geometry, PSRAM-class buffers, and the chat card
+views (`-DBOARD_HAS_SESSION_VIEWS=1` in `[env:sim]`, mirrored in the sim's
+`board.h` and `BoardCaps`) — but renders with desktop LVGL and fake data. It's ideal for iterating UI layouts, but panel-level behavior — column
 offsets, rotation, flush rounding — lives in the hardware board folders, so
 always do a final check on real hardware before merging panel-related changes.

@@ -9,6 +9,7 @@ int main(void) {
         "  mouse          touch (tap toggles splash/usage)\n"
         "  space          play/pause scenario    left/right step    1-9 jump\n"
         "  d              toggle BLE link\n"
+        "  w              fire a session notification (cycles the waiting states)\n"
         "  b / n (hold)   BOOT / secondary button    p  PWR button\n"
         "  c              toggle charging            - / =  battery down/up\n"
         "  s              screenshot                 esc  quit\n\n");

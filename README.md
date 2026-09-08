@@ -12,14 +12,27 @@ Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 
 ## Screens
 
-The device boots into the splash. Tap the screen anywhere to switch to the Usage view; tap again to flip back to the splash.
+Screens are tabs. **Swipe horizontally to move between them** — left for the next tab, right for the previous, wrapping at both ends. On the splash and usage screens a tap still flips between the two; the sessions and settings tabs are read and tapped instead, so you swipe off those.
 
 |              Splash               |              Usage              |
 | :-------------------------------: | :-----------------------------: |
 | ![Splash](screenshots/splash.gif) | ![Usage](screenshots/usage.png) |
-|   Splash; touch-toggle anytime    | Session and weekly utilization  |
+|   Pixel-art Clawd, reacting to how hard you're working    | Session and weekly utilization  |
 
-While the splash is up, the middle (PWR) button cycles animations. **Hold the power button for 3 seconds, then release, to put the device into pairing mode** — this clears the saved Bluetooth bond and re-advertises. The firmware also auto-rotates animations every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
+|                Sessions                 |                Settings                 |
+| :-------------------------------------: | :-------------------------------------: |
+| ![Sessions](screenshots/sessions.png)   | ![Settings](screenshots/settings.png)   |
+| Live Claude Code chats and what each is doing | On-device preferences, saved to flash |
+
+The **Sessions** tab shows every Claude Code chat you have open: what it is doing, how full its context window is, its todo progress, and how long it has been in that state. A chat that needs you — a permission prompt, a question, an error — is drawn in terracotta and sorted to the top. When one of them starts waiting, the device **jumps to this tab on its own** so you notice from across the room. That jump fires once per event, never repeatedly, and it leaves you alone while you are on the Settings tab. When the last waiting chat clears it hands the screen back to where you were about ten seconds later — unless you touched the panel in the meantime, in which case it stays where you left it. Turn the whole thing off in Settings if you would rather it stayed put.
+
+This tab needs the session sidecar on the host — see [`daemon/SESSIONS.md`](daemon/SESSIONS.md). Without it the tab is still in the swipe ring but has nothing to list ("No active sessions"); boards too small to host chat cards never have it in their swipe order at all. More than three live sessions scroll: drag the list vertically — the swipe ring only listens to horizontal drags, so the two never fight.
+
+The **Settings** tab holds the preferences that used to require a reflash: the reset chime, auto-jump, whether the device boots to the splash, the clock format, and screen brightness. Each one is written to flash the moment you change it, so they survive a power cut.
+
+While the splash is up, the PWR button cycles animations. **Hold the power button for 3 seconds, then release, to put the device into pairing mode** — this clears the saved Bluetooth bond and re-advertises. The firmware also auto-rotates animations every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
+
+> Every screenshot above is a real frame from the firmware, captured headlessly from the desktop simulator (`-e sim`) — the same `ui.cpp` that runs on the panel. See [`SIM-USAGE.md`](SIM-USAGE.md) to run it yourself.
 
 ## Hardware
 

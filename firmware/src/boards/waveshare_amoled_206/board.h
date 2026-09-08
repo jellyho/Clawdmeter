@@ -44,4 +44,5 @@
 #define BOARD_HAS_IMU              1   // present + initialized, but rotation off
 #define BOARD_HAS_BATTERY          1
 #define BOARD_HAS_IO_EXPANDER      0
+#define BOARD_HAS_SOUND            0   // ES8311 populated, amp path unverified (sound.cpp no-ops)
 #define BOARD_HAS_SESSION_VIEWS    0   // needs a portrait layout pass

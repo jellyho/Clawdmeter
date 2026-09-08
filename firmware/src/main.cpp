@@ -12,6 +12,7 @@
 #include "idle.h"
 #include "idle_cfg.h"
 #include "brightness.h"
+#include "settings.h"
 
 #include "hal/board_caps.h"
 #include "hal/display_hal.h"
@@ -243,6 +244,7 @@ void setup() {
     display_hal_begin();
     idle_init();        // takes over panel brightness and starts the idle timer
     brightness_init();  // load the user's saved brightness level and apply via idle
+    settings_init();    // load the user's settings (sound, auto-jump, boot screen…)
 
     power_hal_init();
     imu_hal_init();
@@ -269,6 +271,16 @@ void setup() {
     lv_indev_t* indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touch_cb);
+    // Swipe threshold for the tab gestures. LVGL's default is a flat 50 px,
+    // which is a fifth of a 240-wide panel — scale it with the display and
+    // keep it inside a range that is neither trigger-happy nor unreachable.
+    // ui.cpp attaches the gesture handler to this indev in ui_init().
+    {
+        int gd = W / 6;
+        if (gd > 50) gd = 50;
+        if (gd < 24) gd = 24;
+        lv_indev_set_gesture_min_distance(indev, (uint8_t)gd);
+    }
 
     ble_init();
     input_hal_init();
@@ -276,7 +288,8 @@ void setup() {
     ui_init();
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
-    ui_show_screen(SCREEN_SPLASH);
+    // Boot screen is a setting now (default: the splash, as before).
+    ui_show_screen(settings_splash_boot() ? SCREEN_SPLASH : SCREEN_USAGE);
 
     Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE...\n",
         board_caps().name, W, H);
@@ -387,8 +400,11 @@ void loop() {
 
         if (power_hal_pwr_pressed()) {
             if (!idle_consume_wake_press()) {
-                // On splash: cycle animations. On the usage view: cycle
-                // screen brightness (single non-splash view, no more screens).
+                // Unchanged by the tab work: on splash it cycles animations,
+                // everywhere else it cycles brightness. Screen *switching* is
+                // the swipe's job now, so PWR keeps both of its old meanings
+                // and collides with neither — on the settings tab it simply
+                // drives the Brightness row, which repaints to match.
                 if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
                 else                                          brightness_cycle();
             }
@@ -423,8 +439,10 @@ void loop() {
             int g_after = usage_rate_group();
             // 5-hour session limit refilled → chime so the user knows they can
             // use Claude again (no-op on boards without a buzzer). Gated on the
-            // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
-            if (session_reset && usage.chime) {
+            // daemon's opt-in `chime` config AND the on-device Sound setting —
+            // either can silence it. The `buzz` serial cmd ignores both; it is
+            // a hardware test hook, not a notification.
+            if (session_reset && usage.chime && settings_sound_enabled()) {
                 Serial.println("session reset detected — chime");
                 sound_hal_play_reset();
             }

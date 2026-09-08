@@ -36,6 +36,7 @@ void sim_pump(void) {
             case SDLK_LEFT:   sim_playback_step(-1); break;
             case SDLK_RIGHT:  sim_playback_step(+1); break;
             case SDLK_d:      sim_playback_toggle_link(); break;
+            case SDLK_w:      sim_session_alert(); break;
             case SDLK_s:      sim_display_screenshot(NULL); break;
             case SDLK_c:      charging = !charging; break;
             case SDLK_MINUS:  battery = battery < 5 ? 0 : battery - 5; break;

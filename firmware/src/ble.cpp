@@ -66,7 +66,9 @@ static NimBLECharacteristic* input_kbd = nullptr;
 static NimBLECharacteristic* tx_char = nullptr;
 static NimBLECharacteristic* rx_char = nullptr;
 static NimBLECharacteristic* req_char = nullptr;
+#if BOARD_HAS_SESSION_VIEWS
 static NimBLECharacteristic* ss_char = nullptr;
+#endif
 
 static ble_state_t state = BLE_STATE_INIT;
 static bool need_advertise = false;
@@ -81,8 +83,15 @@ static volatile uint16_t param_fix_spent  = CONN_HANDLE_NONE;  // one per connec
 static char rx_buf[BLE_BUF_SIZE];
 static volatile bool data_ready = false;
 static volatile bool has_received_data = false;
+#if BOARD_HAS_SESSION_VIEWS
+// Only the ports that can render the chat views carry this: 1 KB of static
+// internal SRAM plus the airtime of a write on every session change, charged
+// otherwise to the two PSRAM-free C6 parts for a feature they compile out.
+// With the characteristic absent the daemon's maybe_send_sessions() finds no
+// SS UUID and stays quiet, which it already handles.
 static char ss_buf[BLE_SS_BUF_SIZE];
 static volatile bool ss_ready = false;
+#endif
 static char mac_str[18];
 
 // --- Single-owner lock -----------------------------------------------------
@@ -300,6 +309,7 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     }
 };
 
+#if BOARD_HAS_SESSION_VIEWS
 // Session rows (issue #135). Same guard as RX; separate buffer because the
 // two feeds have unrelated cadences (quota every 60s, sessions on change) and
 // must not clobber each other between main-loop polls.
@@ -313,6 +323,7 @@ class SsCallbacks : public NimBLECharacteristicCallbacks {
         ss_ready = true;
     }
 };
+#endif
 
 // When the daemon enables notifications on the refresh char, ask for data
 // if we have none yet. Firing on subscribe (not on connect) ensures the
@@ -329,9 +340,13 @@ class ReqCallbacks : public NimBLECharacteristicCallbacks {
 void ble_init(void) {
     NimBLEDevice::init(DEVICE_NAME);
     NimBLEDevice::setSecurityAuth(true, false, true);  // bonding, no MITM, SC
+#if BOARD_HAS_SESSION_VIEWS
     // Session payloads want room for several rows in one write. The host
     // derives its row budget from the negotiated MTU, so ask for the max.
+    // Quota payloads have always fit the default MTU, so boards without the
+    // chat views keep it (and the smaller per-connection buffers).
     NimBLEDevice::setMTU(517);
+#endif
 
     // Restore the locked owner (if any) and drop any stale non-owner bonds so
     // the board stays paired to a single machine across reboots.
@@ -389,6 +404,7 @@ void ble_init(void) {
     static ReqCallbacks reqCb;
     req_char->setCallbacks(&reqCb);
 
+#if BOARD_HAS_SESSION_VIEWS
     // Session rows (write-only from the host). max_len raised above NimBLE's
     // 512-byte attribute default so a long write can fill the SS buffer.
     ss_char = svc->createCharacteristic(
@@ -398,6 +414,7 @@ void ble_init(void) {
     );
     static SsCallbacks ssCb;
     ss_char->setCallbacks(&ssCb);
+#endif
 
     svc->start();
     server->start();
@@ -459,6 +476,7 @@ const char* ble_get_data(void) {
     return rx_buf;
 }
 
+#if BOARD_HAS_SESSION_VIEWS
 bool ble_has_session_data(void) {
     return ss_ready;
 }
@@ -467,6 +485,12 @@ const char* ble_get_session_data(void) {
     ss_ready = false;
     return ss_buf;
 }
+#else
+// No characteristic, nothing to drain — the API stays total (boards/sim's
+// ble_sim.cpp does the same) so main.cpp's gate is the only #if that matters.
+bool ble_has_session_data(void) { return false; }
+const char* ble_get_session_data(void) { return ""; }
+#endif
 
 void ble_send_ack(void) {
     if (state == BLE_STATE_CONNECTED && tx_char) {

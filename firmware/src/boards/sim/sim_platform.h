@@ -24,3 +24,4 @@ void sim_playback_toggle(void);
 void sim_playback_step(int dir);
 void sim_playback_jump(int idx);      // 0-based
 void sim_playback_toggle_link(void);  // BLE connected <-> disconnected
+void sim_session_alert(void);         // inject a waiting-state session payload

@@ -5,6 +5,7 @@
 #include "logo.h"
 #include "clawd_still.h"
 #include "icons.h"
+#include "settings.h"
 #include "hal/board_caps.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
@@ -65,6 +66,16 @@ struct Layout {
     const lv_font_t* bt_device_font;
     const lv_font_t* bt_credit_1_font;
     const lv_font_t* bt_credit_2_font;
+
+    // Settings screen — one panel per setting, stacked from content_y.
+    // set_detail_font == nullptr means the panel is too short for a subtitle
+    // (240x240): the label alone is centered instead.
+    int16_t set_row_h;
+    int16_t set_row_gap;
+    int16_t set_row_pad_y;
+    const lv_font_t* set_label_font;
+    const lv_font_t* set_detail_font;
+    const lv_font_t* set_value_font;
 };
 static Layout L = {};
 
@@ -117,6 +128,13 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_28;
         L.bt_credit_1_font = &font_styrene_24;
         L.bt_credit_2_font = &font_styrene_20;
+        // 5 rows: 100 + 5*(64+6) - 6 = 444, clear of the 480 bottom edge.
+        L.set_row_h        = 64;
+        L.set_row_gap      = 6;
+        L.set_row_pad_y    = 7;
+        L.set_label_font   = &font_styrene_28;
+        L.set_detail_font  = &font_styrene_16;
+        L.set_value_font   = &font_styrene_24;
     } else if (c.height >= 300) {
         // Compact layout — tuned for 368x448 (AMOLED-1.8).
         L.content_y = 85;
@@ -131,6 +149,13 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_20;
         L.bt_credit_1_font = &font_styrene_16;
         L.bt_credit_2_font = &font_styrene_14;
+        // 5 rows: 85 + 5*(54+6) - 6 = 379, clear of the 448 bottom edge.
+        L.set_row_h        = 54;
+        L.set_row_gap      = 6;
+        L.set_row_pad_y    = 6;
+        L.set_label_font   = &font_styrene_24;
+        L.set_detail_font  = &font_styrene_12;
+        L.set_value_font   = &font_styrene_20;
     } else {
         // Small layout — tuned for 240x240 (LCD-1.54 and similar square TFTs).
         // Everything shrinks: fonts two steps down, panels ~half height, and
@@ -173,6 +198,14 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_14;
         L.bt_credit_1_font = &font_styrene_12;
         L.bt_credit_2_font = &font_styrene_12;
+        // 5 rows: 44 + 5*(30+4) - 4 = 210 of 240. No room for a subtitle —
+        // the label carries the row on its own here.
+        L.set_row_h        = 30;
+        L.set_row_gap      = 4;
+        L.set_row_pad_y    = 4;
+        L.set_label_font   = &font_styrene_14;
+        L.set_detail_font  = nullptr;
+        L.set_value_font   = &font_styrene_12;
     }
 
     L.content_w = L.scr_w - 2 * L.margin;
@@ -191,7 +224,14 @@ static void compute_layout(const BoardCaps& c) {
 #define COL_PURPLE    THEME_PURPLE
 #define COL_BAR_BG    THEME_BAR_BG
 
-// ---- Usage screen widgets (single non-splash view) ----
+// ---- Tab containers ----
+// One per non-splash screen; ui_show_screen() is the only thing that toggles
+// their HIDDEN flag. sessions_container is only built on boards that advertise
+// the chat views (it stays null elsewhere, and the tab ring skips it).
+static lv_obj_t* sessions_container = nullptr;
+static lv_obj_t* settings_container = nullptr;
+
+// ---- Usage screen widgets ----
 static lv_obj_t* usage_container;
 static lv_obj_t* lbl_title;
 // Clock fed by the daemon: base epoch (local wall-clock seconds) + the lv_tick at
@@ -231,7 +271,10 @@ static lv_obj_t* idle_group;            // the "Zzz" idle screen
 static uint32_t  last_data_ms = 0;      // lv_tick when the last valid usage update landed
 static bool      data_received = false; // any valid update since boot
 static bool      data_ok = true;        // last payload's ok flag; a {"ok":false} beat = "no fresh data"
-static int       view_state = -1;       // -1 unknown / 0 pair / 1 idle / 2 usage
+// -1 unknown / 0 pair / 1 idle / 2 usage. States 3 and 4 (the chat views) used
+// to live here too; they are now the SCREEN_SESSIONS tab and are resolved by
+// update_session_view() instead — the usage screen no longer auto-selects them.
+static int       view_state = -1;
 static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within this window (daemon sends ~60s)
 
 // ---- Shared ----
@@ -239,6 +282,37 @@ static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
+
+// ---- Tab model ----
+// The swipe ring, built once in ui_init() from board_caps(). A screen that the
+// board can't host is simply absent from the ring, so no swipe can ever land
+// on an empty tab. ui_show_screen() stays the single place that shows/hides
+// containers; the ring only decides *which* screen it is handed.
+static screen_t tab_order[SCREEN_COUNT];
+static uint8_t  tab_count = 0;
+
+// Swipe → click disambiguation. LVGL sends LV_EVENT_CLICKED on release even
+// when a gesture already fired during the same press, so a swipe would also
+// toggle the splash. The flag is raised by the gesture handler and cleared on
+// the next LV_EVENT_PRESSED — never inside a click handler, because a gesture
+// that ends with the finger off the pressed object produces no CLICKED at all
+// and a self-clearing flag would then eat the *following* tap.
+static bool s_gesture_used = false;
+
+// Auto-jump bookkeeping (requirement 4). s_auto_jumped means "the tab the user
+// is looking at was chosen by the firmware, not by them" — it is dropped the
+// moment they touch the panel or navigate, so the return trip below can never
+// move the screen out from under a hand.
+// The return trip is deliberately lazy: looking at a notification produces no
+// touch, so handing the screen back the instant the payload clears would yank
+// it out from under someone mid-read (and a waiting/clear/waiting burst would
+// flip the panel twice). It waits for the dwell below, and any touch or manual
+// navigation cancels it outright.
+static bool     s_auto_jumped     = false;
+static screen_t s_auto_jump_from  = SCREEN_USAGE;
+static uint32_t s_auto_jump_ms    = 0;      // lv_tick when the jump happened
+static bool     s_auto_return_due = false;  // waiting set cleared; dwell running
+#define AUTO_RETURN_DWELL_MS 10000u
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -312,8 +386,18 @@ static void format_reset_time(int mins, char* buf, size_t len) {
     }
 }
 
+// A routine content refresh must not animate anything (§2.3) — and rewriting
+// a label always invalidates it, so compare first. Shared by the chat cards
+// and the settings rows, both of which re-render on a timer.
+static void set_label_if_changed(lv_obj_t* lbl, const char* txt) {
+    if (strcmp(lv_label_get_text(lbl), txt) != 0) lv_label_set_text(lbl, txt);
+}
+
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
+// The one place that shows/hides containers. `manual` distinguishes a user
+// navigation (swipe / tap / button) from a firmware-initiated one (auto-jump).
+static void show_screen(screen_t screen, bool manual);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -471,13 +555,15 @@ static void build_idle_group(lv_obj_t* parent) {
 }
 
 // ======== Live session awareness (issue #135) ========
-// Two additional usage-screen sub-views — ONE-CHAT (§1.3) and SEVERAL-CHATS
-// (§1.4) — compiled only on boards whose panel can host them
-// (BOARD_HAS_SESSION_VIEWS). No new screen_t: update_view_state() picks them
-// exactly like it picks pairing / no-data / quota.
+// The chat card renderer from the live-sessions work, unchanged. What changed
+// around it is navigation: ONE-CHAT (§1.3) and SEVERAL-CHATS (§1.4) used to be
+// auto-selected sub-views of the usage screen. They are now the two sub-views
+// of their own tab, SCREEN_SESSIONS, which the user reaches by swiping (or is
+// carried to by the auto-jump on a rising notification edge). Compiled only on
+// boards whose panel can host them (BOARD_HAS_SESSION_VIEWS).
 
-static void update_view_state(void);       // defined below ui_update
-static void apply_anim_visibility(void);   // status-line rule (§2.3)
+static void update_view_state(void);       // usage-screen resolver, below ui_update
+static void update_session_view(void);     // sessions-tab resolver
 
 #if BOARD_HAS_SESSION_VIEWS
 
@@ -501,8 +587,13 @@ static void apply_anim_visibility(void);   // status-line rule (§2.3)
 #define CHAT_ROW_COL_GAP  12    // label|bar|pct column gap
 #define CHAT_ROW_HALF_GAP 20    // between the 5h and 7d halves
 #define CHAT_ROW_GAP      14    // strip band ↓ card list (plus 4, per #129)
-#define CHAT_CARD_H       108
-#define CHAT_CARD_GAP     10    // between cards (#129 ch_card_gap)
+// Card height and gap are sized so that THREE WHOLE CARDS plus a sliver of the
+// fourth fit the viewport: 3*104 + 2*4 = 320 of the 332 px between the quota
+// strip and the bottom edge, leaving 12 px for the gap and the peek. Before
+// this the pitch was 118 and the third card was cut 12 px short with its state
+// line inside the fade band, while rows 4-6 were drawn nowhere at all.
+#define CHAT_CARD_H       104
+#define CHAT_CARD_GAP     4
 #define CHAT_CARD_PITCH   (CHAT_CARD_H + CHAT_CARD_GAP)
 #define CHAT_CARD_PAD_Y   8
 // Chat cards (and the ONE-CHAT quota box) bleed to the physical left/right
@@ -510,7 +601,11 @@ static void apply_anim_visibility(void);   // status-line rule (§2.3)
 // inner side padding keeps text at the same 20px inset the old screen margin
 // provided, clear of the panel's rounded corners.
 #define CHAT_CARD_PAD_X   20
-#define CHAT_FADE_H       60    // bottom fade band: transparent → panel black
+// Bottom fade: tapers the peeking next card into the panel edge. It is short
+// on purpose — it must never reach the last WHOLE card's state line and timer,
+// which is the row the user came to this tab to read — and it is hidden
+// entirely when nothing is below the fold (chat_fade_update).
+#define CHAT_FADE_H       16
 // ONE-CHAT: two boxes — the 5h quota panel (exact RESTING "Current" panel)
 // on top, the chat card below it.
 #define FOCUS_CARD_H      176
@@ -542,7 +637,12 @@ struct ChatCard {
 
 static lv_obj_t* focus_group = nullptr;   // ONE-CHAT (§1.3)
 static lv_obj_t* chats_group = nullptr;   // SEVERAL-CHATS (§1.4)
-static lv_obj_t* cards_cont  = nullptr;   // clipping viewport for the card list
+static lv_obj_t* empty_group = nullptr;   // "No active sessions" — the tab is
+                                          // reachable at any time now, so it
+                                          // needs something to say when idle
+static lv_obj_t* cards_cont  = nullptr;   // scrolling viewport for the card list
+static lv_obj_t* chat_fade   = nullptr;   // "more below the fold" gradient
+static lv_obj_t* empty_lbl   = nullptr;   // what the empty tab says
 static ChatCard  chat_cards[SESSION_MAX_ROWS];
 static ChatCard  focus_card;
 static lv_obj_t* focus_lbl_model = nullptr;
@@ -564,10 +664,25 @@ static lv_image_dsc_t icon_agents_dsc, icon_agents_small_dsc;
 // Resolver inputs (§2.1), fed by ui_update_sessions()
 static uint8_t  s_live_count    = 0;      // rows in the last received list
 static bool     s_any_waiting   = false;  // any row in the waiting bucket
-static bool     s_focus_waiting = false;  // rows[0] waiting → status line hides
+// The notification edge is per SESSION, not global. "Something is waiting" is a
+// level, and one parked permission prompt can hold it for an hour — during
+// which a SECOND session hitting its own prompt would produce no edge and no
+// notification, which is precisely the multi-session case this tab exists for.
+// So the waiting set is remembered by sid, and a jump fires for any sid that
+// has just entered it.
+static char     s_waiting_sids[SESSION_MAX_ROWS][3];  // committed set
+static uint8_t  s_waiting_n     = 0;
+static char     s_waiting_now[SESSION_MAX_ROWS][3];   // this payload's set
+static uint8_t  s_waiting_now_n = 0;
+static bool     s_new_waiting   = false;  // a sid entered the set this payload
+static bool     s_focus_waiting = false;  // rows[0] waiting → drives the pulse
 static bool     s_chats_linger  = false;  // holding a chat view after the last chat closed
 static uint32_t s_chats_gone_ms = 0;
-static int      s_linger_view   = 2;
+// Sessions-tab sub-view: 0 = empty, 1 = ONE-CHAT, 2 = SEVERAL-CHATS. These are
+// the old view_state 3/4 renumbered now that they own a tab instead of sharing
+// the usage screen's resolver.
+static int      session_view    = -1;
+static int      s_linger_view   = 1;
 static UsageData s_usage_cache  = {};     // latest quota payload, for the mini bars
 
 enum {
@@ -575,6 +690,12 @@ enum {
     SESSION_BUCKET_WORKING = 1,
     SESSION_BUCKET_WAITING = 2,
 };
+
+static bool sid_in_set(const char set[][3], uint8_t n, const char* sid) {
+    for (uint8_t i = 0; i < n; i++)
+        if (strcmp(set[i], sid) == 0) return true;
+    return false;
+}
 
 static int session_bucket(uint8_t state) {
     if (state >= SESSION_WAITING_PERMISSION && state <= SESSION_ERROR)
@@ -625,12 +746,6 @@ static void session_tok_text(int32_t tok_k, char* buf, size_t n) {
     if (tok_k < 1000) snprintf(buf, n, "%dK", (int)tok_k);
     else              snprintf(buf, n, "%d.%dM", (int)(tok_k / 1000),
                                (int)((tok_k % 1000) / 100));
-}
-
-// A routine content refresh must not animate anything (§2.3) — and rewriting
-// a label always invalidates it, so compare first.
-static void set_label_if_changed(lv_obj_t* lbl, const char* txt) {
-    if (strcmp(lv_label_get_text(lbl), txt) != 0) lv_label_set_text(lbl, txt);
 }
 
 // Ellipsize in firmware: measure, then middle-elide with "..." (three dots),
@@ -969,6 +1084,20 @@ static void focus_set_content(const SessionRow* r) {
     lv_obj_set_style_opa(focus_card.card, session_tier_opa(r->state), 0);
 }
 
+// The bottom fade is an affordance for content below the fold, so it is drawn
+// only while there IS content below the fold. Shown unconditionally it dims
+// the last card's own state line and timer — exactly the reading it exists to
+// protect — and promises rows that aren't there.
+static void chat_fade_update(void) {
+    if (!chat_fade || !cards_cont) return;
+    if (lv_obj_get_scroll_bottom(cards_cont) > 0)
+        lv_obj_remove_flag(chat_fade, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(chat_fade, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void cards_scroll_cb(lv_event_t* e) { (void)e; chat_fade_update(); }
+
 // ---- Card pool: identity-stable matching + the reorder slide (§2.3) ----
 
 static ChatCard* chat_card_by_sid(const char* sid) {
@@ -988,8 +1117,9 @@ static ChatCard* chat_card_alloc(void) {
 
 static void chats_set_content(const SessionList* list) {
     // Motion only while the list is on screen: entering the view (or updating
-    // it while another view is up) positions everything instantly.
-    const bool animate = (view_state == 4);
+    // it while another view — or another tab — is up) positions everything
+    // instantly, so a swipe onto the sessions tab never lands mid-slide.
+    const bool animate = (current_screen == SCREEN_SESSIONS && session_view == 2);
 
     for (auto& c : chat_cards) c.claimed = false;
 
@@ -1046,6 +1176,13 @@ static void chats_set_content(const SessionList* list) {
         }
     }
 
+    // A shrinking list can leave the viewport scrolled past its last card;
+    // pull it back so the top of the list is never dead space.
+    const int content_h  = list->count * CHAT_CARD_PITCH - CHAT_CARD_GAP;
+    const int max_scroll = content_h - lv_obj_get_height(cards_cont);
+    if (lv_obj_get_scroll_y(cards_cont) > max_scroll)
+        lv_obj_scroll_to_y(cards_cont, max_scroll > 0 ? max_scroll : 0, LV_ANIM_OFF);
+
     // Chats that closed: fade out; their slot is reclaimed by the slide (§2.3).
     for (auto& c : chat_cards) {
         if (!c.used || c.claimed) continue;
@@ -1067,6 +1204,8 @@ static void chats_set_content(const SessionList* list) {
             lv_obj_add_flag(c.card, LV_OBJ_FLAG_HIDDEN);
         }
     }
+
+    chat_fade_update();
 }
 
 // Refresh the chat views' quota widgets from the cached usage payload. Values
@@ -1192,11 +1331,15 @@ static void build_session_views(lv_obj_t* parent) {
     }
 
     // Card viewport: runs from the strip to the PHYSICAL bottom edge — this
-    // sub-view alone drops the bottom margin, because clipped content tapers
-    // out through the fade band below instead of hitting a hard cut (§2.5's
-    // mid-card affordance, softened; the 4th card shows 62 of 80 px, the last
-    // 60 of them fading). Side margins stay. No scrolling in this round —
-    // ordering guarantees everything urgent is above the fold.
+    // sub-view alone drops the bottom margin. Side margins stay.
+    //
+    // Three cards fit it exactly (see CHAT_CARD_GAP). SESSION_MAX_ROWS is 6, so
+    // rows 4-6 have to be reachable: the viewport SCROLLS, VERTICALLY ONLY.
+    // That direction restriction is what keeps the tab ring alive — LVGL picks
+    // a scroll object per drag axis (lv_indev_find_scroll_obj), so a horizontal
+    // swipe finds none here, no scroll starts, and the gesture reaches
+    // screen_gesture_cb untouched. A vertical drag scrolls the list and
+    // suppresses the gesture, which is what it should do.
     const int list_y = L.content_y + CHAT_ROW_H + CHAT_ROW_GAP + 4;  // #129 ch_list_y
     const int list_h = L.scr_h - list_y;
     cards_cont = lv_obj_create(chats_group);
@@ -1205,8 +1348,23 @@ static void build_session_views(lv_obj_t* parent) {
     lv_obj_set_style_bg_opa(cards_cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(cards_cont, 0, 0);
     lv_obj_set_style_pad_all(cards_cont, 0, 0);
-    lv_obj_clear_flag(cards_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cards_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(cards_cont, LV_DIR_VER);
+    // AUTO, which in LVGL means "whenever there is content off-screen" (not
+    // "only while dragging") — so the bar is the standing, unambiguous cue
+    // that rows 4-6 exist, and it vanishes the moment the list fits. It rides
+    // in the cards' right-hand padding, clear of every label.
+    lv_obj_set_scrollbar_mode(cards_cont, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_color(cards_cont, COL_DIM, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(cards_cont, LV_OPA_50, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(cards_cont, 4, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(cards_cont, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_right(cards_cont, 6, LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_top(cards_cont, 6, LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_bottom(cards_cont, 6, LV_PART_SCROLLBAR);
     lv_obj_add_flag(cards_cont, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(cards_cont, cards_scroll_cb, LV_EVENT_SCROLL, NULL);
+    lv_obj_add_event_cb(cards_cont, cards_scroll_cb, LV_EVENT_SCROLL_END, NULL);
 
     for (auto& c : chat_cards) {
         build_chat_card(&c, cards_cont, 0, 0, false);
@@ -1220,20 +1378,32 @@ static void build_session_views(lv_obj_t* parent) {
     // it's a later sibling of cards_cont, so reorder slides and pool churn
     // inside the container can never draw above it. Input-transparent (not
     // clickable), so the tap-anywhere splash toggle works through it.
-    lv_obj_t* fade = lv_obj_create(chats_group);
-    lv_obj_set_pos(fade, 0, L.scr_h - CHAT_FADE_H);
-    lv_obj_set_size(fade, L.scr_w, CHAT_FADE_H);
-    lv_obj_set_style_radius(fade, 0, 0);
-    lv_obj_set_style_border_width(fade, 0, 0);
-    lv_obj_set_style_pad_all(fade, 0, 0);
-    lv_obj_set_style_bg_color(fade, COL_BG, 0);
-    lv_obj_set_style_bg_grad_color(fade, COL_BG, 0);
-    lv_obj_set_style_bg_grad_dir(fade, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_bg_opa(fade, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_main_opa(fade, LV_OPA_TRANSP, 0);  // top: fully see-through
-    lv_obj_set_style_bg_grad_opa(fade, LV_OPA_COVER, 0);   // bottom: panel black
-    lv_obj_clear_flag(fade, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(fade, LV_OBJ_FLAG_SCROLLABLE);
+    chat_fade = lv_obj_create(chats_group);
+    lv_obj_set_pos(chat_fade, 0, L.scr_h - CHAT_FADE_H);
+    lv_obj_set_size(chat_fade, L.scr_w, CHAT_FADE_H);
+    lv_obj_set_style_radius(chat_fade, 0, 0);
+    lv_obj_set_style_border_width(chat_fade, 0, 0);
+    lv_obj_set_style_pad_all(chat_fade, 0, 0);
+    lv_obj_set_style_bg_color(chat_fade, COL_BG, 0);
+    lv_obj_set_style_bg_grad_color(chat_fade, COL_BG, 0);
+    lv_obj_set_style_bg_grad_dir(chat_fade, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(chat_fade, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_main_opa(chat_fade, LV_OPA_TRANSP, 0);  // top: see-through
+    lv_obj_set_style_bg_grad_opa(chat_fade, LV_OPA_COVER, 0);   // bottom: panel black
+    lv_obj_clear_flag(chat_fade, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(chat_fade, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(chat_fade, LV_OBJ_FLAG_HIDDEN);   // chat_fade_update() decides
+
+    // ---- EMPTY: no chats to show ----
+    // New with the tab model. When the chat views were auto-selected the
+    // resolver simply never picked them with nothing to show; now the user can
+    // swipe here whenever they like, so the tab has to answer for itself.
+    empty_group = make_session_group(parent);
+    empty_lbl = lv_label_create(empty_group);
+    lv_label_set_text(empty_lbl, "No active sessions");
+    lv_obj_set_style_text_font(empty_lbl, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(empty_lbl, COL_DIM, 0);
+    lv_obj_align(empty_lbl, LV_ALIGN_CENTER, 0, 0);
 
     // The shared pulse: LV_OPA_COVER ↔ LV_OPA_30, 700 ms each way, forever.
     lv_anim_t a;
@@ -1246,6 +1416,151 @@ static void build_session_views(lv_obj_t* parent) {
     lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
     lv_anim_start(&a);
 }
+
+// ---- The sessions tab's own resolver ----
+// The chat views' half of the old update_view_state(), migrated intact: one
+// chat → ONE-CHAT, several → SEVERAL-CHATS, none → EMPTY. The CHAT_LINGER_MS
+// timer came with it and still earns its keep — it holds the last cards
+// (content frozen, waiting treatment dropped) instead of snapping to "No
+// active sessions" the instant a chat closes. What did NOT come along is the
+// s_any_waiting override: pinning mattered when a waiting chat had to fight
+// the usage screen for the panel, and it is now expressed as the auto-jump
+// below, which brings the user to this tab and then leaves them in control.
+static void update_session_view(void) {
+    if (!focus_group) return;
+    const uint32_t now = lv_tick_get();
+    int v;
+    // Connection first — the same test the usage screen's resolver has always
+    // made first. Every row on this tab arrived over the link and is only as
+    // true as the link is; s_live_count is written in exactly one place
+    // (ui_update_sessions), so a host that sleeps or dies would otherwise leave
+    // a "needs permission" card frozen on screen, elapsed timer and all,
+    // forever — and the tab is where the auto-jump may have parked the user.
+    if (!s_ble_connected)       v = 0;
+    else if (s_live_count == 1) v = 1;
+    else if (s_live_count >= 2) v = 2;
+    else if (s_chats_linger && (now - s_chats_gone_ms) < CHAT_LINGER_MS) {
+        v = s_linger_view;      // hold the chat view after the last chat closed
+    } else {
+        s_chats_linger = false; // linger expired (or never armed)
+        v = 0;
+    }
+    // Say which kind of nothing this is: an idle desk reads differently from a
+    // host that stopped talking.
+    if (v == 0 && empty_lbl)
+        set_label_if_changed(empty_lbl, s_ble_connected ? "No active sessions"
+                                                        : "Host disconnected");
+    if (v == session_view) return;
+    session_view = v;
+    lv_obj_add_flag(focus_group, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(empty_group, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(v == 1 ? focus_group : v == 2 ? chats_group : empty_group,
+                      LV_OBJ_FLAG_HIDDEN);
+}
+
+// ---- Auto-jump on notification (requirement 4) ----
+// Fill this payload's waiting set and flag any sid that was not waiting last
+// time. Called once per payload, before the resolver and the jump.
+static void note_waiting_set(const SessionList* list) {
+    s_waiting_now_n = 0;
+    s_new_waiting   = false;
+    for (int i = 0; list && i < list->count && s_waiting_now_n < SESSION_MAX_ROWS; i++) {
+        const SessionRow* r = &list->rows[i];
+        if (session_bucket(r->state) != SESSION_BUCKET_WAITING) continue;
+        snprintf(s_waiting_now[s_waiting_now_n], sizeof(s_waiting_now[0]), "%s", r->sid);
+        if (!sid_in_set(s_waiting_sids, s_waiting_n, r->sid)) s_new_waiting = true;
+        s_waiting_now_n++;
+    }
+    s_any_waiting = s_waiting_now_n > 0;
+}
+
+// EDGES ONLY, and the rising edge is PER SESSION. "Something is waiting" is a
+// level a single parked permission prompt can hold for an hour: jumping on the
+// level would re-yank the tab on every payload and make the device impossible
+// to navigate, while edging on the level as a whole (the first cut of this)
+// dropped the notification for a second session that started waiting while the
+// first still was — the multi-session case the tab is named for. So: one jump
+// per sid that enters the waiting set.
+//
+// It deliberately does NOT fire while the user is on the settings tab. They
+// are mid-edit on a screen whose every row is a tap target; moving the panel
+// under a descending finger would mistap a chat card, and unlike the usage
+// screen the settings tab is somewhere you only ever are on purpose. The
+// notification is not lost — the sessions tab is one swipe away and the cards
+// are already rendered behind it.
+//
+// The return trip: when the LAST waiting session clears, a tab we jumped to
+// ourselves hands the screen back to where the user actually was. It is armed
+// here and executed by sessions_tick() once AUTO_RETURN_DWELL_MS has passed
+// since the jump — reading a notification produces no touch, so returning on
+// the very next payload (the daemon ticks every ~5 s) would take the screen
+// away from someone still looking at it, and a waiting/clear/waiting burst
+// would flip the panel twice. Any touch or manual navigation clears
+// s_auto_jumped (see screen_press_cb / show_screen) and disarms the return.
+static void maybe_auto_jump(void) {
+    const bool rising  = s_new_waiting;
+    const bool falling = !s_any_waiting && s_waiting_n > 0;
+    memcpy(s_waiting_sids, s_waiting_now, sizeof(s_waiting_sids));
+    s_waiting_n = s_waiting_now_n;
+
+    if (rising) {
+        s_auto_return_due = false;                       // whatever was pending
+        if (!settings_auto_jump_enabled()) return;
+        if (current_screen == SCREEN_SESSIONS) return;   // already there
+        if (current_screen == SCREEN_SETTINGS) return;   // never mid-edit
+        s_auto_jump_from = current_screen;               // splash or usage
+        // The alerting chat is row 0 by the host's sort: make sure the list is
+        // showing the top, not wherever it was last scrolled to.
+        if (cards_cont) lv_obj_scroll_to_y(cards_cont, 0, LV_ANIM_OFF);
+        show_screen(SCREEN_SESSIONS, false);             // not manual: keeps the claim
+        s_auto_jumped  = true;
+        s_auto_jump_ms = lv_tick_get();
+        Serial.println("Session needs you — auto-jump to the sessions tab");
+    } else if (falling && s_auto_jumped) {
+        s_auto_return_due = true;                        // sessions_tick() finishes it
+    }
+}
+
+// Runs every UI tick, not only when a payload lands, so the dwell is measured
+// against the clock rather than against the daemon's cadence.
+static void sessions_tick(void) {
+    if (!s_auto_return_due) return;
+    if (!s_auto_jumped || current_screen != SCREEN_SESSIONS) {
+        s_auto_return_due = false;   // they touched it, or navigated away
+        return;
+    }
+    if (lv_tick_get() - s_auto_jump_ms < AUTO_RETURN_DWELL_MS) return;
+    s_auto_return_due = false;
+    s_auto_jumped = false;
+    show_screen(s_auto_jump_from, false);
+    Serial.println("Sessions clear — returning to the previous tab");
+}
+
+// The link went away. Everything this tab knows arrived over it, so drop the
+// lot: the resolver falls to "Host disconnected", the frozen cards stop
+// pulsing, and emptying the waiting set re-arms the edge so a session
+// that is STILL waiting when the host comes back notifies again instead of
+// being swallowed as "no rising edge".
+static void sessions_link_lost(void) {
+    s_live_count      = 0;
+    s_any_waiting     = false;
+    s_waiting_n       = 0;      // re-arms the edge for every still-waiting sid
+    s_waiting_now_n   = 0;
+    s_new_waiting     = false;
+    s_focus_waiting   = false;
+    s_chats_linger    = false;
+    s_auto_jumped     = false;
+    s_auto_return_due = false;
+    for (auto& c : chat_cards) c.waiting = false;
+    update_session_view();
+}
+
+#else   // !BOARD_HAS_SESSION_VIEWS
+
+static void update_session_view(void) {}
+static void sessions_tick(void) {}
+static void sessions_link_lost(void) {}
 
 #endif  // BOARD_HAS_SESSION_VIEWS
 
@@ -1311,16 +1626,286 @@ static void init_usage_screen(lv_obj_t* scr) {
 
     build_pair_group(usage_container);
     build_idle_group(usage_container);
-#if BOARD_HAS_SESSION_VIEWS
-    if (board_caps().has_session_views) build_session_views(usage_container);
-#endif
 
     // Status line — always visible on the usage view. Driven by ui_tick_anim().
+    //
+    // §2.3's rule ("the ✻ line yields when it has nothing to say": no room on
+    // SEVERAL-CHATS, nothing to say once the focused chat is waiting on you)
+    // used to be a runtime check, apply_anim_visibility(), because the chat
+    // views shared this container. With the chat views moved to their own tab
+    // the rule is structural instead: lbl_anim is a child of usage_container
+    // only, so it is simply not present on SCREEN_SESSIONS, and there is
+    // nothing left for it to yield to here.
     lbl_anim = lv_label_create(usage_container);
     lv_label_set_text(lbl_anim, "");
     lv_obj_set_style_text_font(lbl_anim, L.anim_font, 0);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, L.anim_y);
+}
+
+// ======== Tab headers ========
+
+// Pick the largest title font whose text still clears the corner mascot and
+// the battery icon. The usage screen gets away with L.title_font everywhere
+// because "Usage" is short; the tab names are not, and on the 368-wide panel
+// "Settings" in Tiempos 56 runs straight through both corner glyphs. Measuring
+// beats another breakpoint: it holds for the five shipping panel widths and
+// for whatever a new port turns out to be.
+static const lv_font_t* tab_title_font(const char* text) {
+    const int logo_w = L.small_icons ? LOGO_SMALL_HEIGHT : LOGO_HEIGHT;
+    const int left   = L.margin + logo_w;                    // mascot's right edge
+    const int right  = L.scr_w - L.margin - L.batt_w;        // battery's left edge
+    const int center = L.scr_w / 2 + L.title_nudge;          // where the label sits
+    int half = center - left;
+    if (right - center < half) half = right - center;
+    const int avail = 2 * (half - 12);                       // breathing room
+
+    const lv_font_t* const chain[] = {
+        L.title_font, &font_tiempos_34, &font_styrene_28,
+    };
+    for (const lv_font_t* f : chain) {
+        lv_point_t sz;
+        lv_text_get_size(&sz, text, f, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        if (sz.x <= avail) return f;
+    }
+    return &font_styrene_28;
+}
+
+static lv_obj_t* make_tab_title(lv_obj_t* parent, const char* text) {
+    const lv_font_t* f = tab_title_font(text);
+    lv_obj_t* t = lv_label_create(parent);
+    lv_label_set_text(t, text);
+    lv_obj_set_style_text_font(t, f, 0);
+    lv_obj_set_style_text_color(t, COL_TEXT, 0);
+    // A stepped-down title centers inside the header band the full-size one
+    // would have occupied, so every tab's header sits on the same axis.
+    const int dy = (lv_font_get_line_height(L.title_font) -
+                    lv_font_get_line_height(f)) / 2;
+    lv_obj_align(t, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y + dy);
+    return t;
+}
+
+// ======== Sessions screen (tab) ========
+
+#if BOARD_HAS_SESSION_VIEWS
+static void init_sessions_screen(lv_obj_t* scr) {
+    sessions_container = lv_obj_create(scr);
+    lv_obj_set_size(sessions_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(sessions_container, 0, 0);
+    lv_obj_set_style_bg_opa(sessions_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sessions_container, 0, 0);
+    lv_obj_set_style_pad_all(sessions_container, 0, 0);
+    lv_obj_clear_flag(sessions_container, LV_OBJ_FLAG_SCROLLABLE);
+    // Deliberately NO global_click_cb, for the same reason the settings tab has
+    // none: this is a reading surface made of card-shaped things, and a stray
+    // tap that swapped the list for the splash would be a trap. The card list
+    // scrolls; the swipe ring is the way out. (CLAUDE.md's tap-to-splash
+    // rationale is the LCD-4's single button, and the LCD-4 has no chat views.)
+
+    // The chat views used to sit under the usage screen's title/clock. They
+    // keep a header here — but it names the tab, because with manual
+    // navigation the title is the only thing telling you where you are.
+    make_tab_title(sessions_container, "Sessions");
+
+    build_session_views(sessions_container);
+    lv_obj_add_flag(sessions_container, LV_OBJ_FLAG_HIDDEN);
+}
+#endif
+
+// ======== Settings screen (tab) ========
+
+// One built row. The screen never hard-codes a setting: it walks the generic
+// table in settings.h, so a new setting appears here as soon as it is added
+// there — one line in settings.cpp's SPECS[] and one enum member, no edit
+// needed in this file.
+struct SettingsRowUi {
+    lv_obj_t*    panel;
+    lv_obj_t*    value;
+    setting_id_t id;
+};
+static SettingsRowUi set_rows[SETTING_COUNT];
+static uint8_t       set_row_count = 0;
+
+// Which rows this board can act on. board_caps() is the arbiter for all of
+// them — a speaker is as much a runtime fact as a panel that fits chat cards,
+// and shared code cannot see any board.h, so a compile-time guess here would
+// show a dead Sound row on the four ports whose sound_hal_play_reset() no-ops.
+// No board names here.
+static bool setting_row_visible(setting_id_t id) {
+    switch (id) {
+    case SETTING_SOUND:     return board_caps().has_sound;
+    case SETTING_AUTO_JUMP: return board_caps().has_session_views;
+    default:                return true;
+    }
+}
+
+static void settings_row_paint(SettingsRowUi* r) {
+    SettingRow s;
+    if (!settings_get_row((uint8_t)r->id, &s)) return;
+    set_label_if_changed(r->value, s.value_text);
+    // A boolean reads as a state, so it takes the accent when it is on and
+    // recedes to the dim tier when it is off. A stepped or named value is never
+    // "off" in that sense — it stays primary text.
+    const lv_color_t want =
+        s.kind == SETTING_KIND_BOOL ? (s.on ? COL_ACCENT : COL_DIM) : COL_TEXT;
+    // Only on a real change: lv_obj_set_style_text_color() invalidates the
+    // object unconditionally, and settings_refresh() runs every tick while this
+    // tab is up — unguarded, that re-flushes five chips forever on a screen
+    // that is static 99.9% of the time (a permanent cost on the C6 boards).
+    if (lv_color_to_u32(lv_obj_get_style_text_color(r->value, LV_PART_MAIN))
+        != lv_color_to_u32(want))
+        lv_obj_set_style_text_color(r->value, want, 0);
+}
+
+static void settings_refresh(void) {
+    for (uint8_t i = 0; i < set_row_count; i++) settings_row_paint(&set_rows[i]);
+}
+
+static void settings_row_click_cb(lv_event_t* e) {
+    if (s_gesture_used) return;   // the press was a swipe, not a tap
+    SettingsRowUi* r = (SettingsRowUi*)lv_event_get_user_data(e);
+    if (!r) return;
+    settings_activate(r->id);
+    settings_row_paint(r);
+}
+
+static void init_settings_screen(lv_obj_t* scr) {
+    settings_container = lv_obj_create(scr);
+    lv_obj_set_size(settings_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(settings_container, 0, 0);
+    lv_obj_set_style_bg_opa(settings_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(settings_container, 0, 0);
+    lv_obj_set_style_pad_all(settings_container, 0, 0);
+    lv_obj_clear_flag(settings_container, LV_OBJ_FLAG_SCROLLABLE);
+    // Deliberately NO global_click_cb here: every row is a tap target, so a
+    // stray tap that also toggled the splash would be a trap. Swipe out.
+
+    make_tab_title(settings_container, "Settings");
+
+    // Text budget: the row's inner width less the widest the value chip can
+    // ever get ("100%" plus its pill padding) and a gap. Without this the
+    // subtitle runs under the chip on the narrower large-layout panels — the
+    // 410-wide 2.06 is only 70 px of slack away from the 480 boards.
+    int pill_w;
+    {
+        lv_point_t sz;
+        lv_text_get_size(&sz, "100%", L.set_value_font, 0, 0,
+                         LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        pill_w = sz.x + 2 * L.pill_pad_x;
+    }
+    const int text_w = L.content_w - 2 * L.panel_pad_x - pill_w - 12;
+
+    int y = L.content_y;
+    set_row_count = 0;
+    for (uint8_t i = 0; i < settings_count(); i++) {
+        SettingRow s;
+        if (!settings_get_row(i, &s)) continue;
+        if (!setting_row_visible(s.id)) continue;
+
+        SettingsRowUi* r = &set_rows[set_row_count];
+        r->id = s.id;
+        r->panel = make_panel(settings_container, L.margin, y, L.content_w, L.set_row_h);
+        lv_obj_set_style_pad_top(r->panel, L.set_row_pad_y, 0);
+        lv_obj_set_style_pad_bottom(r->panel, L.set_row_pad_y, 0);
+        // The row owns its click; nothing above it needs to hear about it.
+        lv_obj_clear_flag(r->panel, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_event_cb(r->panel, settings_row_click_cb, LV_EVENT_CLICKED, r);
+
+        lv_obj_t* lbl = lv_label_create(r->panel);
+        lv_label_set_text(lbl, s.label);
+        lv_obj_set_style_text_font(lbl, L.set_label_font, 0);
+        lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(lbl, text_w);
+        lv_obj_set_height(lbl, lv_font_get_line_height(L.set_label_font));
+
+        if (L.set_detail_font) {
+            lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+            lv_obj_t* det = lv_label_create(r->panel);
+            lv_label_set_text(det, s.detail);
+            lv_obj_set_style_text_font(det, L.set_detail_font, 0);
+            lv_obj_set_style_text_color(det, COL_DIM, 0);
+            lv_label_set_long_mode(det, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(det, text_w);
+            lv_obj_set_height(det, lv_font_get_line_height(L.set_detail_font));
+            lv_obj_align(det, LV_ALIGN_TOP_LEFT, 0,
+                         lv_font_get_line_height(L.set_label_font) + 2);
+        } else {
+            // 240x240: no subtitle fits, so the label centers on its own.
+            lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
+        }
+
+        // Value chip — the quota pill's treatment at the settings text size,
+        // so "On"/"Off"/"78%" reads as the control rather than as a caption.
+        r->value = lv_label_create(r->panel);
+        lv_label_set_text(r->value, s.value_text);
+        lv_obj_set_style_text_font(r->value, L.set_value_font, 0);
+        lv_obj_set_style_bg_color(r->value, COL_BAR_BG, 0);
+        lv_obj_set_style_bg_opa(r->value, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(r->value, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_pad_left(r->value, L.pill_pad_x, 0);
+        lv_obj_set_style_pad_right(r->value, L.pill_pad_x, 0);
+        lv_obj_set_style_pad_top(r->value, L.pill_pad_y, 0);
+        lv_obj_set_style_pad_bottom(r->value, L.pill_pad_y, 0);
+        lv_obj_align(r->value, LV_ALIGN_RIGHT_MID, 0, 0);
+
+        settings_row_paint(r);
+        set_row_count++;
+        y += L.set_row_h + L.set_row_gap;
+    }
+
+    lv_obj_add_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ======== Tab navigation ========
+
+// The swipe ring. Order is fixed; membership is not — a screen the board can't
+// host never enters the list, which is what keeps a swipe from landing on an
+// empty tab (requirement 1). The splash leads because it is the boot screen.
+static void build_tab_order(void) {
+    tab_count = 0;
+    tab_order[tab_count++] = SCREEN_SPLASH;
+    tab_order[tab_count++] = SCREEN_USAGE;
+#if BOARD_HAS_SESSION_VIEWS
+    if (board_caps().has_session_views && sessions_container)
+        tab_order[tab_count++] = SCREEN_SESSIONS;
+#endif
+    tab_order[tab_count++] = SCREEN_SETTINGS;
+}
+
+void ui_next_tab(int dir) {
+    if (tab_count == 0) return;
+    int idx = 0;
+    for (uint8_t i = 0; i < tab_count; i++)
+        if (tab_order[i] == current_screen) { idx = i; break; }
+    idx = (idx + dir + (int)tab_count) % (int)tab_count;   // wraps both ways
+    show_screen(tab_order[idx], true);
+}
+
+// Every press starts a clean slate: the swipe flag is cleared here (see its
+// declaration for why not in the click handler), and the auto-jump loses its
+// claim on the screen the moment a finger lands on the panel.
+static void screen_press_cb(lv_event_t* e) {
+    (void)e;
+    s_gesture_used = false;
+    s_auto_jumped  = false;
+}
+
+// LVGL raises this once per press, mid-drag, after gesture_min_distance px.
+// It reaches us through the indev rather than an object so it cannot be
+// swallowed by whatever happens to be under the finger.
+static void screen_gesture_cb(lv_event_t* e) {
+    (void)e;
+    lv_indev_t* indev = lv_indev_active();
+    if (!indev) return;
+    // Any gesture suppresses the click that LVGL still sends on release —
+    // including a vertical one, which must not toggle the splash either.
+    s_gesture_used = true;
+    switch (lv_indev_get_gesture_dir(indev)) {
+    case LV_DIR_LEFT:  ui_next_tab(+1); break;
+    case LV_DIR_RIGHT: ui_next_tab(-1); break;
+    default: break;   // vertical gestures are unassigned
+    }
 }
 
 // ======== Public API ========
@@ -1331,6 +1916,10 @@ void ui_init(void) {
     lv_obj_t* scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, COL_BG, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    // Screens are scrollable by default. Nothing here scrolls, and a live
+    // scroll would suppress gesture detection entirely (LVGL bails out of
+    // indev_gesture() as soon as it has a scroll object), so take it away.
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
 #ifndef BOARD_HAS_PSRAM
     // Static corner mascot (see clawd_still.h) — the animated one needs PSRAM.
@@ -1340,10 +1929,29 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
+#if BOARD_HAS_SESSION_VIEWS
+    if (board_caps().has_session_views) init_sessions_screen(scr);
+#endif
+    init_settings_screen(scr);
+    build_tab_order();
     splash_init(scr);
 
     if (splash_get_root()) {
         lv_obj_add_event_cb(splash_get_root(), global_click_cb, LV_EVENT_CLICKED, NULL);
+    }
+
+    // Swipe navigation. The handlers hang off the input device, not off an
+    // object: LVGL sends LV_EVENT_PRESSED / LV_EVENT_GESTURE to the indev's
+    // own event list regardless of which widget the finger landed on, so no
+    // container, card or label can quietly eat a swipe. (Gestures still need
+    // a hit object to originate from, which every screen here provides — the
+    // full-bleed tab containers are clickable by default.) main.cpp creates
+    // the indev before calling us.
+    for (lv_indev_t* indev = lv_indev_get_next(NULL); indev;
+         indev = lv_indev_get_next(indev)) {
+        if (lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) continue;
+        lv_indev_add_event_cb(indev, screen_press_cb, LV_EVENT_PRESSED, NULL);
+        lv_indev_add_event_cb(indev, screen_gesture_cb, LV_EVENT_GESTURE, NULL);
     }
 
     // Corner mascot in the old logo slot. The still Clawd is shorter than the
@@ -1467,86 +2075,64 @@ void ui_update(const UsageData* data) {
 #endif
 }
 
-// The `✻` status line yields when it has nothing to say (§2.3): no room for
-// it on SEVERAL-CHATS, and nothing for it to say once the focused chat is
-// waiting on you. Everywhere else it stays.
-static void apply_anim_visibility(void) {
-    if (!lbl_anim) return;
-    bool hide = false;
-#if BOARD_HAS_SESSION_VIEWS
-    if (view_state == 4 || (view_state == 3 && s_focus_waiting)) hide = true;
-#endif
-    if (hide) lv_obj_add_flag(lbl_anim, LV_OBJ_FLAG_HIDDEN);
-    else      lv_obj_clear_flag(lbl_anim, LV_OBJ_FLAG_HIDDEN);
-}
-
-// The view resolver (§2.1) — one function, run every tick; nothing else
-// chooses a view. Picks the usage-screen sub-view: pairing hint (BLE down),
-// the idle "Zzz" screen (connected but data stale), the live quota panels
-// (RESTING), or — on boards with session views — ONE-CHAT / SEVERAL-CHATS.
-// Only re-lays-out on an actual change.
+// The usage screen's view resolver (§2.1) — run every tick; nothing else
+// chooses its sub-view. Pairing hint (BLE down), the idle "Zzz" screen
+// (connected but data stale), or the live quota panels (RESTING).
+//
+// It used to also auto-select ONE-CHAT / SEVERAL-CHATS, including an override
+// that pinned a waiting chat over everything else. Those belong to the
+// sessions tab now (update_session_view), and the pin became the auto-jump —
+// a usage screen that silently turned into a chat list is exactly the
+// no-navigation model the tabs replace. Only re-lays-out on an actual change.
 static void update_view_state(void) {
     if (!usage_group || !pair_group || !idle_group) return;
     const uint32_t now = lv_tick_get();
     const bool fresh = data_received && (now - last_data_ms) < DATA_FRESH_MS;
     int v;
-    if (!s_ble_connected) {
-        v = 0;  // pairing hint
-    }
-#if BOARD_HAS_SESSION_VIEWS
-    else if (board_caps().has_session_views && s_any_waiting) {
-        // A waiting chat pins the view (§2.1): it bypasses the freshness
-        // check and the linger timer. A session that has sat on a permission
-        // prompt for forty minutes is precisely the case this feature exists
-        // for, and a plain inactivity timeout would hide it.
-        v = (s_live_count <= 1) ? 3 : 4;
-    }
-#endif
-    else if (!fresh) {
-        v = 1;  // idle / Zzz
-    }
-#if BOARD_HAS_SESSION_VIEWS
-    else if (board_caps().has_session_views && s_live_count == 1) {
-        v = 3;  // ONE CHAT (§1.3)
-    } else if (board_caps().has_session_views && s_live_count >= 2) {
-        v = 4;  // SEVERAL CHATS (§1.4)
-    } else if (board_caps().has_session_views && s_chats_linger &&
-               (now - s_chats_gone_ms) < CHAT_LINGER_MS) {
-        v = s_linger_view;  // hold the chat view after the last chat closed (§2.1)
-    }
-#endif
-    else {
-#if BOARD_HAS_SESSION_VIEWS
-        s_chats_linger = false;  // linger expired (or never armed)
-#endif
-        v = 2;  // RESTING — live quota panels
-    }
+    if (!s_ble_connected)  v = 0;  // pairing hint
+    else if (!fresh)       v = 1;  // idle / Zzz
+    else                   v = 2;  // RESTING — live quota panels
     if (v == view_state) return;
     view_state = v;
-    // Instant swap. §2.3's 280 ms RESTING↔chat cross-fade is deliberately
-    // deferred — the existing sub-view pattern is instant, and the fade is
-    // cosmetic-only.
     lv_obj_add_flag(pair_group, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(usage_group, LV_OBJ_FLAG_HIDDEN);
-#if BOARD_HAS_SESSION_VIEWS
-    if (focus_group) lv_obj_add_flag(focus_group, LV_OBJ_FLAG_HIDDEN);
-    if (chats_group) lv_obj_add_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
-    if (v == 3) lv_obj_clear_flag(focus_group, LV_OBJ_FLAG_HIDDEN);
-    else if (v == 4) lv_obj_clear_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
-    else
-#endif
     lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group : usage_group,
                       LV_OBJ_FLAG_HIDDEN);
-    apply_anim_visibility();
 }
 
 void ui_tick_anim(void) {
-    if (current_screen != SCREEN_USAGE) return;
+    // Both resolvers run on every tick regardless of the visible tab, so a
+    // swipe arrives at a sub-view that is already correct rather than one
+    // frame stale — and the sessions tab's linger timer keeps expiring while
+    // the user is somewhere else.
     update_view_state();
+    update_session_view();
+    sessions_tick();
+
+    // Brightness is also reachable from the PWR button, so the settings rows
+    // are repainted from the module rather than only where they were tapped.
+    if (current_screen == SCREEN_SETTINGS) settings_refresh();
+
+    if (current_screen != SCREEN_USAGE) return;
     if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
 
     uint32_t now = lv_tick_get();
+
+    // Clock format. Auto (the default) follows the daemon's hint exactly as the
+    // firmware did before this row existed, so an upgrade never reformats
+    // anyone's clock; 24h and 12h are overrides that win in both directions,
+    // including over a host that reports 24. A change has to force a re-render
+    // — the title is only rewritten when the minute rolls over.
+    const clock_pref_t pref = settings_clock_pref();
+    const int fmt = pref == CLOCK_PREF_24H ? 24
+                  : pref == CLOCK_PREF_12H ? 12
+                  : clock_fmt;
+    static int last_fmt = -1;
+    if (fmt != last_fmt) {
+        last_fmt = fmt;
+        clock_last_min = -1;
+    }
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
     // the live time, advanced locally so it ticks every minute between payloads.
@@ -1557,7 +2143,7 @@ void ui_tick_anim(void) {
         if (tmv.tm_min != clock_last_min) {   // only rewrite the title when the minute changes
             clock_last_min = tmv.tm_min;
             char tbuf[12];
-            if (clock_fmt == 12) {
+            if (fmt == 12) {
                 int h12 = tmv.tm_hour % 12;
                 if (h12 == 0) h12 = 12;
                 snprintf(tbuf, sizeof(tbuf), "%d:%02d %s", h12, tmv.tm_min,
@@ -1608,17 +2194,38 @@ static void apply_battery_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+    // A swipe also produces a CLICKED on release; that must not toggle the
+    // splash on top of changing tabs.
+    if (s_gesture_used) return;
+    if (current_screen == SCREEN_SPLASH) show_screen(prev_non_splash_screen, true);
+    else                                  show_screen(SCREEN_SPLASH, true);
 }
 
-void ui_show_screen(screen_t screen) {
+// The single place that shows and hides tab containers — every entry point
+// (swipe, tap, button, auto-jump) funnels through here.
+static void show_screen(screen_t screen, bool manual) {
+    // A board without the chat views has no sessions container; nothing should
+    // ever ask for it (the tab ring skips it), but a stray request lands on the
+    // usage screen rather than a blank panel.
+    if (screen == SCREEN_SESSIONS && !sessions_container) screen = SCREEN_USAGE;
+    // Same for settings: if LVGL's pool ran dry while building it, a swipe onto
+    // the tab must degrade to the usage screen, not dereference NULL.
+    if (screen == SCREEN_SETTINGS && !settings_container) screen = SCREEN_USAGE;
+
+    // The user just chose this screen — the auto-jump no longer has a claim on
+    // it, so the return trip won't move it back under them.
+    if (manual) s_auto_jumped = false;
+
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    if (sessions_container) lv_obj_add_flag(sessions_container, LV_OBJ_FLAG_HIDDEN);
+    if (settings_container) lv_obj_add_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
-    case SCREEN_SPLASH:  splash_show(); break;
-    case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SPLASH:   splash_show(); break;
+    case SCREEN_USAGE:    lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SESSIONS: lv_obj_clear_flag(sessions_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SETTINGS: lv_obj_clear_flag(settings_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
@@ -1631,11 +2238,14 @@ void ui_show_screen(screen_t screen) {
     if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
     current_screen = screen;
     apply_battery_visibility();
+    if (screen == SCREEN_SETTINGS) settings_refresh();
 }
 
+void ui_show_screen(screen_t screen) { show_screen(screen, true); }
+
 void ui_toggle_splash(void) {
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+    if (current_screen == SCREEN_SPLASH) show_screen(prev_non_splash_screen, true);
+    else                                  show_screen(SCREEN_SPLASH, true);
 }
 
 screen_t ui_get_current_screen(void) {
@@ -1648,6 +2258,7 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
     s_ble_connected = (state == BLE_STATE_CONNECTED);
 
     if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
+    if (!s_ble_connected && was_connected) sessions_link_lost();
     // pair / idle / usage — picked from connection + data freshness.
     update_view_state();
 }
@@ -1658,20 +2269,17 @@ void ui_update_sessions(const SessionList* list) {
 
     const uint8_t prev_count = s_live_count;
     s_live_count = list->count;
-    s_any_waiting = false;
-    for (int i = 0; i < list->count; i++)
-        if (session_bucket(list->rows[i].state) == SESSION_BUCKET_WAITING)
-            s_any_waiting = true;
+    note_waiting_set(list);
 
     if (list->count == 0) {
-        if (prev_count > 0 && (view_state == 3 || view_state == 4)) {
+        if (prev_count > 0 && (session_view == 1 || session_view == 2)) {
             // The last live chat disappeared → hold the current view for
             // CHAT_LINGER_MS (§2.1). Cards keep their final content, but the
             // waiting treatment is dropped: a chat that ended can't need you,
             // and the pulse must keep meaning "come here".
             s_chats_linger = true;
             s_chats_gone_ms = lv_tick_get();
-            s_linger_view = view_state;
+            s_linger_view = session_view;
             s_focus_waiting = false;
             if (focus_card.dot) {
                 lv_obj_set_style_bg_opa(focus_card.dot, LV_OPA_COVER, 0);
@@ -1685,16 +2293,19 @@ void ui_update_sessions(const SessionList* list) {
                 }
             }
         }
-        update_view_state();
-        apply_anim_visibility();
+        update_session_view();
+        maybe_auto_jump();   // may be a falling edge: hand the screen back
         return;
     }
 
     s_chats_linger = false;
     focus_set_content(&list->rows[0]);
     chats_set_content(list);
-    update_view_state();
-    apply_anim_visibility();
+    update_session_view();
+    // Last, so the cards are already rendered and the sub-view already
+    // resolved when the tab switches — the user arrives at a finished screen,
+    // and chats_set_content's "am I visible?" animate test saw the truth.
+    maybe_auto_jump();
 }
 #else
 // Boards without session views compile to today's behavior; the call sites
