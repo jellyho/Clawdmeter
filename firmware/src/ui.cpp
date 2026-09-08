@@ -3,6 +3,7 @@
 #include <lvgl.h>
 #include <time.h>
 #include "logo.h"
+#include "clawd_still.h"
 #include "icons.h"
 #include "hal/board_caps.h"
 
@@ -229,6 +230,7 @@ static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 static lv_obj_t* idle_group;            // the "Zzz" idle screen
 static uint32_t  last_data_ms = 0;      // lv_tick when the last valid usage update landed
 static bool      data_received = false; // any valid update since boot
+static bool      data_ok = true;        // last payload's ok flag; a {"ok":false} beat = "no fresh data"
 static int       view_state = -1;       // -1 unknown / 0 pair / 1 idle / 2 usage
 static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within this window (daemon sends ~60s)
 
@@ -459,10 +461,10 @@ static void build_idle_group(lv_obj_t* parent) {
     lv_obj_clear_flag(idle_group, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    // A shrunk-down sleeping creature (reused claudepix "expression sleep" art)
+    // A shrunk-down resting creature (the official cloud-ride animation)
     // sits between the header and the status line; the animated "Listening…"
     // status line carries the words, so no extra text is needed here.
-    lv_obj_t* creature = splash_mini_create(idle_group, "expression sleep", L.idle_px);
+    lv_obj_t* creature = splash_mini_create(idle_group, "cloud", L.idle_px);
     if (creature) lv_obj_align(creature, LV_ALIGN_CENTER, 0, -20);
 
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);  // update_view_state decides
@@ -1330,8 +1332,11 @@ void ui_init(void) {
     lv_obj_set_style_bg_color(scr, COL_BG, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    if (L.small_icons) init_icon_dsc_rgb565a8(&logo_dsc, LOGO_SMALL_WIDTH, LOGO_SMALL_HEIGHT, logo_small_data);
-    else               init_icon_dsc_rgb565a8(&logo_dsc, LOGO_WIDTH, LOGO_HEIGHT, logo_data);
+#ifndef BOARD_HAS_PSRAM
+    // Static corner mascot (see clawd_still.h) — the animated one needs PSRAM.
+    if (L.small_icons) init_icon_dsc_rgb565a8(&logo_dsc, CLAWD_STILL_SMALL_W, CLAWD_STILL_SMALL_H, clawd_still_small_data);
+    else               init_icon_dsc_rgb565a8(&logo_dsc, CLAWD_STILL_W, CLAWD_STILL_H, clawd_still_data);
+#endif
     init_battery_icons();
 
     init_usage_screen(scr);
@@ -1341,9 +1346,21 @@ void ui_init(void) {
         lv_obj_add_event_cb(splash_get_root(), global_click_cb, LV_EVENT_CLICKED, NULL);
     }
 
-    logo_img = lv_image_create(scr);
-    lv_image_set_src(logo_img, &logo_dsc);
-    lv_obj_set_pos(logo_img, L.margin, L.logo_y);
+    // Corner mascot in the old logo slot. The still Clawd is shorter than the
+    // 80/40 px slot the spark logo used; center it vertically in that slot.
+    {
+        const int slot  = L.small_icons ? LOGO_SMALL_HEIGHT : LOGO_HEIGHT;
+        const int art_h = L.small_icons ? CLAWD_STILL_SMALL_H : CLAWD_STILL_H;
+        const int top   = L.logo_y + (slot - art_h) / 2;
+#ifdef BOARD_HAS_PSRAM
+        // Animated: idles, does acts, and takes walk-off/lurk trips.
+        splash_mascot_create(scr, L.margin, top + art_h, L.small_icons ? 2 : 3);
+#else
+        logo_img = lv_image_create(scr);
+        lv_image_set_src(logo_img, &logo_dsc);
+        lv_obj_set_pos(logo_img, L.margin, top);
+#endif
+    }
 
     battery_img = lv_image_create(scr);
     lv_image_set_src(battery_img, &battery_dscs[0]);
@@ -1358,7 +1375,9 @@ void ui_init(void) {
 
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
-    last_data_ms = lv_tick_get();   // a valid usage update just landed → dot goes green
+    data_ok = data->ok;
+    if (!data->ok) return;          // a {"ok":false} "no data" beat → fall through to idle, keep last numbers
+    last_data_ms = lv_tick_get();   // a real usage update just landed
     data_received = true;
 
     if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
@@ -1603,6 +1622,7 @@ void ui_show_screen(screen_t screen) {
     default: break;
     }
 
+    splash_mascot_set_visible(screen != SCREEN_SPLASH);
     if (logo_img) {
         if (screen == SCREEN_SPLASH) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
         else                          lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
