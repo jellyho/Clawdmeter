@@ -83,6 +83,60 @@ clock = off
 # MTU the firmware requests. See daemon/REPORT.md for the arithmetic.
 # sessions_budget_bytes = 500
 
+# --- Firing a round: daemon/clawdmeter_report.py ----------------------------
+# These are read by the DISPATCHER, not by the device or the poller.
+#
+# ONCE, before the first round -- the replies need a session to land in:
+#
+#   python daemon/clawdmeter_report.py --create-maildrop
+#
+# That starts a dedicated background session called clawdmeter-inbox (it
+# outlives your terminal and your editor; it prints how to stop it). Without
+# it every round refuses -- there is deliberately no fallback to whichever
+# session you happen to have open, because a round delivered there interrupts
+# you with mail you did not ask for.
+#
+# Then:
+#
+#   python daemon/clawdmeter_report.py --dry-run   # who would be asked, and
+#                                                  # the exact prompt. Sends
+#                                                  # nothing.
+#   python daemon/clawdmeter_report.py             # ask them, then watch 90 s
+#                                                  # for the replies
+
+# Name of that mail drop. It is the name on BOTH surfaces at once -- this
+# machine's session roster and the account listing that remote agents resolve
+# against -- which is the whole point of choosing it rather than accepting a
+# derived one. See daemon/REPORT.md, "The mail drop".
+# report_maildrop = clawdmeter-inbox
+
+# Let a round start the mail drop when it is missing. OFF by default: a status
+# feature does not get to start a long-lived Claude Code session on your
+# machine on its own. With it off, a missing drop is a refusal that prints the
+# one command to fix it.
+# report_maildrop_autostart = off
+
+# How many agents one round may ask. Five is what the device can DRAW: the
+# firmware parses six rows and spends the sixth on the "+N MORE" marker, so a
+# sixth agent's turn buys a number in a footnote rather than a card anybody can
+# read. Every turn a round spends is somebody's quota, so the cap sits where
+# the spending stops buying information.
+# report_max_targets = 5
+
+# Minimum seconds between rounds. A stuck button and an impatient human are the
+# same failure, and a second round ten seconds after the first spends another
+# turn per agent to redraw the same cards -- a report is a snapshot, and
+# nothing has moved. 300 s is inside report_expire_s, so the previous round is
+# still on the panel when the limit lifts. --ignore-rate-limit overrides one
+# round deliberately.
+# report_min_interval_s = 300
+
+# Model for the one-shot `claude -p` session that does the fan-out. Its whole
+# job is mechanical -- read a list of names, call one tool per name, copy a
+# fixed block of text into each call -- so the cheapest capable model is the
+# right one.
+# report_model = haiku
+
 # ---------------------------------------------------------------------------
 # Remote fleet (daemon/FLEET.md) -- sessions on your OTHER machines
 # ---------------------------------------------------------------------------

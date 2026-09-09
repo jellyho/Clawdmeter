@@ -9,10 +9,12 @@ This file is the contract in the middle: **what an agent must say**, **the
 exact words the dispatcher asks it in**, and **what the device does with the
 answer**.
 
-> **The button and the dispatcher do not exist yet.** This is the format and
-> the rendering, built first so that when the dispatcher lands there is
-> something worth showing. Everything below works today: write a reply that
-> matches the contract from any Claude Code session, and the card appears.
+> **The button does not exist yet; the dispatcher does.**
+> [`clawdmeter_report.py`](clawdmeter_report.py) fires a round from the command
+> line — see [The dispatcher](#the-dispatcher) — and the hardware button that
+> will eventually call it is still to come. Everything below works today: fire
+> a round, or write a reply that matches the contract from any Claude Code
+> session, and the card appears.
 
 ---
 
@@ -112,7 +114,9 @@ sent.
 The agents are LLMs, so **the request text is the contract**. Send this, or
 something that keeps every constraint in it:
 
-> Clawdmeter status check. Reply to the session that sent this, and make your
+> Clawdmeter status check. Send your answer as a cross-session message to the
+> session named `<REPLY-TO>` — whoever sent you this is a one-shot dispatcher
+> that has already exited, so a reply to the sender is lost — and make your
 > whole reply this one line: `CLAWDMETER-REPORT/1 <STATE>: <summary>` —
 > nothing before it, nothing after it, no code fence, no backticks, no
 > explanation.
@@ -128,25 +132,336 @@ something that keeps every constraint in it:
 >
 > `<summary>` is one line of at most 40 characters. For `WORKING` or `DONE`,
 > say what the work is. For `NEEDS-YOU` or `BLOCKED`, say what you are waiting
-> for. No line breaks, no quotes, no markdown. Write it in the language you
-> normally use with this user — Korean is fine.
+> for. No line breaks, no quotes, no markdown. Write it in English, even if
+> you normally speak another language with this user.
 >
 > If it will not fit in 40 characters, shorten the words. Do not drop the
 > format.
 
-Three things in there are load-bearing and should survive any rewording:
+Four things in there are load-bearing and should survive any rewording:
+
+0. **The reply address is named.** It used to say "reply to the session that
+   sent this", which was right when this was a format with no dispatcher and
+   is wrong now that there is one: the sender is a `claude -p` one-shot that
+   exits the moment it has finished sending, and the replies arrive seconds
+   later. A reply to the sender is delivered to nothing. `<REPLY-TO>` is
+   substituted with a live local session — see [The dispatcher](#the-dispatcher).
 
 1. **"make your whole reply this one line"**, twice over ("nothing before
    it"). The marker has to open the body — see above.
 2. **"at most 40 characters"**, because that is what the byte budget buys at
    the recommended budget (see below). A longer summary is not rejected, it is
    head-elided with `...`, so the agent loses its own last words.
-3. **"the language you normally use with this user"**. The panel's message
-   font carries the 2,350 KS X 1001 Hangul syllables, so Korean summaries go
-   out as real Hangul; the *state word* on the card is drawn by the firmware
-   from the code, so it is English whatever language the summary is in, and
-   the *agent name* is romanised (its font has no fallback). See
-   [FLEET.md](FLEET.md#non-ascii-and-why-the-panel-does-not-just-go-blank).
+3. **"Write it in English"** — and this line is load-bearing in the direction
+   people will want to revert. It used to say "the language you normally use
+   with this user — Korean is fine", and on a Korean-speaking fleet that is
+   exactly what came back: all three replies of the first real round were
+   Hangul. Two reasons it now asks for English:
+
+   **Bytes.** UTF-8 Hangul is three bytes a syllable, so a Korean summary
+   costs roughly triple for the same words. Measured, from that round:
+
+   | reply | characters | bytes | fits the 41 B cap at budget 500? |
+   | --- | --- | --- | --- |
+   | `앵커 끄는 arm 던질지 답 대기` | 18 | 38 | yes |
+   | `aloha 롤아웃+Q영상 3건 SLURM 대기` | 25 | 41 | exactly, with nothing to spare |
+   | `머지·정리 완료, 학습 job은 계속 실행 중` | 25 | 54 | **no** — head-elided to `머지·정리 완료, 학습 job은...` |
+
+   All three obeyed the 40-*character* rule and one still lost its last words,
+   because the budget is counted in **bytes**. Worse, the overspend comes off
+   the *round*: `fit_round` drops from the tail, so bytes eaten by one verbose
+   card are taken from the agents least likely to be seen. In English, 40
+   characters is a real 40 characters.
+
+   **Consistency.** Every other string on the panel is English — the tab
+   titles, the state chips, `needs you`, `Settings`. A Korean summary between
+   English furniture reads as an inconsistency, not as a translation.
+
+   **None of this removes Hangul support, and it must not.** The panel's
+   message font still carries the 2,350 KS X 1001 syllables, the fold is still
+   relaxed for bodies, and a reply that genuinely arrives in Korean still
+   parses and still renders as Hangul — agents quote Korean, and a message a
+   human sends by hand is often Korean. This is about what the request *asks
+   for*, not about what the panel can *display*. (The *state word* on the card
+   is drawn by the firmware from the code, so it is English regardless; the
+   *agent name* is romanised, its font having no fallback. See
+   [FLEET.md](FLEET.md#non-ascii-and-why-the-panel-does-not-just-go-blank).)
+
+## The dispatcher
+
+`daemon/clawdmeter_report.py`. Fire a round by hand:
+
+```bash
+python daemon/clawdmeter_report.py --dry-run   # who would be asked, and the exact prompt
+python daemon/clawdmeter_report.py             # ask them, then watch 90 s for replies
+```
+
+### Why it spawns a session at all
+
+**A daemon cannot send a cross-session message.** `SendMessage` is a tool
+inside a Claude Code session, not an endpoint a Python process can call. So the
+dispatcher does the only thing available to it: it spawns a headless one-shot
+(`claude -p "<prompt>"`) whose entire job is to fan the request out, and that
+one-shot exits the moment its turn ends.
+
+Which is exactly why the request had to change. **The replies arrive seconds
+later, over a channel the sender is no longer on.** So the request names a
+*different*, long-lived session as the reply address — the mail drop below.
+
+If there is no mail drop, the round is **refused**. A round answered into a
+dead address costs one turn per agent and produces nothing.
+
+## The mail drop
+
+**Set it up once, before the first round:**
+
+```bash
+python daemon/clawdmeter_report.py --create-maildrop
+```
+
+That starts a dedicated background session called `clawdmeter-inbox` in a
+directory of its own, and prints how to stop it (`claude stop <id>`). It
+outlives the terminal and the editor. Nothing starts it behind your back:
+without it, every round refuses and prints that command.
+
+### Why a session of its own, and not one off the roster
+
+The first version picked the longest-running live session out of
+`~/.claude/sessions/<pid>.json`. That is wrong three times over, and the first
+real round only worked because it got lucky:
+
+1. **A session has two names.** The roster's `name` (`clawdmeter-d0`) is what
+   peers *on this machine* address it by. The account listing's `title`
+   (`CLAWDMETER`) is what *remote* agents see and the only string they can
+   address. Every target of a round is remote, so handing them the roster name
+   names something invisible. The round measured below did exactly that — the
+   agents could not find `clawdmeter-d0`, fell back to a plausible-looking
+   `CLAWDMETER`, and it happened to be the same session.
+2. **Derived names are not stable.** They are the directory basename plus a
+   random byte, regenerated on restart. And every session started in *this*
+   project's directory is called `clawdmeter-`something, so the two live ones
+   here are `clawdmeter-d0` and `clawdmeter-2f` — an address one prefix away
+   from meaning either.
+3. **Those sessions live inside the owner's editor.** Closing VS Code kills the
+   address. And a round delivered into a working session interrupts whoever is
+   using it, with mail they did not ask for.
+
+A `claude --bg` session fixes all three: it returns immediately, outlives the
+terminal or editor that started it, does nothing else, and takes a name **we**
+choose.
+
+### What was measured before building on it
+
+On 2.1.263 — all three had to be true or the design collapses:
+
+| Question | Answer |
+| --- | --- |
+| Can a `--bg` session receive a cross-session message? | **Yes**, verified end to end. |
+| Does it write a transcript the watcher reads? | **Yes** — `~/.claude/projects/<munged-cwd>/<session-id>.jsonl`, top level, and the arrival record in it is byte-for-byte the `queue-operation` / `enqueue` shape [FLEET.md](FLEET.md#how-the-message-is-found) documents. |
+| Can we give it a stable name we choose? | **Yes** — `-n clawdmeter-inbox` sets it on *both* surfaces at once: the roster (`nameSource: "peer"`, not `derived`) and the listing title. One string, both sides, so the two-names problem disappears rather than being worked around. |
+
+The id `--bg` prints (`f2a6c9b8…`) is the session-id prefix and changes if the
+drop is recreated — which does not matter, because **the address is the name**.
+A drop that dies is replaced by name, not resurrected by id.
+
+### It still has to be verified, every round
+
+`ensure_maildrop()` runs before anything is sent, and every check is a refusal
+rather than a fallback:
+
+- exactly **one** live local session carries the name (`cs.pid_alive()`, which
+  handles Windows pid reuse via `procStart`); two is ambiguous and refused;
+- it is in the account listing, not archived, and its own bridge is connected —
+  otherwise remote agents cannot see it at all;
+- its listing title is unique across the whole listing, because that is the
+  name space the answering agent resolves in.
+
+There is deliberately **no** path where some other session stands in.
+
+### What it costs, and why it is safe to leave running
+
+The drop is a live session, so each arriving report wakes it for one small
+turn. It runs on `haiku` and carries a standing instruction that keeps that
+turn to a word — and that also says, in as many words, that the mail is *data*:
+it is text written by agents on machines the owner cannot see, arriving in a
+session that has tools.
+
+That turn is **not** on the path to the panel. The watcher reads the arrival
+record, so the drop never has to process a message for the card to appear. It
+only has to exist.
+
+**If it dies**, the next round refuses and says so. `--create-maildrop` (or
+`report_maildrop_autostart = on`) starts a replacement under the same name.
+Supervision beyond that — a Run-key entry and a tray watchdog, the way
+`autostart_windows.py` and `tray_windows.py` already keep the fleet poller
+alive — is the same pattern and is where this should go next; it is not built
+here because those two files are outside this change.
+
+### Who gets asked
+
+Computed here, from the listing `clawdmeter_fleet` already polls, and handed to
+the one-shot as a literal list of names. **A model told to "message everyone
+who looks active" improvises; a model handed a list does not.**
+
+| Rule | Why |
+| --- | --- |
+| `environment_kind == "bridge"` | Remote Control on a real machine, same as the panel's own filter. |
+| not `archived` / `failed` | Not live. |
+| not `disconnected` | The machine is asleep; the message would never be delivered. |
+| not this machine | You are sitting at it, and a session cannot usefully report to itself. |
+| `cross_session_inbound != "unavailable"` | The session has refused inbound peer mail (`crossSessionInbound: "refuse"`); the request would bounce. Missing field = reachable — older clients predate it. |
+| a title, not starting with `/` | `SendMessage` addresses peers by title, and a title starting with `/` is unaddressable (Claude Code 2.1.263 changelog). |
+| unique titles | Two live sessions sharing a title are one ambiguous recipient. The fresher one is kept. |
+
+What survives is sorted **most recently active first** and cut to the cap. When
+the cap bites it bites the machine that has been quiet for a week rather than
+the one that moved a minute ago.
+
+`--dry-run` prints the ones that were dropped and why, which is the difference
+between "nothing was sent" and "nothing was reachable".
+
+**The `attention_only` filter does not apply here.** The panel drops rows that
+do not need a human because an idle roster is noise; a *round* asks everybody,
+because `WORKING` is an answer to a question the owner just asked.
+
+`--skip-running` is the one exception, and it is off by default. A message to
+an agent that is mid-turn queues and costs it a turn of its own when it lands,
+so a round that is not meant to disturb anything in flight can leave those out
+— at the price of the thing they would have said, which is better than the
+listing's bare "running".
+
+### The cap is five
+
+`report_max_targets`, default **5** — which is exactly what the device can
+draw. The firmware parses six rows and the sixth is spent on the `+N MORE`
+marker, so a sixth agent's turn buys a number in a footnote instead of a card
+anybody can read. Every turn a round spends is somebody's quota, and the cap
+sits where the spending stops buying information.
+
+### The spawn, flag by flag
+
+| Flag | Why |
+| --- | --- |
+| `--model haiku` | The one-shot's job is mechanical: read a list, call one tool per name, copy a fixed block of text. There is no judgement in it to pay for. `report_model` overrides. |
+| `--output-format json` | An exit code cannot tell "sent five" from "refused, and said so". The parsed result goes in the log and the round record. |
+| `--tools ListAgents,SendMessage` | Every other built-in is **removed**, not merely denied. A dispatcher has no business reading files or running commands, and the narrowest surface is the one that cannot be talked into anything. |
+| `--allowedTools ListAgents,SendMessage` | So the two it does have never stop to ask. |
+| `--permission-prompts none` | There is no human at this session. Anything that would prompt is denied instead of hanging until the timeout. |
+| `--no-session-persistence` | Nobody resumes a dispatcher, and its transcript would sit in the tree the inbox watcher scans. |
+| `--setting-sources user` | The owner's own settings, but not the project or local settings of whatever directory the button happened to be pressed in. |
+| cwd = a fresh temp dir | `claude -p` auto-discovers `CLAUDE.md` and `.claude/` from its working directory. Run from this repo it would load *this file*. It runs in an empty throwaway directory instead, removed afterwards. |
+
+The **environment is inherited**, because that is where the login lives — so an
+`ANTHROPIC_API_KEY` exported in the parent shell bills the round to that key
+rather than to the subscription. That is the one thing the spawn does not
+insulate itself from, and it is deliberate: stripping it would break auth on
+machines that use it.
+
+### The gate: a one-shot cannot see the fleet by default
+
+**This is the fact the whole feature hangs on, and it was found the hard way.**
+The first real round reported success and sent nothing:
+
+```
+dispatcher said: I sent 0 of 3 messages. Could not reach: DLPS, ACRFT-C-WM,
+ACRFT-N (none appear in the available agents listing).
+```
+
+Measured on 2.1.263: inside `claude -p`, **`ListAgents` lists only the sessions
+on this machine.** Every Remote Control peer is absent — not offline, not
+unreachable, *absent* — so `SendMessage` has nothing to address:
+
+```
+Peer sessions (2):
+  clawdmeter-d0 [f0d907]  ·  interactive  ·  started 4h ago
+  clawdmeter-2f [33dd05]  ·  interactive  ·  started 4h ago
+```
+
+It is not caused by any flag in the table above — a bare `claude -p` with no
+options behaves identically. A print-mode session has no Remote Control handle
+of its own, and the peer walk that finds bridge sessions is gated on having one
+(or on an account-level rollout flag). `--remote-control` does not help: it is
+documented as starting an **interactive** session and is silently ignored under
+`-p` — the session it produces is still auto-named and still blind.
+
+Two internal variables open that gate, and both are needed — the first makes
+the account-wide peer walk run at all, the second makes it include `bridge`
+rows rather than only cloud ones:
+
+```
+CLAUDE_CODE_HARBOR_KITE_CLOUD=1
+CLAUDE_CODE_REMOTE=true
+```
+
+With them, the same one-shot's `ListAgents` returns all 25 peers an interactive
+session sees, with reference handles and with no "unreachable from here"
+marking — and the names match the listing's titles exactly, which is what makes
+the computed target list addressable at all.
+
+**This is internal and undocumented**, exactly like the listing endpoint
+[FLEET.md](FLEET.md#read-this-before-you-turn-it-on) apologises for — and more
+brittle than that one, because it is a behaviour gate rather than a URL. So it
+is named (`PEER_ENV`), overridable (`--no-peer-env`), and it fails **loudly**:
+when the gate stops working the one-shot says "sent 0 of N", the follow phase
+reports every target silent, and the log carries both. A round does nothing;
+nothing is corrupted.
+
+The one-shot is also told to call `ListAgents` **twice** if the names are not
+there the first time. That list is fetched under a ~5 s deadline and the tool
+discloses when it misses it; a single call would read a slow listing as an
+empty fleet and send nothing.
+
+**stdout and stderr are captured**, not inherited. Under the tray daemon — and
+under the button — there is no console at all, so an uncaptured failure is a
+round that produced nothing with no record of why.
+
+`--timeout` (120 s) kills the spawn. It does **not** un-send whatever was
+already sent: it bounds the spawn, not the round.
+
+### The brakes
+
+- **`--dry-run`** prints the recipients, the reasons the rest were dropped, the
+  reply address and the complete prompt — and sends nothing, spawns nothing,
+  and does not touch the rate limit.
+- **A rate limit.** `report_min_interval_s`, default **300 s**. A stuck button
+  and an impatient human are the same failure, and a second round ten seconds
+  after the first costs another turn per agent to redraw the same cards — a
+  report is a snapshot, and nothing has moved. Five minutes is inside
+  `report_expire_s`, so the previous round is still on the panel when the limit
+  lifts. The clock is anchored to the last **attempt**, not the last success:
+  otherwise a spawn that fails instantly could be retried in a loop.
+  `--ignore-rate-limit` is the deliberate override.
+- **Refusal to dispatch into nothing.** No reachable agents, or no live local
+  session to answer to, means no spawn at all. Spawning a session to message
+  nobody spends a turn to accomplish nothing and leaves a log that cannot say
+  which of the two happened.
+
+### When a round produces no cards
+
+Three different failures look identical from the panel, so the dispatcher
+separates them. After dispatching it watches the inbox for `--follow` seconds
+(90 by default) using the same `InboxWatcher` the poller runs, primed to
+end-of-file *before* the spawn so everything it sees is new:
+
+```
+asked 3: ACRFT-C-WM, ACRFT-N, DLPS
+answered 2, 2 matched the contract, 0 did not
+silent: DLPS
+```
+
+- **Nothing was sent** — the log says `refused:` or `DISPATCH FAILED`, with the
+  one-shot's stderr.
+- **The agents ignored the format** — they answered, and `matched the contract`
+  is lower than `answered`. The raw body is logged either way, because the
+  wording is the only thing that can be fixed.
+- **The replies went somewhere unwatched** — everything was sent, nothing came
+  back, and `silent:` names them.
+
+Every round is also written to `%LOCALAPPDATA%\Clawdmeter\report_round.json`
+(`~/.clawdmeter/report_round.json` elsewhere) — targets, drop reasons, reply
+address, the spawn's exit code and output, and the replies. That file is what
+the rate limit reads, and it is the record a button press leaves behind when
+nobody is watching the console.
 
 ## What the device does with it
 
@@ -342,6 +657,11 @@ agents into 684 slots is about a 6% chance of one aliasing.
 | `reports` | `on` | `off` reads report replies as ordinary messages. The words still reach the panel; only the state colouring goes away. Rides `inbox`, which rides `fleet`. |
 | `report_expire_s` | `300` | How long a report stays on the panel. Longer than a message's 180 s because a report is a snapshot the owner asked for — but bounded, because the host cannot see the agent change its mind. The age on the card keeps it honest meanwhile. |
 | `sessions_budget_bytes` | `180` | Raise to `500` for report rounds; see the arithmetic above. |
+| `report_max_targets` | `5` | How many agents one round may ask. Five is what the device can draw — see [The cap is five](#the-cap-is-five). Dispatcher only; nothing on the device reads it. |
+| `report_min_interval_s` | `300` | Minimum seconds between rounds. A stuck button and an impatient human are the same failure. `--ignore-rate-limit` overrides one round. |
+| `report_model` | `haiku` | Model for the one-shot dispatcher. The fan-out is mechanical; there is no judgement in it to pay for. |
+| `report_maildrop` | `clawdmeter-inbox` | Name of the dedicated background session the replies land in. See [The mail drop](#the-mail-drop). |
+| `report_maildrop_autostart` | `off` | `on` lets a round start the mail drop when it is missing. Off, a missing drop is a refusal that prints the one command — a status feature does not get to start a long-lived session on your machine by itself. |
 
 One card per **agent**: a newer report from the same agent replaces the older
 one outright rather than stacking beside it, so a re-dispatch refreshes the
@@ -363,6 +683,11 @@ python3 daemon/clawdmeter_inbox.py --watch --budget 500    # keep printing
 python3 daemon/clawdmeter_inbox.py --once --no-reports     # as plain messages
 ```
 
-Reports print with their state code in brackets. To see a round without a
-dispatcher, send yourself a contract line from any Claude Code session with
-`SendMessage`.
+Reports print with their state code in brackets. To see a round without
+spending anyone's quota, send yourself a contract line from any Claude Code
+session with `SendMessage`; to see who a real round *would* ask, and the exact
+words it would ask them in:
+
+```bash
+python3 daemon/clawdmeter_report.py --dry-run
+```
