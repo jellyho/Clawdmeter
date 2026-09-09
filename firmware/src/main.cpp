@@ -469,8 +469,12 @@ void loop() {
             static bool secondary_was = false;
             bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
             if (secondary_now != secondary_was) {
-                if (secondary_now && !idle_consume_wake_press())
-                    ble_send_report_request();
+                if (secondary_now && !idle_consume_wake_press()) {
+                    // Same action as the panel's town hall button, so the same
+                    // acknowledgement: a round shows nothing for ~20 s.
+                    if (ble_send_report_request() && settings_sound_enabled())
+                        sound_hal_play_short();
+                }
                 secondary_was = secondary_now;
             }
         }
@@ -514,7 +518,7 @@ void loop() {
     // A change also PLAYS the new level, because a row that reads "High" tells
     // you nothing until you have heard it and the only other way to find out
     // was to wait for the next session reset. It is a sample, not the chime:
-    // sound_hal_play_preview() cuts the same clip to its first note (~170 ms),
+    // sound_hal_play_short() cuts the same clip to its first note (~170 ms),
     // so a press is answered immediately and three presses in a row don't stack
     // into three overlapping bells.
     //
@@ -529,7 +533,7 @@ void loop() {
             const bool first = (applied_volume == 0xFF);
             applied_volume = v;
             sound_hal_set_volume(v);
-            if (!first && settings_sound_enabled()) sound_hal_play_preview();
+            if (!first && settings_sound_enabled()) sound_hal_play_short();
         }
     }
 

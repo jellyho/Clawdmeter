@@ -8,6 +8,7 @@
 #include "icons.h"
 #include "settings.h"
 #include "hal/board_caps.h"
+#include "hal/sound_hal.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
@@ -616,12 +617,6 @@ static void update_session_view(void);     // sessions-tab resolver
 
 #if BOARD_HAS_SESSION_VIEWS
 
-// How long the chat view is held after the last live chat disappears before
-// returning to RESTING (§2.1). A waiting chat pins the view past this timer.
-#ifndef CHAT_LINGER_MS
-#define CHAT_LINGER_MS (10u * 60u * 1000u)
-#endif
-
 // Geometry — the capability gate limits these views to 480×480-class panels
 // (the S3 2.16 and the sim); other geometries need a layout pass before their
 // flag can flip, so these are tuned constants, not breakpoints.
@@ -713,7 +708,19 @@ struct ChatCard {
     // presses again and interrupts the agent twice. Cleared by the agent
     // saying anything new, because that changes the sig.
     uint32_t answered_sig;
+    // …and when. A card that leaves SOON after being answered left because the
+    // agent moved (it reported WORKING and the host retracted the row); one
+    // that leaves much later just expired. The device cannot tell those apart
+    // from the payload — a row is simply absent either way — so the clock is
+    // the whole discriminator, and it is honest about being one: a resume
+    // report lands in seconds, an expiry at five minutes.
+    uint32_t answered_ms;
 };
+
+// How long after a go-ahead a card's disappearance still counts as "the agent
+// moved". Generously past the seconds a resume report actually takes, and far
+// short of the five-minute expiry it has to be told apart from.
+#define RESUME_WINDOW_MS 90000
 
 static lv_obj_t* chats_group = nullptr;   // SEVERAL-CHATS (§1.4)
 static lv_obj_t* empty_group = nullptr;   // "Nothing needs you" — the tab is
@@ -761,8 +768,6 @@ static uint8_t  s_notify_now_n  = 0;
 static bool     s_new_notify    = false;  // a sid entered the set this payload
 static bool     s_new_notify_msg = false; // …and one of them is a message
 static bool     s_new_notify_report = false; // …or an agent report needing you
-static bool     s_chats_linger  = false;  // holding a chat view after the last chat closed
-static uint32_t s_chats_gone_ms = 0;
 // Sessions-tab sub-view: 0 = empty, 1 = ONE-CHAT, 2 = SEVERAL-CHATS. These are
 // the old view_state 3/4 renumbered now that they own a tab instead of sharing
 // the usage screen's resolver.
@@ -1979,8 +1984,35 @@ static void chats_set_content(const SessionList* list) {
         // this widget to a different chat, and a bar still pointing at it
         // would act on whatever moved in.
         if (s_sel == &c) card_deselect();
+        // The agent you told to go ahead has moved: the host stopped sending
+        // its row. This is the only moment on the tab where something the
+        // owner asked for is confirmed to have HAPPENED rather than to have
+        // been sent, so it is the one that gets a sound.
+        if (c.answered_sig != 0 &&
+            lv_tick_get() - c.answered_ms < RESUME_WINDOW_MS) {
+            session_toast("Agent resumed", COL_GREEN);
+            if (settings_sound_enabled()) sound_hal_play_short();
+            // …and it brings the screen here. This is the ONE event on the
+            // tab worth interrupting for: not a card arriving (with the host
+            // filtering to what needs a person, cards arrive because the
+            // owner pressed the button and is already looking at them), but a
+            // thing the owner ASKED FOR being confirmed to have happened.
+            // The auto-return below takes the screen back once the list is
+            // empty, so this cannot strand anybody on a tab with nothing on
+            // it.
+            if (current_screen != SCREEN_SESSIONS &&
+                current_screen != SCREEN_SETTINGS &&
+                settings_auto_jump_enabled()) {
+                s_auto_jump_from = current_screen;
+                show_screen(SCREEN_SESSIONS, false);
+                s_auto_jumped  = true;
+                s_auto_jump_ms = lv_tick_get();
+                Serial.println("An agent resumed — auto-jump to the sessions tab");
+            }
+        }
         c.used = false;
         c.answered_sig = 0;
+        c.answered_ms = 0;
         c.waiting = false;
         c.sid[0] = 0;
         c.target_y = -1;
@@ -2121,7 +2153,9 @@ static void act_do_cb(lv_event_t* e) {
             return;
         }
         c->answered_sig = c->sig;
+        c->answered_ms  = lv_tick_get();
         session_toast("Go ahead sent", COL_GREEN);
+        if (settings_sound_enabled()) sound_hal_play_short();
         card_deselect();
         chat_card_mark_answered(c);
         return;
@@ -2133,12 +2167,12 @@ static void act_do_cb(lv_event_t* e) {
     // thing that can end them.
     ble_send_event(BLE_EVENT_DISMISS, c->sid);   // advisory; see ble.h
     session_toast("Cleared", COL_DIM);
+    // Cleared BY HAND, so this card is about to vanish for a reason that is
+    // NOT the agent moving. Drop the answered mark before the re-render, or
+    // the release below would sound the resume note for the owner's own tap.
+    c->answered_sig = 0;
     remember_dismissed(c->sig);
     card_deselect();
-    // The owner cleared this themselves, so the linger -- which exists to stop
-    // the view snapping away when a chat closes on its own -- would be exactly
-    // wrong here: they are waiting for the card to go.
-    s_chats_linger = false;
     filter_dismissed(&s_shown, &s_shown);
     sessions_render();
 }
@@ -2181,6 +2215,9 @@ static void town_hall_tap_cb(lv_event_t* e) {
     if (s_th_called_ms == 0) s_th_called_ms = 1;   // 0 is the idle sentinel
     town_hall_set_calling(true);
     session_toast("Calling the fleet", COL_ACCENT);
+    // A round shows nothing for ~20 s. The note is the only immediate proof
+    // the press was taken at all.
+    if (settings_sound_enabled()) sound_hal_play_short();
     Serial.println("Town hall: report round requested from the panel");
 }
 
@@ -2548,12 +2585,7 @@ static void update_session_view(void) {
     // forever — and the tab is where the auto-jump may have parked the user.
     if (!s_ble_connected)       v = 0;
     else if (s_live_count >= 1) v = 2;
-    else if (s_chats_linger && (now - s_chats_gone_ms) < CHAT_LINGER_MS) {
-        v = 2;                  // hold the card list after the last card closed
-    } else {
-        s_chats_linger = false; // linger expired (or never armed)
-        v = 0;
-    }
+    else                        v = 0;
     // Say which kind of nothing this is: a calm desk reads differently from a
     // host that stopped talking. And note what this screen no longer means —
     // "nothing needs you" is a claim about the HOST's last word, which is why
@@ -2728,15 +2760,22 @@ static void sessions_tick(void) {
         lv_obj_add_flag(toast_obj, LV_OBJ_FLAG_HIDDEN);
     }
     if (!s_auto_return_due) return;
-    if (!s_auto_jumped || current_screen != SCREEN_SESSIONS) {
-        s_auto_return_due = false;   // they touched it, or navigated away
+    if (current_screen != SCREEN_SESSIONS) {
+        s_auto_return_due = false;   // they navigated away themselves
         return;
     }
+    // The dwell is measured from the JUMP when there was one, and from the
+    // moment the list emptied when there was not — s_auto_jump_ms is stamped
+    // in both places.
     if (lv_tick_get() - s_auto_jump_ms < AUTO_RETURN_DWELL_MS) return;
+    // Back where they were if the firmware moved them; to usage otherwise,
+    // which is the tab this device is for.
+    const screen_t back = s_auto_jumped ? s_auto_jump_from : SCREEN_USAGE;
     s_auto_return_due = false;
     s_auto_jumped = false;
-    show_screen(s_auto_jump_from, false);
-    Serial.println("Sessions clear — returning to the previous tab");
+    card_deselect();
+    show_screen(back, false);
+    Serial.println("Sessions clear — handing the screen back");
 }
 
 // The link went away. Everything this tab knows arrived over it, so drop the
@@ -2753,7 +2792,6 @@ static void sessions_link_lost(void) {
     s_new_notify      = false;
     s_new_notify_msg  = false;
     s_new_notify_report = false;
-    s_chats_linger    = false;
     s_auto_jumped     = false;
     s_auto_return_due = false;
     for (auto& c : chat_cards) c.waiting = false;
@@ -3117,6 +3155,9 @@ static void screen_press_cb(lv_event_t* e) {
     (void)e;
     s_gesture_used = false;
     s_auto_jumped  = false;
+    // Somebody is using the panel. The auto-return is a courtesy for a screen
+    // nobody is looking at; taking the tab out from under a finger is not.
+    s_auto_return_due = false;
 }
 
 // LVGL raises this once per press, mid-drag, after gesture_min_distance px.
@@ -3341,8 +3382,8 @@ void ui_tick_anim(void) {
 
     // Both resolvers run on every tick regardless of the visible tab, so a
     // swipe arrives at a sub-view that is already correct rather than one
-    // frame stale — and the sessions tab's linger timer keeps expiring while
-    // the user is somewhere else.
+    // frame stale — and the sessions tab's auto-return dwell keeps running
+    // while the user is somewhere else.
     update_view_state();
     update_session_view();
     sessions_tick();
@@ -3518,28 +3559,34 @@ void ui_update_sessions(const SessionList* list) {
     s_live_count = s_shown.count;
     note_notify_set(&s_shown);
 
-    if (s_shown.count == 0) {
-        if (prev_count > 0 && (session_view == 1 || session_view == 2)) {
-            // The last live chat disappeared → hold the current view for
-            // CHAT_LINGER_MS (§2.1). Cards keep their final content, but the
-            // waiting treatment is dropped: a chat that ended can't need you,
-            // and the pulse must keep meaning "come here".
-            s_chats_linger = true;
-            s_chats_gone_ms = lv_tick_get();
-            for (auto& c : chat_cards) {
-                c.waiting = false;
-                if (c.used) {
-                    lv_obj_set_style_bg_opa(c.dot, LV_OPA_COVER, 0);
-                    lv_obj_set_style_text_opa(c.lbl_state, LV_OPA_COVER, 0);
-                }
-            }
-        }
-        update_session_view();
-        maybe_auto_jump();   // may be a falling edge: hand the screen back
-        return;
+    // The list just emptied. Hand the screen back after the dwell — and do it
+    // whether or not the firmware is what brought the owner here, because a
+    // tab whose whole content has resolved is a tab with nothing left to say.
+    //
+    // It is armed on the TRANSITION, never on the state: arriving at an
+    // already-empty tab arms nothing, which is what keeps the town hall button
+    // reachable at all. Any touch disarms it (screen_press_cb), so somebody
+    // reading, scrolling or reaching for that button is left alone.
+    if (s_shown.count == 0 && prev_count > 0) {
+        s_auto_return_due = true;
+        s_auto_jump_ms    = lv_tick_get();   // the dwell starts here
     }
 
-    s_chats_linger = false;
+    // One path for every count, INCLUDING zero, and that is a fix rather than
+    // a tidy-up. The old empty branch returned before chats_set_content, so
+    // the card-release loop never ran on the payload that emptied the list —
+    // and that loop is where an answered card announces that its agent moved.
+    // The last card resolving is exactly the case that matters, and it was the
+    // one case that stayed silent.
+    //
+    // What went with it is the ten-minute LINGER, which held the last cards on
+    // screen after they were gone. It was right when this view had to fight
+    // the usage screen for the panel and snapping to "no active sessions" read
+    // as a glitch. It is wrong now: the host already filters to what needs a
+    // person, so a list that empties has genuinely resolved, and the tab has
+    // somewhere better to go — the town hall button, and then the usage screen
+    // after the dwell. Holding stale cards over that button for ten minutes
+    // would hide the one control the empty tab exists for.
     sessions_render();
     // Last, so the cards are already rendered and the sub-view already
     // resolved when the tab switches — the user arrives at a finished screen,

@@ -24,7 +24,7 @@ void sound_hal_init(void) {
 }
 
 void sound_hal_play_reset(void)   { chime_play(); }
-void sound_hal_play_preview(void) { chime_play_preview(); }
+void sound_hal_play_short(void) { chime_play_preview(); }
 void sound_hal_set_volume(uint8_t v) { chime_set_volume(v); }
 void sound_hal_tick(void)       { chime_tick(); }
 
@@ -33,7 +33,7 @@ void sound_hal_tick(void)       { chime_tick(); }
 void sound_hal_init(void)       {}
 void sound_hal_tick(void)       {}
 void sound_hal_play_reset(void)   {}
-void sound_hal_play_preview(void) {}
+void sound_hal_play_short(void) {}
 void sound_hal_set_volume(uint8_t v) { (void)v; }
 
 #endif  // BOARD_HAS_SOUND
