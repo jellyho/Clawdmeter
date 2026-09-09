@@ -574,6 +574,16 @@ _SID_TAIL = "0123456789abcdefghijklmnopqrstuvwxyz"
 MORE_SID = "zz"
 
 
+def _is_resume(prev, msg):
+    """Did this agent go from needing a person to not needing one?
+
+    True only for waiting -> WORKING. Not for -> DONE: "it finished" is news
+    the owner may well want to see, and a done card expires on its own.
+    """
+    return (prev.report_state in REPORT_WAITING_STATES and
+            msg.report_state == STATE_REPORT_WORKING)
+
+
 def report_sid(sender):
     """Stable per AGENT, not per report: the card keeps its identity (and its
     slot in the notify set) while the same agent's state changes under it, so
@@ -1021,7 +1031,28 @@ class InboxWatcher(object):
                     key = panel_sender(msg.sender, self.translit)
                     prev = self._reports.get(key)
                     if prev is None or msg.ts >= prev.ts:
-                        self._reports[key] = msg
+                        # WAITING -> WORKING RETRACTS THE CARD instead of
+                        # replacing it. An agent that was blocked on a person
+                        # and is now working is, by definition, no longer
+                        # something that needs one -- and this tab shows only
+                        # what does. Replacing it with a "working" card would
+                        # leave the owner a row to read and dismiss for a
+                        # question that has already been answered.
+                        #
+                        # It is the TRANSITION that retracts, not the state.
+                        # A WORKING report with no card before it still draws
+                        # one, because that is a town hall round asking what
+                        # everyone is doing, and "busy" is a real answer to
+                        # that question. Only the agent that was waiting and
+                        # has stopped waiting disappears.
+                        #
+                        # This is what makes the panel's go-ahead button
+                        # honest: press it, and the card goes when the AGENT
+                        # moves rather than when the press was sent.
+                        if prev is not None and _is_resume(prev, msg):
+                            del self._reports[key]
+                        else:
+                            self._reports[key] = msg
                     continue
                 if msg.mid in self._seen:
                     # The normal case, not an edge one: every message is

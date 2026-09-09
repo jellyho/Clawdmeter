@@ -1324,6 +1324,78 @@ def test_a_newer_report_replaces_that_agents_older_one(projects):
     assert rows[0][ib.MSG_FIELD_INDEX] == "ok now what?"
 
 
+def test_an_agent_that_resumes_loses_its_card_rather_than_turning_working(projects):
+    """The point of the go-ahead button. An agent that was blocked on a person
+    and is now working no longer needs one, and this tab shows only what does
+    -- so the card goes, instead of becoming a row to read and dismiss for a
+    question that has already been answered."""
+    path = transcript(projects)
+    append(path, [report_record("NEEDS-YOU", "start the fix or wait?", ts=NOW - 60)])
+    w = report_watcher(projects)
+    w.poll()
+    assert len(w.rows()) == 1
+
+    append(path, [report_record("WORKING", "resumed: running the fix", ts=NOW - 1)])
+    w.poll()
+    assert w.rows() == []
+
+
+def test_blocked_also_clears_when_the_agent_starts_moving(projects):
+    """BLOCKED is the other waiting state -- somebody clicked the permission
+    dialog on that machine, and the card has to notice."""
+    path = transcript(projects)
+    append(path, [report_record("BLOCKED", "permission prompt", ts=NOW - 60)])
+    w = report_watcher(projects)
+    w.poll()
+    assert len(w.rows()) == 1
+    append(path, [report_record("WORKING", "granted, carrying on", ts=NOW - 1)])
+    w.poll()
+    assert w.rows() == []
+
+
+def test_a_working_report_with_no_card_before_it_still_draws_one(projects):
+    """It is the TRANSITION that retracts, not the state. A town hall round
+    asks what everyone is doing, and "busy" is a real answer to that -- only
+    the agent that WAS waiting and has stopped disappears."""
+    path = transcript(projects)
+    append(path, [report_record("WORKING", "building the index", ts=NOW - 1)])
+    w = report_watcher(projects)
+    w.poll()
+    rows = w.rows()
+    assert len(rows) == 1
+    assert rows[0][2] == ib.STATE_REPORT_WORKING
+
+
+def test_finishing_is_news_and_keeps_its_card(projects):
+    """NEEDS-YOU -> DONE is not a resume. "It finished" is worth seeing, and
+    the card expires on its own soon enough."""
+    path = transcript(projects)
+    append(path, [report_record("NEEDS-YOU", "ok now what?", ts=NOW - 60)])
+    w = report_watcher(projects)
+    w.poll()
+    append(path, [report_record("DONE", "shipped it", ts=NOW - 1)])
+    w.poll()
+    rows = w.rows()
+    assert len(rows) == 1
+    assert rows[0][2] == ib.STATE_REPORT_DONE
+
+
+def test_a_stale_working_report_cannot_retract_a_newer_waiting_card(projects):
+    """The out-of-order guard has to cover the retraction too, or a WORKING
+    line that arrives late silently clears the NEEDS-YOU that replaced it."""
+    path_a = transcript(projects, name="aaaaaaaa-1111-2222-3333-444444444444.jsonl")
+    path_b = transcript(projects, name="bbbbbbbb-1111-2222-3333-444444444444.jsonl")
+    append(path_a, [report_record("NEEDS-YOU", "newer", ts=NOW - 1,
+                                  session_id="s-a")])
+    append(path_b, [report_record("WORKING", "older", ts=NOW - 40,
+                                  session_id="s-b")])
+    w = report_watcher(projects)
+    w.poll()
+    rows = w.rows()
+    assert len(rows) == 1
+    assert rows[0][ib.MSG_FIELD_INDEX] == "newer"
+
+
 def test_an_out_of_order_report_does_not_overwrite_a_newer_one(projects):
     """Two transcripts read in one pass can yield an agent's replies in
     either order; the newest must win regardless."""

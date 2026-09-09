@@ -856,14 +856,25 @@ When every message has been sent, reply with one short line: how many of the
 # without which the one-shot cannot see a remote agent at all.
 #
 # WHAT IT DOES NOT SAY is as considered as what it does. "Go ahead" and
-# nothing else: the owner pressed a button on a 480-pixel panel, so the device
-# has no idea what they are approving and must not invent one. An agent that
-# needs a decision rather than a nudge will ask again, and that answer belongs
-# on a keyboard.
+# nothing else about the work: the owner pressed a button on a 480-pixel panel,
+# so the device has no idea what they are approving and must not invent one. An
+# agent that needs a decision rather than a nudge will ask again, and that
+# answer belongs on a keyboard.
+#
+# THE ONE THING IT DOES ASK FOR is a line back when the agent actually starts
+# moving, and that line is what makes the panel honest. Without it the card
+# just sits there until it expires -- five minutes of a row that says an agent
+# is waiting when it is not. With it, the host sees WAITING -> WORKING and
+# RETRACTS the card (see _is_resume in clawdmeter_inbox.py): the row goes
+# because the agent moved, which is the property the whole tab is built on.
+# It costs the agent one line inside a turn it was taking anyway.
 GO_AHEAD_BODY = ("Go ahead. This is the owner, answering from the Clawdmeter "
                  "panel: continue with what you reported you were waiting on. "
                  "If you need a decision rather than permission, say so in one "
-                 "line and stop.")
+                 "line and stop. Otherwise, before you carry on, send ONE "
+                 "message back to " + DEFAULT_MAILDROP_NAME + " reading exactly "
+                 "'CLAWDMETER-REPORT/1 WORKING: <what you have resumed>' so "
+                 "the panel can stop showing you as waiting.")
 
 GO_AHEAD_TEMPLATE = """\
 You are a courier. Do exactly what is listed below, then stop.
