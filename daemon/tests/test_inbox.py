@@ -6,9 +6,12 @@ another process is appending to, and the interesting cases (a half-written
 line, a truncated file, a project directory that appears mid-run) only exist
 if the test owns the writer.
 
-The record shape asserted in test_the_verified_record_shape_is_parsed is the
-one observed live on this machine from a real probe message, not one inferred
-from documentation.
+BOTH record shapes asserted here -- the `queue-operation` / `enqueue` one the
+transcript writes when a message ARRIVES, and the `user` / `userType:
+"external"` one it writes when the session PROCESSES it 207 ms later -- were
+observed live on this machine from a real probe message, not inferred from
+documentation. See the helpers arrival_record() and msg_record(), and
+both_records() for the pair as one message really lands.
 """
 import datetime
 import json
@@ -65,7 +68,44 @@ def record(content, ts=NOW, rtype="user", user_type="external", sidechain=False,
 
 
 def msg_record(body="ship it", sender="CLAWDMETER", ts=NOW, **kw):
+    """The record written once the receiving session PROCESSES the message."""
     return record(wrapped(body, sender), ts=ts, **kw)
+
+
+def tagged(body, sender="CLAWDMETER"):
+    """The envelope as the ARRIVAL record carries it: the tag at the head of a
+    plain string, no preamble sentence and no trailing boilerplate."""
+    pipe = "uds:" + "\\" * 2 + "." + "\\" + "pipe" + "\\" + "LOCAL" + "\\" + "cc-msg-572ec92f"
+    return ('<cross-session-message from="' + pipe + '" '
+            'from-name="' + sender + '" from-mode="prompting">\n'
+            + body + "\n</cross-session-message>")
+
+
+def arrival_record(body="ship it", sender="CLAWDMETER", ts=NOW,
+                   session_id="11111111-2222-3333-4444-555555555555",
+                   operation="enqueue", content=None, **kw):
+    """The record written the instant the message lands in the receiving
+    session's input queue -- 207 ms before the one above, on the verified
+    probe, and written whether or not that session ever gets round to it.
+
+    Shape copied from the real transcript: `content` is a plain string at the
+    TOP level of the record, not nested under `message`.
+    """
+    rec = {
+        "type": "queue-operation",
+        "operation": operation,
+        "timestamp": iso(ts),
+        "sessionId": session_id,
+        "content": tagged(body, sender) if content is None else content,
+    }
+    rec.update(kw)
+    return rec
+
+
+def both_records(body="ship it", sender="CLAWDMETER", ts=NOW, gap=0.207):
+    """One message, exactly as the receiving transcript records it: twice."""
+    return [arrival_record(body, sender, ts=ts),
+            msg_record(body, sender, ts=ts + gap)]
 
 
 def other_record(ts=NOW, text="just an ordinary turn"):
@@ -190,6 +230,186 @@ def test_both_timestamp_spellings(stamp):
     rec = msg_record()
     rec["timestamp"] = stamp
     assert ib.message_from_record(rec).ts > 0
+
+
+# --------------------------------------------------------------------------- the arrival record
+#
+# One message, two records. The receiving transcript writes it the instant it
+# lands in the session's queue AND again when the session gets round to it --
+# 207 ms apart on the verified probe, and arbitrarily far apart when the
+# session is busy or parked at a prompt. The watcher reads both, and shows
+# one card.
+
+def test_the_verified_arrival_record_shape_is_parsed():
+    """The OTHER shape observed live, 207 ms before the processed one:
+    type=queue-operation, operation=enqueue, `content` a plain string at the
+    TOP level of the record with the tag at its head and NO preamble."""
+    m = ib.message_from_record(arrival_record("the build is green", "CLAWDMETER"))
+    assert m is not None
+    assert m.sender == "CLAWDMETER"
+    assert m.body == "the build is green"
+    assert m.ts == pytest.approx(NOW, abs=1)
+
+
+def test_a_message_never_processed_still_reaches_the_panel(projects):
+    """The reason for reading the arrival record at all: the receiving session
+    is busy, blocked, or parked at a prompt with an undrained queue, so the
+    processed record does not exist yet and may never."""
+    path = transcript(projects)
+    append(path, [arrival_record("your build broke", "BOX-2", ts=NOW - 3)])
+    w = watcher(projects)
+    assert [m.body for m in w.poll()] == ["your build broke"]
+    row = w.rows()[0]
+    assert row[1] == "BOX-2"
+    assert row[ib.MSG_FIELD_INDEX] == "your build broke"
+
+
+def test_a_processed_record_alone_still_reaches_the_panel(projects):
+    """Belt and braces. The processed record is not replaced by the arrival
+    one: it is the shape verified to carry the "Another Claude session sent a
+    message:" framing, and a Claude Code version that writes only it must
+    keep working."""
+    path = transcript(projects)
+    append(path, [msg_record("processed only", ts=NOW - 2)])
+    assert [m.body for m in watcher(projects).poll()] == ["processed only"]
+
+
+def test_an_arrival_and_its_processed_twin_are_one_card(projects):
+    """The dedup, on the pair the transcript really contains for one message."""
+    path = transcript(projects)
+    append(path, both_records("deploy when you can"))
+    w = watcher(projects)
+    assert [m.body for m in w.poll()] == ["deploy when you can"]
+    assert [r[ib.MSG_FIELD_INDEX] for r in w.rows()] == ["deploy when you can"]
+
+
+def test_the_pair_dedupes_across_two_passes(projects):
+    """The two records rarely land in the same tail-read: at a 2 s tick the
+    arrival is usually read on its own and the processed one on a later pass."""
+    path = transcript(projects)
+    append(path, [arrival_record("one card only", ts=NOW - 5)])
+    w = watcher(projects)
+    assert len(w.poll()) == 1
+    append(path, [msg_record("one card only", ts=NOW - 4)])
+    assert [m.body for m in w.poll()] == ["one card only"]
+
+
+def test_the_card_carries_the_arrival_time_not_the_processing_time(projects):
+    """The earlier record wins, which is the point: the age on the panel is
+    when the message LANDED, not when its reader happened to wake up to it."""
+    path = transcript(projects)
+    append(path, both_records("timely", ts=NOW - 30, gap=20))
+    w = watcher(projects)
+    msgs = w.poll()
+    assert len(msgs) == 1
+    assert msgs[0].ts == pytest.approx(NOW - 30, abs=1)
+    assert w.rows()[0][4] == 30
+
+
+@pytest.mark.parametrize("rec", [
+    pytest.param(arrival_record(operation="dequeue"), id="dequeue"),
+    pytest.param(arrival_record(operation="cleared"), id="another-operation"),
+    pytest.param(arrival_record(isSidechain=True), id="a-subagents-own-queue"),
+    pytest.param(arrival_record(content="how do cross-session-message records "
+                                        "get written?"),
+                 id="a-human-typing-about-the-feature"),
+    pytest.param({"type": "queue-operation", "operation": "enqueue"},
+                 id="no-content-at-all"),
+])
+def test_queue_records_that_are_not_mail(rec):
+    """`queue-operation` is the session's INPUT QUEUE -- the user's own typed
+    prompts go through it too (verified: the real transcripts are full of
+    enqueued prompts). The tag is what separates mail from a prompt, and a
+    record that says a queued item LEFT the queue is not a message arriving."""
+    assert ib.message_from_record(rec) is None
+
+
+def test_an_arrival_without_an_operation_field_is_still_read():
+    """`operation` saying something else is a rejection; `operation` absent is
+    not. Nothing in this module treats Claude Code's record prose as a
+    contract, and the tag is the strong signal."""
+    rec = arrival_record()
+    del rec["operation"]
+    assert ib.message_from_record(rec) is not None
+
+
+def test_the_identity_ignores_the_timestamp():
+    """A key including the timestamp is exactly what fails to dedupe: the two
+    records for one message disagree about it by 207 ms on the verified pair
+    and by however long a parked session takes in general."""
+    a = ib.message_from_record(arrival_record("same body", ts=NOW))
+    b = ib.message_from_record(msg_record("same body", ts=NOW + 0.207))
+    assert a.mid == b.mid
+    assert a.ts != b.ts
+
+
+def test_the_pipe_id_is_not_the_identity():
+    """`from="uds:...cc-msg-<32 hex>"` looks per-message and is not: on the
+    real transcripts one such id spans 52 records and several distinct
+    messages, because it names the SENDING session's pipe. Identity is
+    who sent WHAT to WHICH session."""
+    assert ib.message_id("s", "PEER", "first") != ib.message_id("s", "PEER", "second")
+    assert ib.message_id("s", "PEER", "hi") != ib.message_id("s", "OTHER", "hi")
+    assert ib.message_id("s1", "PEER", "hi") != ib.message_id("s2", "PEER", "hi")
+
+
+def test_the_identity_survives_a_whitespace_difference():
+    """Neither shape's line endings are a contract either, so the key sees
+    collapsed whitespace -- one record writing CRLF must not mean two cards."""
+    assert (ib.message_id("s", "PEER", "one\r\ntwo")
+            == ib.message_id("s", "PEER", "one\ntwo"))
+
+
+def test_the_pair_still_dedupes_after_a_long_queue_dwell(projects):
+    """A session parked at a prompt drains its queue when its human comes
+    back, so the gap between the two records is bounded by nothing. Expiring
+    the remembered id on the message's own horizon in between drew the same
+    message a SECOND time, hours late -- see SEEN_KEEP_MIN."""
+    clock = {"t": NOW}
+    path = transcript(projects)
+    append(path, [arrival_record("read me when you can", ts=NOW - 1)])
+    w = watcher(projects, now_fn=lambda: clock["t"])
+    assert len(w.poll()) == 1
+
+    clock["t"] = NOW + 4 * 3600                  # four hours at the prompt
+    assert w.poll() == []                        # the card expired long ago
+    append(path, [msg_record("read me when you can", ts=clock["t"])])
+    assert w.poll() == [], "one message, one card, however late the drain"
+
+
+def test_the_remembered_id_table_stays_bounded(projects, monkeypatch):
+    """Never fewer than SEEN_KEEP_MIN ids whatever their age -- but not
+    unbounded either. This table lives in a process that runs for weeks."""
+    monkeypatch.setattr(ib, "SEEN_KEEP_MIN", 4)
+    clock = {"t": NOW}
+    path = transcript(projects)
+    w = watcher(projects, now_fn=lambda: clock["t"])
+    for i in range(20):
+        append(path, [arrival_record(f"message {i}", ts=clock["t"])])
+        w.poll()
+        clock["t"] += 1
+    clock["t"] += 10_000                         # everything is past the horizon
+    w.poll()
+    assert len(w._seen) == 4
+
+
+def test_a_first_run_does_not_dump_arrival_records_either(projects):
+    """The cold-start baseline is shape-agnostic: reading a second record type
+    must not open a second route for backlog onto the panel."""
+    path = transcript(projects)
+    append(path, [arrival_record("an hour ago", ts=NOW - 3600),
+                  arrival_record("five seconds ago", ts=NOW - 5)])
+    assert [m.body for m in watcher(projects).poll()] == ["five seconds ago"]
+
+
+def test_a_cold_pass_drops_an_undatable_arrival_too(projects):
+    """Same rule as for the processed record: unknown age inside a tail of
+    history is not news."""
+    path = transcript(projects)
+    rec = arrival_record("last week's private message", ts=NOW - 7 * 86400)
+    del rec["timestamp"]
+    append(path, [rec])
+    assert watcher(projects).poll() == []
 
 
 # --------------------------------------------------------------------------- discovery

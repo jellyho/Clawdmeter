@@ -15,18 +15,32 @@ arriving message on the desk device.
 
 WHY WATCH TRANSCRIPTS AND NOT SOMETHING NICER
 ---------------------------------------------
-A received message is appended to the RECEIVING session's transcript when
-that session processes it, as a `user` record with `userType: "external"`
-whose content begins "Another Claude session sent a message:" followed by a
-`<cross-session-message from-name="..." ...>` block. Verified on this machine
-against a real probe message, not inferred from docs.
+A received message is appended to the RECEIVING session's transcript TWICE,
+and both records are read here. Verified on this machine against a real probe
+message, not inferred from docs:
 
-That has one hard consequence worth stating: **a session only writes the
-message when it is alive to process it.** There is no host-side spool to read.
-Watching every open session's transcript is therefore the zero-cost approach
--- it adds no session and no model turns beyond what already happens. The
-alternative (a dedicated always-on "inbox" session) would burn a model turn
-per message on a device whose entire purpose is watching quota.
+  * **on arrival**, the moment it lands in the session's input queue, as a
+    `queue-operation` / `enqueue` record whose top-level `content` string
+    starts with the `<cross-session-message from-name="..." ...>` tag; and
+  * **207 ms later**, once the session actually processed it, as a `user`
+    record with `userType: "external"` whose content begins "Another Claude
+    session sent a message:" followed by the same tag.
+
+Reading the ARRIVAL record is what makes the panel independent of the
+receiving session's state: a message shows up while that session is busy,
+blocked, or parked at a prompt with an undrained queue -- and ~200 ms sooner
+even when it is not. The processed record is read as well rather than
+instead, because it is the shape verified to carry the preamble framing and
+a Claude Code version that emits only one of the two must not go silent.
+Two records for one message means DEDUP is mandatory: see message_id().
+
+Watching every open session's transcript is the zero-cost approach -- it
+adds no session and no model turns beyond what already happens. There is
+still no host-side spool to read, and a dedicated always-on "inbox" session
+would burn a model turn per message on a device whose entire purpose is
+watching quota. (With the arrival record read, such a session would no
+longer NEED to take a turn for its mail to reach the panel -- it could just
+sit there and be a mail drop.)
 
 WHAT IS *NOT* WATCHED
 ---------------------
@@ -189,6 +203,42 @@ _PREAMBLE_RE = re.compile(r"Another Claude session sent a message:?\s*", re.I)
 # between the tags already excludes it; this only matters when the close tag
 # is missing.
 _TRAILER_RE = re.compile(r"\n\s*This came from another Claude session\b.*\Z", re.S)
+
+# The receiving transcript records ONE arriving message TWICE, and the first
+# of the two is the one worth reading. Verified on this machine (grep
+# PROBE-MARKER-7f3a2b in the probe transcript), 207 ms apart:
+#
+#   1. ON ARRIVAL, the moment it lands in the session's input queue:
+#      {"type":"queue-operation","operation":"enqueue","sessionId":...,
+#       "timestamp":...,"content":"<cross-session-message from=... >\n...body"}
+#      Note the shape: `content` is a plain string at the TOP level, and the
+#      tag sits at its head with no "Another Claude session sent a message:"
+#      preamble.
+#
+#   2. ONCE THE SESSION PROCESSES IT, as the `user` / `userType: "external"`
+#      record with the preamble and the body nested under `message.content`.
+#
+# Both are parsed. Reading (1) is what lets a message reach the panel while
+# the receiving session is busy, blocked, or parked at a prompt with an
+# undrained queue -- and (2) is the shape verified to carry the preamble
+# framing, so it stays as the belt to (1)'s braces. Dedup across the pair is
+# message_id(); see it for the identity and its one honest cost.
+#
+# `queue-operation` is NOT a message-only record type: the user's own typed
+# prompts are enqueued through it too. What separates mail from a prompt is
+# the same thing that separates it in a `user` record -- the tag -- so the
+# false-positive surface is the one this module already accepted (a person
+# who PASTES an envelope gets it back on their panel), not a new one.
+_ARRIVAL_TYPE = "queue-operation"
+_ARRIVAL_OP = "enqueue"
+
+# Ceiling on remembered message ids, over and above the time-based horizon in
+# _expire(). The horizon alone is not enough now that the two records can be
+# far apart: a session parked at a prompt drains its queue whenever its human
+# gets back, so the gap between (1) and (2) is bounded by nothing. Forgetting
+# the id in between would put the message on the panel a SECOND time at drain.
+# 512 ids is 49 KB (measured) and covers any plausible backlog.
+SEEN_KEEP_MIN = 512
 
 DEFAULT_SENDER = "peer"
 
@@ -395,36 +445,90 @@ class Message(object):
         return f"<Message {self.mid} from={self.sender!r} ts={self.ts:.0f}>"
 
 
-def message_from_record(rec, source=""):
-    """A transcript record -> Message, or None.
+def record_text(rec):
+    """The candidate message text of a transcript record, or None.
 
-    The record filter is deliberately narrow, because the transcript of a
+    Both shapes a received message takes are accepted here -- see the
+    _ARRIVAL_TYPE block above for what they are and why both are read.
+
+    The filter is deliberately narrow either way, because the transcript of a
     session that *investigates* cross-session messaging is full of text that
     mentions them:
 
-      * `type` must be "user"           -- an assistant turn quoting the tag is not mail;
       * `isSidechain` must be falsy     -- sidechain traffic is a subagent's, not yours;
-      * content must be text            -- see content_text() on tool_result blocks.
+      * an assistant turn quoting the tag is not mail;
+      * content must be text            -- see content_text() on tool_result blocks;
+      * a `queue-operation` must be an ENQUEUE. A record that says a queued
+        item was removed is not a message arriving. `operation` missing is
+        allowed (a future version may spell it differently); `operation`
+        present and saying something else is not.
 
-    `userType == "external"` is what the verified record carries, but it is
-    NOT required: it is undocumented and the tag is the stronger signal.
+    `userType == "external"` is what the verified processed record carries,
+    but it is NOT required: it is undocumented and the tag is the stronger
+    signal.
     """
-    if not isinstance(rec, dict):
+    if not isinstance(rec, dict) or rec.get("isSidechain"):
         return None
-    if rec.get("type") != "user" or rec.get("isSidechain"):
+    rtype = rec.get("type")
+    if rtype == "user":
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            return None
+        return content_text(msg.get("content"))
+    if rtype == _ARRIVAL_TYPE:
+        op = rec.get("operation")
+        if op is not None and op != _ARRIVAL_OP:
+            return None
+        # content_text() rather than the bare string the verified record
+        # carries: the shape is not a contract, and routing through the one
+        # reader keeps the tool_result exclusion in force here too.
+        return content_text(rec.get("content"))
+    return None
+
+
+def message_id(session, sender, body):
+    """The stable identity of one arriving message: WHO sent WHAT to WHICH session.
+
+    This is what collapses the arrival record and the processed record into a
+    single card. It deliberately does NOT include:
+
+      * the TIMESTAMP -- the whole point is that the two records disagree
+        about it (207 ms on the verified pair, and unbounded when the
+        receiving session sits on its queue). A coarse time bucket would only
+        move the problem to the pair that straddles a bucket edge.
+      * the `from` PIPE ID -- tempting, since it looks per-message
+        (cc-msg-572ec92ff3b152decf8ea5ffef7664ad), but it is not: on this
+        machine's transcripts one such id appears across 52 records and
+        several distinct messages. It is the SENDING session's pipe, so it
+        would not dedupe, and keying on an attribute that a version might
+        emit in one shape and not the other would resurrect the double card
+        this exists to prevent.
+
+    Whitespace is collapsed before hashing so a shape that writes `\\r\\n`
+    where the other writes `\\n` still matches, and only the first 160
+    characters are taken -- long enough to tell messages apart, short enough
+    that the key does not carry the whole body around.
+
+    THE COST, stated honestly: a byte-identical body from the same sender to
+    the same session, twice inside the id-retention window, shows as one card.
+    That is the right answer for a device you read at a glance, where the
+    second card would be indistinguishable from the first anyway.
+    """
+    key = "|".join((str(session), sender, " ".join(body.split())[:160]))
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:8]
+
+
+def message_from_record(rec, source=""):
+    """A transcript record -> Message, or None."""
+    text = record_text(rec)
+    if text is None:
         return None
-    msg = rec.get("message")
-    if not isinstance(msg, dict):
-        return None
-    parsed = parse_cross_session(content_text(msg.get("content")))
+    parsed = parse_cross_session(text)
     if parsed is None:
         return None
     sender, body = parsed
-    ts = _epoch(rec.get("timestamp"))
-    key = "|".join((str(rec.get("sessionId") or source), str(rec.get("timestamp") or ""),
-                    sender, body[:160]))
-    mid = hashlib.md5(key.encode("utf-8")).hexdigest()[:8]
-    return Message(mid, ts, sender, body, source)
+    mid = message_id(rec.get("sessionId") or source, sender, body)
+    return Message(mid, _epoch(rec.get("timestamp")), sender, body, source)
 
 
 # ---------------------------------------------------------------------------
@@ -629,7 +733,12 @@ class InboxWatcher(object):
                 if now - msg.ts > self.freshness_s:
                     continue
                 if msg.mid in self._seen:
-                    continue      # re-read after a rotation, or a duplicate
+                    # The normal case, not an edge one: every message is
+                    # recorded twice -- on arrival and again when the session
+                    # processes it -- so the second sighting lands here and
+                    # the panel gets ONE card, dated from the first. Also
+                    # covers a re-read after a rotation.
+                    continue
                 self._seen[msg.mid] = now
                 self._messages.append(msg)
         self._expire(now)
@@ -642,8 +751,18 @@ class InboxWatcher(object):
         # both the "newest first" row order and the max_rows cut depend on it.
         live.sort(key=lambda m: m.ts)
         self._messages = live[-self.max_rows:] if len(live) > self.max_rows else live
+        # Forget message ids on a horizon, but never fewer than the most
+        # recent SEEN_KEEP_MIN of them whatever their age. The horizon on its
+        # own was right when one message meant one record; it is not now that
+        # a message is recorded on ARRIVAL and again when the session gets
+        # round to it, because a session parked at a prompt can leave hours
+        # between the two and the second sighting would draw a second card.
+        # Insertion order is the age order here (mids are only ever added).
         horizon = self.expire_s + self.freshness_s + 60
-        self._seen = {k: v for k, v in self._seen.items() if now - v <= horizon}
+        items = list(self._seen.items())
+        floor = len(items) - SEEN_KEEP_MIN
+        self._seen = {k: v for i, (k, v) in enumerate(items)
+                      if i >= floor or now - v <= horizon}
 
     # -- wire rows ---------------------------------------------------------
 

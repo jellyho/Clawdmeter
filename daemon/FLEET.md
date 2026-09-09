@@ -129,8 +129,21 @@ flashing at you, so it never gets the waiting card's accent or pulse.
 ### How the message is found
 
 A received message is appended to the **receiving** session's transcript
-(`~/.claude/projects/<munged-cwd>/<session-id>.jsonl`) as a `user` record whose
-content begins:
+(`~/.claude/projects/<munged-cwd>/<session-id>.jsonl`) **twice**, and both
+records are read.
+
+**1. When it arrives** — the instant it lands in that session's input queue,
+whether or not the session is in any state to look at it:
+
+```json
+{"type":"queue-operation","operation":"enqueue",
+ "timestamp":"2026-09-08T14:37:46.006Z","sessionId":"a5c6cdfd-…",
+ "content":"<cross-session-message from=\"uds:…\" from-name=\"CLAWDMETER\" from-mode=\"prompting\">\n…the body…\n</cross-session-message>"}
+```
+
+**2. 207 ms later, when the session processes it** — as a `user` record with
+`userType: "external"`, the body now nested under `message.content` and led by
+a preamble sentence:
 
 ```
 Another Claude session sent a message:
@@ -139,18 +152,57 @@ Another Claude session sent a message:
 </cross-session-message>
 ```
 
+Reading **(1)** is what makes the panel independent of the receiving session's
+state: a message shows up while that session is busy, blocked, or parked at a
+prompt with an undrained queue — and ~200 ms sooner even when it is not.
+Reading **(2)** as well rather than instead is belt and braces: it is the shape
+verified to carry the preamble framing, and a Claude Code version that emits
+only one of the two must not make the feature go silent.
+
+Note that `queue-operation` is *not* a message-only record type — your own
+typed prompts are enqueued through it too. What separates mail from a prompt is
+the `<cross-session-message>` tag, exactly as it does in a `user` record.
+
 `clawdmeter_inbox.py` tails those files and reads only the bytes appended since
 its last pass. Sender comes from `from-name`, the body from between the tags.
-Parsing is deliberately loose: attribute order, the preamble wording and the
-string-vs-block-list shape of `content` are all things a Claude Code release
-can change, so none of them is treated as a contract.
+Parsing is deliberately loose: attribute order, the preamble wording, the
+`operation` spelling and the string-vs-block-list shape of `content` are all
+things a Claude Code release can change, so none of them is treated as a
+contract.
 
-**Watching transcripts is the zero-cost approach**, and the reason is worth
-stating: a session only writes the message when it is alive to process it, so
-there is no host-side spool to read instead. Watching the sessions you already
-have open adds no session and no model turns. A dedicated always-on "inbox"
-session would work too, and would burn a model turn per message on a device
-whose entire purpose is watching quota.
+#### One message, two records, one card
+
+Two records for one message makes **deduplication mandatory**, and the identity
+it dedupes on is `(receiving session, sender, body)` — who sent *what* to
+*which* session. Two things are deliberately left out of it:
+
+- **the timestamp**, because the two records disagree about it. 207 ms on the
+  verified probe, and unbounded in general: a session parked at a prompt drains
+  its queue whenever its human comes back. A coarse time bucket would only move
+  the problem to the pair that straddles a bucket edge.
+- **the `from` pipe id**. `cc-msg-572ec92ff3b152decf8ea5ffef7664ad` *looks*
+  per-message and is not — on this machine's transcripts one such id spans 52
+  records and several distinct messages, because it names the **sending**
+  session's pipe. Keying on an attribute a future version might write in one
+  shape and not the other would resurrect the double card this exists to
+  prevent.
+
+The card is dated from the **arrival** record, so the age on the panel is when
+the message landed, not when its reader woke up to it. Message ids are
+remembered past the expiry horizon (the most recent 512, whatever their age),
+because otherwise a message queued now and processed hours later would be drawn
+a second time at drain.
+
+The one honest cost: a byte-identical body from the same sender to the same
+session, twice inside that window, shows as one card. On a device you read at a
+glance the second card would have been indistinguishable from the first anyway.
+
+**Watching transcripts is the zero-cost approach**: there is no host-side spool
+to read instead, and watching the sessions you already have open adds no session
+and no model turns. A dedicated always-on "inbox" session would work too — and
+now that the arrival record is read, such a session would not even have to take
+a model turn for its mail to reach the panel. It could sit there and be a mail
+drop.
 
 Only **top-level** transcripts are watched — `<project>/<id>.jsonl`, no
 recursion. `subagents/` and `workflows/` are excluded: those are an
@@ -256,6 +308,12 @@ re-reading only the transcript bytes that are new, and writes the handoff file
 as soon as something meaningful changes — so a message is on the panel within
 the BLE daemon's own 5 s tick.
 
+They do not wait for the **receiving session** either, which used to be the
+larger of the two delays: the arrival record above is written when the message
+lands in the queue, so a session that is mid-tool-call, blocked on a permission
+prompt, or simply sitting at an idle prompt no longer holds its own mail off
+the panel.
+
 "Meaningful" excludes the clock: every row carries an `elapsed` field that
 advances on its own, and comparing whole payloads on a 2 s loop would look like
 a change every 2 s and turn into a BLE write every 5 s forever. The loop
@@ -312,8 +370,13 @@ handoff file:
 ```bash
 python3 daemon/clawdmeter_inbox.py --once        # what is live right now
 python3 daemon/clawdmeter_inbox.py --watch       # keep printing as mail arrives
-python3 daemon/clawdmeter_inbox.py --once --freshness 86400   # look back a day
+python3 daemon/clawdmeter_inbox.py --once --freshness 86400 --expire 86400  # look back a day
 ```
+
+Widen **both** windows to look back: `--freshness` decides what is read, and
+`--expire` decides what is still live once it has been. `--freshness 86400` on
+its own prints `{"ss":[]}`, because a message from this morning is accepted and
+then immediately expired by the 180 s default.
 
 ### Config
 
