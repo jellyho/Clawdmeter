@@ -938,8 +938,21 @@ static void town_hall_tap_cb(lv_event_t* e);
 // Tapping a card does not DO anything. It SELECTS the card and offers what can
 // be done with it, in a bar along the bottom of the tab:
 //
-//   [ GO AHEAD ]  [ WAIT ]     on a report that says an agent is waiting
-//   [ DISMISS  ]  [ WAIT ]     on anything else
+//   [ GO AHEAD ]  [ DISMISS ]  [ WAIT ]   a report saying an agent is waiting
+//                 [ DISMISS ]  [ WAIT ]   anything else
+//
+// Three answers because there are three, and collapsing any two of them loses
+// something real:
+//
+//   GO AHEAD   send the owner's word to that agent
+//   DISMISS    take the card off the panel; send nothing
+//   WAIT       leave the card exactly where it is; send nothing
+//
+// DISMISS and WAIT are not the same answer. WAIT means "I am going to deal
+// with this on a keyboard, keep showing it to me until I have"; DISMISS means
+// "I have seen it, stop showing it to me". The first cut offered DISMISS only
+// on cards that could not be resumed, which left the card that matters most
+// as the one card you could not simply be finished with.
 //
 // The first cut acted on the tap itself, and it was wrong in a way worth
 // writing down. A tap that sent the owner's "go ahead" left no way to be
@@ -954,9 +967,9 @@ static void town_hall_tap_cb(lv_event_t* e);
 // it. That is the whole point of the tab: it mirrors what is true elsewhere,
 // so a card that is still there means a session that still needs somebody.
 static lv_obj_t* act_bar    = nullptr;
-static lv_obj_t* act_do     = nullptr;   // GO AHEAD / DISMISS
-static lv_obj_t* act_do_lbl = nullptr;
-static lv_obj_t* act_wait   = nullptr;
+static lv_obj_t* act_go     = nullptr;   // GO AHEAD — only when resumable
+static lv_obj_t* act_clear  = nullptr;   // DISMISS
+static lv_obj_t* act_wait   = nullptr;   // WAIT
 static ChatCard* s_sel      = nullptr;   // the selected card, or none
 
 #define ACT_BAR_H   64
@@ -964,7 +977,8 @@ static ChatCard* s_sel      = nullptr;   // the selected card, or none
 
 static void card_select(ChatCard* c);
 static void card_deselect(void);
-static void act_do_cb(lv_event_t* e);
+static void act_go_cb(lv_event_t* e);
+static void act_clear_cb(lv_event_t* e);
 static void act_wait_cb(lv_event_t* e);
 static void chat_card_mark_answered(ChatCard* c);
 
@@ -2078,11 +2092,41 @@ static void card_clear_highlight(ChatCard* c) {
     if (c && c->card) lv_obj_set_style_border_width(c->card, 0, 0);
 }
 
+// Lay the bar out for the card in hand. GO AHEAD is present only on a card
+// that can be resumed, and the two that remain widen to fill the space it is
+// not using -- rather than sitting in a gap where a button used to be, which
+// reads as a control that failed to draw.
+static void act_bar_layout(bool with_go) {
+    if (!act_bar || !act_go || !act_clear || !act_wait) return;
+    const int side = L.margin;
+    const int gap  = 12;
+    const int room = L.scr_w - 2 * side;
+    if (with_go) {
+        const int avail = room - 2 * gap;
+        const int w_go = avail * 42 / 100;
+        const int w_cl = avail * 32 / 100;
+        const int w_wt = avail - w_go - w_cl;
+        lv_obj_remove_flag(act_go, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_width(act_go, w_go);
+        lv_obj_set_width(act_clear, w_cl);
+        lv_obj_set_width(act_wait, w_wt);
+        lv_obj_align(act_go, LV_ALIGN_LEFT_MID, side, 0);
+        lv_obj_align(act_clear, LV_ALIGN_LEFT_MID, side + w_go + gap, 0);
+    } else {
+        const int avail = room - gap;
+        const int w_cl = avail * 55 / 100;
+        lv_obj_add_flag(act_go, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_width(act_clear, w_cl);
+        lv_obj_set_width(act_wait, avail - w_cl);
+        lv_obj_align(act_clear, LV_ALIGN_LEFT_MID, side, 0);
+    }
+    lv_obj_align(act_wait, LV_ALIGN_RIGHT_MID, -side, 0);
+}
+
 static void card_select(ChatCard* c) {
     if (s_sel != c) card_clear_highlight(s_sel);   // one selection, ever
     s_sel = c;
-    if (act_do_lbl)
-        lv_label_set_text(act_do_lbl, card_can_resume(c) ? "GO AHEAD" : "DISMISS");
+    act_bar_layout(card_can_resume(c));
     if (act_bar) {
         lv_obj_remove_flag(act_bar, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(act_bar);
@@ -2136,40 +2180,42 @@ static void act_wait_cb(lv_event_t* e) {
     card_deselect();
 }
 
-static void act_do_cb(lv_event_t* e) {
+static void act_go_cb(lv_event_t* e) {
+    (void)e;
+    if (s_gesture_used) return;
+    ChatCard* c = s_sel;
+    if (!c || !c->used || !card_can_resume(c)) { card_deselect(); return; }
+
+    // The card is NOT removed: the agent has to actually move first, and the
+    // host stops sending the row when it does. Marking it answered is what
+    // stops a second press interrupting the agent twice while it gets going.
+    if (!ble_send_event(BLE_EVENT_GO_AHEAD, c->sid)) {
+        session_toast("No host - not sent", COL_AMBER);
+        card_deselect();
+        return;
+    }
+    c->answered_sig = c->sig;
+    c->answered_ms  = lv_tick_get();
+    session_toast("Go ahead sent", COL_GREEN);
+    if (settings_sound_enabled()) sound_hal_play_short();
+    card_deselect();
+    chat_card_mark_answered(c);
+}
+
+// DISMISS. Offered on every card, including the ones an agent is waiting on --
+// "I have seen this and I am done with it" is a different answer from "leave
+// it up until I have dealt with it", and the owner is entitled to both.
+static void act_clear_cb(lv_event_t* e) {
     (void)e;
     if (s_gesture_used) return;
     ChatCard* c = s_sel;
     if (!c || !c->used) { card_deselect(); return; }
 
-    if (card_can_resume(c)) {
-        // GO AHEAD. The card is NOT removed: the agent has to actually move
-        // first, and the host stops sending the row when it does. Marking it
-        // answered is what stops a second press interrupting the agent twice
-        // while it gets going.
-        if (!ble_send_event(BLE_EVENT_GO_AHEAD, c->sid)) {
-            session_toast("No host - not sent", COL_AMBER);
-            card_deselect();
-            return;
-        }
-        c->answered_sig = c->sig;
-        c->answered_ms  = lv_tick_get();
-        session_toast("Go ahead sent", COL_GREEN);
-        if (settings_sound_enabled()) sound_hal_play_short();
-        card_deselect();
-        chat_card_mark_answered(c);
-        return;
-    }
-
-    // DISMISS. Only for the cards nothing is waiting on -- mail already read,
-    // a report that says an agent is busy, the overflow footnote. These have
-    // no "the session moved" moment to wait for, so the owner is the only
-    // thing that can end them.
     ble_send_event(BLE_EVENT_DISMISS, c->sid);   // advisory; see ble.h
     session_toast("Cleared", COL_DIM);
     // Cleared BY HAND, so this card is about to vanish for a reason that is
     // NOT the agent moving. Drop the answered mark before the re-render, or
-    // the release below would sound the resume note for the owner's own tap.
+    // the release would sound the resume note for the owner's own tap.
     c->answered_sig = 0;
     remember_dismissed(c->sig);
     card_deselect();
@@ -2475,6 +2521,31 @@ static void build_session_views(lv_obj_t* parent) {
     // cards live in a scrolling viewport: a bar inside it would scroll away
     // from the selection it belongs to, and one anchored to a card would have
     // to move every time the list re-sorts underneath.
+    // One factory, because the three buttons differ only in their colours and
+    // their words -- and a bar whose buttons were built three ways would drift
+    // apart the first time one of them was adjusted.
+    auto make_act_button = [](lv_obj_t* parent_bar, lv_event_cb_t cb,
+                              const char* text, lv_color_t fill,
+                              lv_color_t ink) {
+        lv_obj_t* b = lv_obj_create(parent_bar);
+        lv_obj_set_height(b, ACT_BTN_H);
+        lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(b, fill, 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(b, lv_color_mix(fill, COL_TEXT, 200),
+                                  LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(b, 0, 0);
+        lv_obj_set_style_pad_all(b, 0, 0);
+        lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t* l = lv_label_create(b);
+        lv_label_set_text(l, text);
+        lv_obj_set_style_text_font(l, L.bt_credit_2_font, 0);
+        lv_obj_set_style_text_color(l, ink, 0);
+        lv_obj_center(l);
+        return b;
+    };
+
     act_bar = lv_obj_create(parent);
     lv_obj_set_size(act_bar, L.scr_w, ACT_BAR_H);
     lv_obj_set_style_bg_color(act_bar, COL_BG, 0);
@@ -2487,50 +2558,26 @@ static void build_session_views(lv_obj_t* parent) {
     lv_obj_add_flag(act_bar, LV_OBJ_FLAG_HIDDEN);
 
     {
-        // Two buttons, and the split is not even: the one that SENDS gets the
-        // room and the colour, the one that does nothing is an outline. A bar
-        // where both looked equally like the thing to press would make WAIT --
-        // the safe answer, and the common one -- as easy to hit by accident as
+        // Weight tracks CONSEQUENCE, so the eye lands on the right one: the
+        // button that sends something to another machine is filled with the
+        // accent, the one that changes what the panel shows is a quiet slab,
+        // and the one that changes nothing is an outline. A bar where all
+        // three looked equally pressable would make "leave it alone" -- the
+        // answer most of the time -- as easy to hit by accident as
         // interrupting an agent.
-        const int gap  = 12;
-        const int side = L.margin;
-        const int w    = L.scr_w - 2 * side - gap;
-        const int wide = w * 3 / 5;
-
-        act_do = lv_obj_create(act_bar);
-        lv_obj_set_size(act_do, wide, ACT_BTN_H);
-        lv_obj_set_style_radius(act_do, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(act_do, COL_ACCENT, 0);
-        lv_obj_set_style_bg_color(act_do, lv_color_hex(0xa85639), LV_STATE_PRESSED);
-        lv_obj_set_style_bg_opa(act_do, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(act_do, 0, 0);
-        lv_obj_set_style_pad_all(act_do, 0, 0);
-        lv_obj_clear_flag(act_do, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_event_cb(act_do, act_do_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_align(act_do, LV_ALIGN_LEFT_MID, side, 0);
-        act_do_lbl = lv_label_create(act_do);
-        lv_obj_set_style_text_font(act_do_lbl, L.bt_credit_2_font, 0);
-        lv_obj_set_style_text_color(act_do_lbl, COL_BG, 0);
-        lv_obj_center(act_do_lbl);
-
-        act_wait = lv_obj_create(act_bar);
-        lv_obj_set_size(act_wait, w - wide, ACT_BTN_H);
-        lv_obj_set_style_radius(act_wait, LV_RADIUS_CIRCLE, 0);
+        act_go = make_act_button(act_bar, act_go_cb, "GO AHEAD",
+                                 COL_ACCENT, COL_BG);
+        act_clear = make_act_button(act_bar, act_clear_cb, "DISMISS",
+                                    COL_PANEL, COL_TEXT);
+        act_wait = make_act_button(act_bar, act_wait_cb, "WAIT",
+                                   COL_BG, COL_DIM);
+        // Only WAIT is drawn as an outline; the other two carry their own fill.
         lv_obj_set_style_bg_opa(act_wait, LV_OPA_TRANSP, 0);
         lv_obj_set_style_bg_color(act_wait, COL_PANEL, LV_STATE_PRESSED);
         lv_obj_set_style_bg_opa(act_wait, LV_OPA_COVER, LV_STATE_PRESSED);
         lv_obj_set_style_border_color(act_wait, COL_DIM, 0);
         lv_obj_set_style_border_width(act_wait, 1, 0);
         lv_obj_set_style_border_opa(act_wait, LV_OPA_40, 0);
-        lv_obj_set_style_pad_all(act_wait, 0, 0);
-        lv_obj_clear_flag(act_wait, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_event_cb(act_wait, act_wait_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_align(act_wait, LV_ALIGN_RIGHT_MID, -side, 0);
-        lv_obj_t* wl = lv_label_create(act_wait);
-        lv_label_set_text(wl, "WAIT");
-        lv_obj_set_style_text_font(wl, L.bt_credit_2_font, 0);
-        lv_obj_set_style_text_color(wl, COL_DIM, 0);
-        lv_obj_center(wl);
     }
 
     // The toast. Parented on the TAB, above both sub-views, so a tap that
