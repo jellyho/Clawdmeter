@@ -101,6 +101,41 @@ except ImportError:  # run as a script, not a package
 # this one goes on the end. The firmware phase must add the same number.
 STATE_MESSAGE = 11
 
+# ---- Report states (see REPORT.md) ----------------------------------------
+# A REPORT is a cross-session message whose body opens with the contract line
+# in REPORT.md. It is not a new ROW KIND -- it is a message-shaped card whose
+# STATE means something, which is the whole trick: the firmware already
+# colours, sorts and auto-jumps on the state field, and filing every reply
+# under STATE_MESSAGE threw all of that away.
+#
+# Four states, because three would hide the distinction the next feature needs.
+# A later button will send "go ahead" back to an agent, and that only works on
+# one of them:
+#
+#   WORKING    busy, needs nothing              -> nothing to send
+#   NEEDS-YOU  stopped, waiting for direction    -> THE valid target: a message
+#                                                   lands in its input queue
+#                                                   and it carries on
+#   BLOCKED    stopped at a permission prompt    -> a message CANNOT unblock it;
+#                                                   it queues behind the dialog
+#                                                   until a human clicks
+#   DONE       finished, nothing running         -> nothing to continue
+#
+# WORKING/NEEDS-YOU/BLOCKED/DONE are what an agent can say about itself. MORE
+# is host-minted: the overflow marker that makes a dropped report visible
+# rather than silent (see overflow_row).
+STATE_REPORT_WORKING   = 12
+STATE_REPORT_NEEDS_YOU = 13
+STATE_REPORT_BLOCKED   = 14
+STATE_REPORT_DONE      = 15
+STATE_REPORT_MORE      = 16
+
+REPORT_STATES = (STATE_REPORT_WORKING, STATE_REPORT_NEEDS_YOU,
+                 STATE_REPORT_BLOCKED, STATE_REPORT_DONE)
+# Only these two mean "a human is needed": they are the firmware's waiting
+# bucket (accent + pulse + sorts to the top + trips the auto-jump).
+REPORT_WAITING_STATES = (STATE_REPORT_NEEDS_YOU, STATE_REPORT_BLOCKED)
+
 # The message text is a NEW TRAILING field. Indices 0..12 keep the exact
 # meaning and the exact bytes they have today, so firmware that stops reading
 # at index 12 sees a normal (if oddly-stated) row and ignores the tail.
@@ -108,6 +143,14 @@ MSG_FIELD_INDEX = 13
 
 # Only message rows carry index 13. Session rows stay 13 fields long: a field
 # nobody reads is pure byte-budget, and the budget is the scarce thing here.
+# Report rows carry it too -- the summary rides in the same field the message
+# body does, because it renders in the same place on the same card anatomy.
+
+# The device parses at most this many rows (SESSION_MAX_ROWS in
+# firmware/src/data.h) and drops the rest without telling anyone. Ten agents
+# can be reachable at once, so for reports that cap is not theoretical: the
+# host has to do the dropping itself, in a defensible order, and say so.
+DEVICE_MAX_ROWS = 6
 
 # ---------------------------------------------------------------------------
 # Tunables (all overridable from the daemon config file)
@@ -154,6 +197,25 @@ MSG_TEXT_MIN = 16
 # host is the side that knows a name is being shortened and can middle-elide
 # so the tail that tells two machines apart survives.
 LABEL_MAX = 32
+
+# Report summary length, in BYTES after folding and eliding. A report is a
+# one-liner by construction (the dispatcher asks for <= 40 characters), so it
+# gets a tighter ceiling than a message body: the scarce thing in a report
+# round is ROWS, and every byte a summary spends is a byte the next agent's
+# card cannot have.
+#
+# The floor is 24 B -- eight Hangul syllables, or "waiting for go-ahead" with
+# room to spare. Under that a summary stops saying anything and the round
+# would be better spent on fewer, readable cards.
+REPORT_TEXT_MAX = 64
+REPORT_TEXT_MIN = 24
+
+# How long a report stays on the panel. Longer than a message's 180 s because
+# a report is a SNAPSHOT the owner asked for, not something that arrived
+# unbidden -- but bounded, because the host cannot see the agent change its
+# mind: the card goes away by expiry, never by resolution. The age on the card
+# is what keeps it honest in the meantime.
+DEFAULT_REPORT_EXPIRE_S = 300
 
 # Two message rows cost ~146 bytes whatever the text cap, so below this budget
 # a pair of them evicts EVERY session card (measured against cs.fit_payload
@@ -416,6 +478,112 @@ def parse_cross_session(text):
     return sender, body.strip()
 
 
+# ---------------------------------------------------------------------------
+# The REPORT contract -- daemon/REPORT.md is the normative copy
+# ---------------------------------------------------------------------------
+# One line, and the agent's whole reply:
+#
+#     CLAWDMETER-REPORT/1 NEEDS-YOU: rebase done, force-push?
+#
+# STRICT ABOUT THE MATCH, FORGIVING ABOUT WHITESPACE, and one rule carries
+# most of the strictness: the marker must open the body's FIRST NON-EMPTY
+# LINE. That is not fussiness, it is the only thing standing between this
+# parser and its own request text -- the dispatcher's message tells the agent
+# what to emit, so it necessarily CONTAINS the marker, and it lands in the
+# receiving transcript exactly like any other cross-session message. Accepting
+# the marker anywhere would make every dispatch draw a bogus report card on
+# the panel. REPORT.md's request text therefore keeps the template indented
+# inside prose, never at the head of the body.
+#
+# What IS forgiven: leading/trailing whitespace, the case of the marker and
+# the state word, `NEEDS_YOU` / `NEEDS YOU` for `NEEDS-YOU`, a missing colon,
+# and any amount of space around the separator. Everything else degrades to an
+# ordinary message row -- never dropped, never crashed, never guessed at. An
+# unknown state word in particular must NOT become "working": the panel would
+# then be confidently wrong about a machine the owner cannot see.
+REPORT_MARKER = "CLAWDMETER-REPORT/1"
+
+REPORT_STATE_WORDS = {
+    "WORKING":   STATE_REPORT_WORKING,
+    "NEEDS-YOU": STATE_REPORT_NEEDS_YOU,
+    "BLOCKED":   STATE_REPORT_BLOCKED,
+    "DONE":      STATE_REPORT_DONE,
+}
+
+_REPORT_RE = re.compile(
+    r"^\s*CLAWDMETER-REPORT/1\s+"
+    r"(WORKING|NEEDS[-_ ]?YOU|BLOCKED|DONE)"
+    r"(?:\s*:\s*|\s+)"
+    r"(\S.*)$",
+    re.IGNORECASE,
+)
+
+
+def parse_report(body):
+    """`(state_code, summary)` if `body` is a report reply, else None.
+
+    None is not a failure path: it is how a malformed report degrades to the
+    ordinary message row it already was. The caller keeps the body either way,
+    so nothing is ever dropped for being badly formatted.
+    """
+    if not body:
+        return None
+    for line in body.splitlines():
+        if not line.strip():
+            continue                      # blank lead-in is whitespace, not prose
+        m = _REPORT_RE.match(line)
+        if not m:
+            return None                   # first real line is not the contract
+        word = re.sub(r"[_ ]+", "-", m.group(1).upper())
+        state = REPORT_STATE_WORDS.get(word)
+        if state is None:                 # unreachable via the regex; belt to
+            return None                   # its braces if the alternation grows
+        # Collapse the summary to one line: the card draws it as running text
+        # and a stray newline would otherwise eat one of its two lines.
+        summary = " ".join(m.group(2).split())
+        return (state, summary) if summary else None
+    return None
+
+
+def report_text_max(budget):
+    """Summary length, in BYTES, that keeps a full report round on the wire.
+
+    Scales with the payload budget the same way text_max_for_budget does for
+    message bodies, but a twelfth of it rather than a quarter: a round is
+    several rows and a message is one. At the 500 bytes REPORT.md recommends
+    this is 41 B -- 41 ASCII characters, or 13 Hangul syllables -- which is
+    why the dispatcher asks agents for 40 CHARACTERS: one byte of slack, so
+    an on-spec ASCII summary is never elided.
+    """
+    try:
+        budget = int(budget)
+    except (TypeError, ValueError):
+        return REPORT_TEXT_MAX
+    return max(REPORT_TEXT_MIN, min(REPORT_TEXT_MAX, budget // 12))
+
+
+# Report sids live in their own 2-character alphabet, disjoint from every
+# other producer's. Message sids and session sids are both 2 hex characters,
+# so they already share one 256-value key space and can alias (see the note on
+# s_notify_sids in ui.cpp); adding a third hex producer would have made that
+# worse at exactly the moment there are ten of them. A leading letter outside
+# [0-9a-f] cannot collide with either, and 19x36 = 684 slots keeps the
+# birthday odds among ten agents around 6%.
+_SID_HEAD = "ghijklmnopqrstuvwxy"          # 'z' reserved for MORE_SID
+_SID_TAIL = "0123456789abcdefghijklmnopqrstuvwxyz"
+MORE_SID = "zz"
+
+
+def report_sid(sender):
+    """Stable per AGENT, not per report: the card keeps its identity (and its
+    slot in the notify set) while the same agent's state changes under it, so
+    a WORKING -> NEEDS-YOU flip slides the existing card up instead of fading
+    a new one in. The notify set is keyed on (sid, kind) and only the waiting
+    states join it, so that flip still produces exactly one auto-jump."""
+    h = int(hashlib.md5(("report|" + sender).encode("utf-8")).hexdigest()[:8], 16)
+    return _SID_HEAD[h % len(_SID_HEAD)] + _SID_TAIL[(h // len(_SID_HEAD)) % len(_SID_TAIL)]
+
+
 def _epoch(value):
     """ISO-8601 (or numeric) timestamp -> epoch seconds; 0 when unreadable."""
     if isinstance(value, (int, float)):
@@ -430,19 +598,34 @@ def _epoch(value):
 
 
 class Message(object):
-    """One received cross-session message."""
+    """One received cross-session message.
 
-    __slots__ = ("mid", "ts", "sender", "body", "source")
+    `report_state` / `summary` are filled when the body matched the REPORT
+    contract; they are None on ordinary mail, which is what every consumer
+    tests to tell the two apart. The raw `body` is kept either way, so a
+    report can still be rendered as the message it also is.
+    """
 
-    def __init__(self, mid, ts, sender, body, source=""):
+    __slots__ = ("mid", "ts", "sender", "body", "source",
+                 "report_state", "summary")
+
+    def __init__(self, mid, ts, sender, body, source="",
+                 report_state=None, summary=None):
         self.mid = mid
         self.ts = ts
         self.sender = sender
         self.body = body
         self.source = source
+        self.report_state = report_state
+        self.summary = summary
+
+    @property
+    def is_report(self):
+        return self.report_state is not None
 
     def __repr__(self):  # pragma: no cover - debugging aid
-        return f"<Message {self.mid} from={self.sender!r} ts={self.ts:.0f}>"
+        kind = f"report={self.report_state}" if self.is_report else "msg"
+        return f"<Message {self.mid} from={self.sender!r} {kind} ts={self.ts:.0f}>"
 
 
 def record_text(rec):
@@ -518,8 +701,13 @@ def message_id(session, sender, body):
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:8]
 
 
-def message_from_record(rec, source=""):
-    """A transcript record -> Message, or None."""
+def message_from_record(rec, source="", reports=True):
+    """A transcript record -> Message, or None.
+
+    `reports=False` reads a report reply as the ordinary message it is made
+    of, which is what the `reports = off` switch does: the body is unchanged,
+    only its interpretation is.
+    """
     text = record_text(rec)
     if text is None:
         return None
@@ -528,7 +716,9 @@ def message_from_record(rec, source=""):
         return None
     sender, body = parsed
     mid = message_id(rec.get("sessionId") or source, sender, body)
-    return Message(mid, _epoch(rec.get("timestamp")), sender, body, source)
+    rep = parse_report(body) if reports else None
+    return Message(mid, _epoch(rec.get("timestamp")), sender, body, source,
+                   rep[0] if rep else None, rep[1] if rep else None)
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +749,9 @@ class InboxWatcher(object):
     def __init__(self, roots=None, freshness_s=DEFAULT_FRESHNESS_S,
                  expire_s=DEFAULT_EXPIRE_S, max_rows=DEFAULT_MAX_ROWS,
                  text_max=MSG_TEXT_MAX, translit=True, keep_hangul=True,
-                 now_fn=time.time):
+                 now_fn=time.time, reports=True,
+                 report_expire_s=DEFAULT_REPORT_EXPIRE_S,
+                 budget=cs.DEFAULT_BUDGET_BYTES):
         self.roots = list(roots) if roots is not None else default_roots()
         self.freshness_s = freshness_s
         self.expire_s = expire_s
@@ -567,9 +759,19 @@ class InboxWatcher(object):
         self.text_max = text_max
         self.translit = translit
         self.keep_hangul = keep_hangul
+        self.reports = reports
+        self.report_expire_s = report_expire_s
+        self.budget = budget
         self._now = now_fn
         self._files = {}       # path -> [offset, inode, cold]
         self._messages = []    # live, newest last
+        # Reports are keyed by AGENT, not by message: a status report
+        # supersedes that agent's previous one rather than stacking beside it,
+        # which is what makes a re-dispatch refresh the panel instead of
+        # doubling it. `max_rows` (a burst cap for unsolicited mail) does not
+        # apply here -- a round is meant to be one card per reachable agent,
+        # and what bounds it is the device's row cap and the byte budget.
+        self._reports = {}     # panel sender -> Message
         self._seen = {}        # mid -> ts, for de-duplication across re-reads
 
     # -- discovery ---------------------------------------------------------
@@ -710,7 +912,7 @@ class InboxWatcher(object):
                     rec = json.loads(line)
                 except ValueError:
                     continue      # half-written or corrupt line: skip it
-                msg = message_from_record(rec, path)
+                msg = message_from_record(rec, path, self.reports)
                 if msg is None:
                     continue
                 if not msg.ts:
@@ -732,6 +934,30 @@ class InboxWatcher(object):
                 # right here, so the panel never shows backlog.
                 if now - msg.ts > self.freshness_s:
                     continue
+                if msg.is_report:
+                    # One card per agent. A newer report replaces the older
+                    # one outright -- keeping both would show a machine in two
+                    # states at once, which is worse than showing it in the
+                    # stale one. Out-of-order arrival is guarded explicitly
+                    # rather than by luck: two transcripts read in one pass can
+                    # yield an agent's replies in either order.
+                    #
+                    # AND IT DELIBERATELY SKIPS THE MID DEDUP BELOW. `_seen`
+                    # remembers the most recent SEEN_KEEP_MIN ids whatever
+                    # their age, which for mail is what stops a long-queued
+                    # message drawing a second card when its session finally
+                    # drains -- and for a report would mean an agent that
+                    # re-reports the SAME state, in the same words, could
+                    # never get its card back once the first one expired. On a
+                    # quiet machine that is "never" literally: 512 ids is more
+                    # than a day of reports. The arrival/processed pair still
+                    # collapses to ONE card without it, because both records
+                    # name the same agent and this key is the agent.
+                    key = panel_sender(msg.sender, self.translit)
+                    prev = self._reports.get(key)
+                    if prev is None or msg.ts >= prev.ts:
+                        self._reports[key] = msg
+                    continue
                 if msg.mid in self._seen:
                     # The normal case, not an edge one: every message is
                     # recorded twice -- on arrival and again when the session
@@ -742,9 +968,15 @@ class InboxWatcher(object):
                 self._seen[msg.mid] = now
                 self._messages.append(msg)
         self._expire(now)
-        return list(self._messages)
+        return list(self._messages) + list(self._reports.values())
+
+    def reports_live(self):
+        """Live reports, newest first. Read-only view for callers and tests."""
+        return sorted(self._reports.values(), key=lambda m: -m.ts)
 
     def _expire(self, now):
+        self._reports = {k: m for k, m in self._reports.items()
+                         if now - (m.ts or now) <= self.report_expire_s}
         live = [m for m in self._messages if now - (m.ts or now) <= self.expire_s]
         # Sorted by arrival, not by the order files happened to be scanned in:
         # two transcripts read in one pass can yield messages out of order, and
@@ -766,21 +998,33 @@ class InboxWatcher(object):
 
     # -- wire rows ---------------------------------------------------------
 
-    def rows(self, now=None, text_max=None):
-        """Live messages as wire rows, newest first.
+    def rows(self, now=None, text_max=None, budget=None):
+        """Live messages and reports as wire rows, most urgent first.
 
         The per-message length shrinks when several are live at once. Without
         that, two full-length message rows overflow the default 180-byte
         budget and cs.fit_payload() drops the older one from the tail --
         a message would vanish silently rather than arrive shortened.
+
+        With no reports live this returns exactly what it always did, byte for
+        byte: the report round is an added path, not a rewrite of the message
+        one, and mail must keep behaving the way it is documented to.
         """
         now = self._now() if now is None else now
         cap = self.text_max if text_max is None else text_max
         live = list(reversed(self._messages))
         if len(live) > 1:
             cap = max(MSG_TEXT_MIN, cap // len(live))
-        return [message_row(m, now, cap, self.translit, self.keep_hangul)
-                for m in live]
+        msg_rows = [message_row(m, now, cap, self.translit, self.keep_hangul)
+                    for m in live]
+        if not self._reports:
+            return msg_rows
+
+        budget = self.budget if budget is None else budget
+        rcap = report_text_max(budget)
+        rep_rows = [report_row(m, now, rcap, self.translit, self.keep_hangul)
+                    for m in self.reports_live()]
+        return fit_round(sorted(rep_rows + msg_rows, key=row_rank), budget)
 
 
 def message_row(msg, now, text_max=MSG_TEXT_MAX, translit=True,
@@ -812,6 +1056,147 @@ def message_row(msg, now, text_max=MSG_TEXT_MAX, translit=True,
         cs.REMOTE_UNKNOWN,               # 12 remote: meaningless for a message
         text,                            # 13 NEW: the message itself
     ]
+
+
+def report_row(msg, now, text_max=REPORT_TEXT_MAX, translit=True,
+               keep_hangul=True):
+    """One report Message -> the positional wire row.
+
+    Identical in SHAPE to a message row -- same 14 fields, same "not
+    applicable" values, the summary riding in the same index 13 a body does --
+    and different in exactly one field: the state. That is the point. The
+    firmware keeps the message card's LAYOUT (sender line, then the words) and
+    takes the dot colour, the sort bucket and the auto-jump from the state, so
+    a report needs no new row kind, no new field and no new parser on the
+    device.
+
+    The summary keeps its Hangul for the same reason a message body does: it
+    renders in the one font that has the fallback. The sender does not (see
+    panel_sender), and neither does the state word -- that one is drawn by the
+    firmware from the code, so it is English on the panel whatever language
+    the agent wrote in.
+    """
+    elapsed = int(max(0.0, now - msg.ts)) if msg.ts else 0
+    sender = panel_sender(msg.sender, translit)
+    text = elide_message(to_panel_text(msg.summary or "", translit, keep_hangul),
+                         text_max)
+    return [
+        report_sid(sender),              # 0  sid: stable per AGENT
+        sender,                          # 1  label: which agent reported
+        msg.report_state,                # 2  state: the whole trick
+        -1,                              # 3  ctx: not applicable
+        elapsed,                         # 4  age of the report
+        0,                               # 5  model: unknown
+        0,                               # 6  tool: none
+        0, 0, 0, 0,                      # 7-10 ntools/nagents/tdone/ttotal
+        -1,                              # 11 tok: not applicable
+        cs.REMOTE_UNKNOWN,               # 12 remote: not this API's to say
+        text,                            # 13 the one-line summary
+    ]
+
+
+# What a row is worth on a panel you read at a glance. Reports jump the
+# session sort entirely (they are people asking, not machines running), and
+# among themselves they rank by how much they need:
+#
+#   0  NEEDS-YOU  a human's answer unblocks it, and the device will one day
+#                 be able to send that answer -- the most actionable row there
+#                 is, so it is the last thing that may ever be dropped
+#   1  BLOCKED    a human is needed too, but at the keyboard: no message can
+#                 clear a permission dialog
+#   2  message    somebody said something unbidden
+#   3  DONE       finished. Rarer than WORKING after a dispatch and therefore
+#                 more informative: a finished agent is news, a busy one is
+#                 the expected answer
+#   4  WORKING    needs nothing. The default answer, and the first to go
+#
+# Tie-break is newest first, matching the message rows' own order.
+_ROW_RANK = {
+    STATE_REPORT_NEEDS_YOU: 0,
+    STATE_REPORT_BLOCKED:   1,
+    STATE_MESSAGE:          2,
+    STATE_REPORT_DONE:      3,
+    STATE_REPORT_WORKING:   4,
+    STATE_REPORT_MORE:      5,
+}
+
+
+def row_rank(row):
+    return (_ROW_RANK.get(row[2], 9), row[4])
+
+
+_MORE_WORDS = (
+    (STATE_REPORT_NEEDS_YOU, "need you"),
+    (STATE_REPORT_BLOCKED,   "blocked"),
+    (STATE_REPORT_DONE,      "done"),
+    (STATE_REPORT_WORKING,   "working"),
+)
+
+
+def overflow_row(dropped):
+    """The row that makes a dropped report visible instead of silent.
+
+    Ten agents can answer one dispatch and the device parses six rows, so
+    dropping is the normal case, not the edge one -- and a panel that just
+    shows the first five is a panel that lies about the fleet. This says how
+    many did not fit and what they said, in the same words the cards above it
+    use, so the count is checkable at a glance.
+
+    It is the quietest thing on the screen by design (state MORE renders dim,
+    idle bucket, never in the notify set): the urgent rows are the ones above
+    it, and this is the footnote that says the list is not the whole story.
+    """
+    counts = {}
+    for row in dropped:
+        counts[row[2]] = counts.get(row[2], 0) + 1
+    parts = [f"{counts[state]} {word}" for state, word in _MORE_WORDS
+             if counts.get(state)]
+    nmsg = counts.get(STATE_MESSAGE, 0)
+    if nmsg:
+        parts.append(f"{nmsg} msg" + ("s" if nmsg > 1 else ""))
+    return [
+        MORE_SID,
+        f"+{len(dropped)} MORE",
+        STATE_REPORT_MORE,
+        -1, 0, 0, 0, 0, 0, 0, 0, -1, cs.REMOTE_UNKNOWN,
+        ", ".join(parts) or "not shown",
+    ]
+
+
+def fit_round(rows, budget, max_rows=DEVICE_MAX_ROWS):
+    """Rank-sorted rows -> what actually goes on the wire, plus the marker.
+
+    TWO caps bind here and both of them bite at ten agents:
+
+      * the DEVICE parses SESSION_MAX_ROWS = 6 rows and silently discards the
+        rest, so the host must do that cut itself to know what was lost; and
+      * the BYTE BUDGET, which at the recommended 480 holds about five report
+        rows (see REPORT.md for the arithmetic).
+
+    Rows are dropped from the TAIL, which is why row_rank exists: the tail is
+    the least urgent row, and NEEDS-YOU is never in it. Whatever goes,
+    overflow_row() says so.
+
+    The whole result is measured against `budget` here rather than left to
+    cs.fit_payload downstream, because that one drops from the tail too -- and
+    the tail, once a marker is appended, IS the marker. The one row whose job
+    is to report the dropping would be the first thing dropped.
+    """
+    kept = list(rows[:max_rows])
+    dropped = list(rows[max_rows:])
+    while True:
+        trial = kept + ([overflow_row(dropped)] if dropped else [])
+        if len(trial) <= max_rows and _payload_bytes(trial) <= budget:
+            return trial
+        if not kept:
+            # Nothing fits at all. Ship the marker alone: "N agents reported,
+            # none of them fit" is a panel that is still telling the truth.
+            return trial[:1]
+        dropped.insert(0, kept.pop())
+
+
+def _payload_bytes(rows):
+    return len(cs.encode_payload(rows).encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +1250,13 @@ def watcher_from_config(budget=cs.DEFAULT_BUDGET_BYTES, config_path=None, roots=
         text_max=text_max_for_budget(budget),
         translit=_config_flag("inbox_translit", True, config_path),
         keep_hangul=_config_flag("inbox_hangul", True, config_path),
+        # `reports = off` does not turn a report into nothing: it turns it back
+        # into the ordinary message it is made of, so the words still reach the
+        # panel and only the state colouring goes away.
+        reports=_config_flag("reports", True, config_path),
+        report_expire_s=_config_int("report_expire_s", DEFAULT_REPORT_EXPIRE_S,
+                                    config_path),
+        budget=budget,
     )
 
 
@@ -890,6 +1282,9 @@ def main(argv=None):
                         help="romanise Korean instead of sending it as "
                              "Hangul (for firmware older than the Korean "
                              "font, which would draw it as empty boxes)")
+    parser.add_argument("--no-reports", action="store_true",
+                        help="read report replies as ordinary messages "
+                             "(see daemon/REPORT.md for the contract)")
     parser.add_argument("--root", action="append", default=None,
                         help="projects dir to watch (repeatable; default from config)")
     args = parser.parse_args(argv)
@@ -902,13 +1297,16 @@ def main(argv=None):
         text_max=text_max_for_budget(args.budget),
         translit=not args.no_translit,
         keep_hangul=not args.no_hangul,
+        reports=not args.no_reports,
+        budget=args.budget,
     )
 
     def report():
         msgs = watcher.poll()
         for m in msgs:
+            kind = f"[{m.report_state}] " if m.is_report else ""
             log(f"{time.strftime('%H:%M:%S', time.localtime(m.ts))} "
-                f"<{m.sender}> "
+                f"<{m.sender}> {kind}"
                 f"{to_panel_text(m.body, watcher.translit, watcher.keep_hangul)[:120]}")
         rows = watcher.rows()
         print(cs.encode_payload(rows))

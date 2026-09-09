@@ -49,7 +49,56 @@ enum session_state_t : uint8_t {
     // confident zero. Its own bucket in the UI: never the waiting pulse (a
     // message is something to read, not a chat blocked on you).
     SESSION_MESSAGE            = 11,
+
+    // ---- Agent reports (daemon/REPORT.md) ----
+    // Also not sessions. The owner presses a button, a dispatcher asks every
+    // reachable Claude Code agent to report in, and each agent replies with
+    // one contract line by cross-session message. The host's inbox watcher
+    // recognises that line and mints one of the states below.
+    //
+    // A report is NOT a new row kind, on purpose: it is a message-shaped card
+    // whose STATE means something. It keeps the message LAYOUT (sender line,
+    // then the words) and takes its dot colour, its sort bucket and its
+    // auto-jump from the state — all machinery this file's codes already
+    // drive. `label` carries the agent, `msg` (index 13) the one-line
+    // summary, every session-shaped field arrives as "not applicable".
+    //
+    // The split between NEEDS_YOU and BLOCKED is the one that earns its code.
+    // A later feature will let a button on a report card send "go ahead" back
+    // to the agent, and it only works on one of the two:
+    //
+    //   WORKING    busy, needs nothing               → nothing to send
+    //   NEEDS_YOU  stopped, waiting for direction    → THE valid target: the
+    //                                                  message reaches its
+    //                                                  input queue and it goes
+    //   BLOCKED    stopped at a permission prompt    → a message cannot help;
+    //                                                  it queues BEHIND the
+    //                                                  dialog until a human
+    //                                                  clicks on that machine
+    //   DONE       finished, nothing running         → nothing to continue
+    //
+    // So `state == SESSION_REPORT_NEEDS_YOU` is the whole predicate that
+    // future button needs. NEEDS_YOU and BLOCKED are both the WAITING bucket
+    // (accent + pulse + sorts first + trips the auto-jump); WORKING and DONE
+    // are not, because nobody is blocked.
+    SESSION_REPORT_WORKING     = 12,  // working bucket
+    SESSION_REPORT_NEEDS_YOU   = 13,  // waiting bucket — and the resume target
+    SESSION_REPORT_BLOCKED     = 14,  // waiting bucket — NOT the resume target
+    SESSION_REPORT_DONE        = 15,  // working bucket, green dot
+    // Host-minted, never sent by an agent: "N reports did not fit". Ten agents
+    // can answer one dispatch and SESSION_MAX_ROWS is 6, so dropping is the
+    // normal case — this row is what stops it being a silent one. Idle bucket
+    // and never in the notify set: it is a footnote, not an alert.
+    SESSION_REPORT_MORE        = 16,
 };
+
+// A report card and a message card share the same widget anatomy (a sender
+// line and the words under it) and the same wire field for their text. This
+// is the test both of them answer yes to; the state itself still decides the
+// colour and the bucket. Session rows answer no.
+static inline bool session_state_has_words(uint8_t s) {
+    return s >= SESSION_MESSAGE && s <= SESSION_REPORT_MORE;
+}
 
 enum session_model_t : uint8_t {
     SESSION_MODEL_UNKNOWN = 0,
@@ -115,7 +164,9 @@ struct SessionRow {
     int32_t tok;                     // context tokens used, in units of 1k
                                      // (190 = 190k, 1200 = 1.2M); -1 = unknown.
                                      // Wire index 11; absent (older host) → -1.
-    char    msg[SESSION_MSG_MAX];    // SESSION_MESSAGE body, UTF-8: ASCII
+    char    msg[SESSION_MSG_MAX];    // the card's words — a SESSION_MESSAGE
+                                     // body or a SESSION_REPORT_* summary
+                                     // (session_state_has_words). UTF-8: ASCII
                                      // 32..126 plus the 2,350 KS X 1001
                                      // Hangul syllables the fallback font
                                      // carries (font_nanum_kr_28); everything

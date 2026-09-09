@@ -1167,3 +1167,438 @@ def test_a_re_read_after_rotation_is_cold_too(projects):
     del rec["timestamp"]
     path.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
     assert [m.body for m in w.poll()] == ["first"]   # only the original stands
+
+
+# --------------------------------------------------------------------------- agent reports
+# A REPORT is an ordinary cross-session message whose body opens with the
+# contract line in daemon/REPORT.md. Everything here therefore reuses the
+# helpers above: the transport is unchanged and only the reading of the body
+# is new. What is asserted is the contract, the degradation, the ordering and
+# the byte budget -- in that order, because that is the order they bite in.
+
+REPORT_STATE_CASES = [
+    ("WORKING",   ib.STATE_REPORT_WORKING),
+    ("NEEDS-YOU", ib.STATE_REPORT_NEEDS_YOU),
+    ("BLOCKED",   ib.STATE_REPORT_BLOCKED),
+    ("DONE",      ib.STATE_REPORT_DONE),
+]
+
+
+def report_body(state="WORKING", summary="building the C6 firmware"):
+    return f"CLAWDMETER-REPORT/1 {state}: {summary}"
+
+
+def report_record(state="WORKING", summary="building the C6 firmware",
+                  sender="ORCHESTRATOR", ts=NOW, **kw):
+    return msg_record(report_body(state, summary), sender=sender, ts=ts, **kw)
+
+
+def report_watcher(projects, **kw):
+    kw.setdefault("budget", 500)
+    return watcher(projects, **kw)
+
+
+@pytest.mark.parametrize("word,code", REPORT_STATE_CASES)
+def test_every_state_in_the_contract_parses(word, code):
+    assert ib.parse_report(report_body(word, "doing the thing")) == \
+        (code, "doing the thing")
+
+
+def test_the_state_codes_are_appended_not_renumbered():
+    """firmware/src/data.h says the codes cross the BLE boundary, so they are
+    append-only. 12..16 go after SESSION_MESSAGE = 11."""
+    assert ib.STATE_MESSAGE == 11
+    assert [ib.STATE_REPORT_WORKING, ib.STATE_REPORT_NEEDS_YOU,
+            ib.STATE_REPORT_BLOCKED, ib.STATE_REPORT_DONE,
+            ib.STATE_REPORT_MORE] == [12, 13, 14, 15, 16]
+
+
+def test_only_two_states_mean_a_human_is_needed():
+    """The waiting bucket is what turns a card terra-cotta, sorts it first and
+    trips the auto-jump. WORKING and DONE must never be in it."""
+    assert set(ib.REPORT_WAITING_STATES) == {
+        ib.STATE_REPORT_NEEDS_YOU, ib.STATE_REPORT_BLOCKED}
+
+
+@pytest.mark.parametrize("line", [
+    "   CLAWDMETER-REPORT/1 NEEDS-YOU: waiting on you   ",
+    "clawdmeter-report/1 needs-you: waiting on you",
+    "CLAWDMETER-REPORT/1 NEEDS_YOU: waiting on you",
+    "CLAWDMETER-REPORT/1 NEEDS YOU: waiting on you",
+    "CLAWDMETER-REPORT/1   NEEDS-YOU   :   waiting on you",
+    "CLAWDMETER-REPORT/1 NEEDS-YOU waiting on you",
+    "\n\n  CLAWDMETER-REPORT/1 NEEDS-YOU: waiting on you",
+])
+def test_whitespace_and_spelling_are_forgiven(line):
+    """Strict about the match, forgiving about whitespace -- and about the
+    non-semantic dimensions an LLM will vary on its own."""
+    assert ib.parse_report(line) == (ib.STATE_REPORT_NEEDS_YOU, "waiting on you")
+
+
+@pytest.mark.parametrize("body", [
+    "Here is my report:\nCLAWDMETER-REPORT/1 DONE: finished",
+    "CLAWDMETER-REPORT/2 DONE: finished",
+    "CLAWDMETER-REPORT/1 MOSTLY-FINE: rebase done",
+    "CLAWDMETER-REPORT/1 DONE:",
+    "CLAWDMETER-REPORT/1 DONE",
+    "CLAWDMETER-REPORT/1",
+    "the report format is CLAWDMETER-REPORT/1 DONE: like this",
+    "just an ordinary message",
+    "",
+])
+def test_anything_off_contract_is_not_a_report(body):
+    assert ib.parse_report(body) is None
+
+
+def test_the_dispatchers_own_request_is_not_read_as_a_report():
+    """The request text necessarily CONTAINS the marker -- it is telling the
+    agent what to emit -- and it lands in the receiving transcript exactly
+    like any other message. Accepting the marker anywhere would draw a bogus
+    report card on every dispatch. This is the wording in daemon/REPORT.md."""
+    request = (
+        "Clawdmeter status check. Reply to the session that sent this, and "
+        "make your whole reply this one line: `CLAWDMETER-REPORT/1 <STATE>: "
+        "<summary>` - nothing before it, nothing after it, no code fence, no "
+        "backticks, no explanation.\n\n"
+        "`<STATE>` is exactly one of these four words: `WORKING`, "
+        "`NEEDS-YOU`, `BLOCKED`, `DONE`.\n"
+    )
+    assert ib.parse_report(request) is None
+
+
+def test_a_malformed_report_degrades_to_a_plain_message(projects):
+    """Never dropped, never guessed at: the words still reach the panel, on
+    the row kind they always had."""
+    bad = "CLAWDMETER-REPORT/1 MOSTLY-FINE: rebase done, force-push?"
+    path = transcript(projects)
+    append(path, [msg_record(bad, ts=NOW)])
+    w = report_watcher(projects)
+    w.poll()
+    rows = w.rows()
+    assert len(rows) == 1
+    assert rows[0][2] == ib.STATE_MESSAGE
+    assert rows[0][ib.MSG_FIELD_INDEX] == bad
+    assert not w.reports_live()
+
+
+def test_a_report_reaches_the_panel_end_to_end(projects):
+    path = transcript(projects)
+    append(path, [report_record("NEEDS-YOU", "rebase done - force-push?",
+                                sender="ORCHESTRATOR", ts=NOW - 7)])
+    w = report_watcher(projects)
+    w.poll()
+    row = w.rows()[0]
+    assert row[1] == "ORCHESTRATOR"
+    assert row[2] == ib.STATE_REPORT_NEEDS_YOU
+    assert row[3] == -1 and row[11] == -1 and row[12] == cs.REMOTE_UNKNOWN
+    assert row[4] == 7
+    assert row[ib.MSG_FIELD_INDEX] == "rebase done - force-push?"
+    assert len(row) == 14
+
+
+def test_the_arrival_and_processed_pair_is_still_one_report(projects):
+    """A report is recorded twice like any message; dedup is unchanged."""
+    path = transcript(projects)
+    append(path, both_records(report_body("DONE", "build is green"), ts=NOW))
+    w = report_watcher(projects)
+    w.poll()
+    assert len(w.rows()) == 1
+    assert w.rows()[0][2] == ib.STATE_REPORT_DONE
+
+
+def test_a_newer_report_replaces_that_agents_older_one(projects):
+    """One card per AGENT. Two states for one machine at once is worse than
+    one stale state, and a re-dispatch must refresh rather than double."""
+    path = transcript(projects)
+    append(path, [report_record("WORKING", "still going", ts=NOW - 60)])
+    w = report_watcher(projects)
+    w.poll()
+    append(path, [report_record("NEEDS-YOU", "ok now what?", ts=NOW - 1)])
+    w.poll()
+    rows = w.rows()
+    assert len(rows) == 1
+    assert rows[0][2] == ib.STATE_REPORT_NEEDS_YOU
+    assert rows[0][ib.MSG_FIELD_INDEX] == "ok now what?"
+
+
+def test_an_out_of_order_report_does_not_overwrite_a_newer_one(projects):
+    """Two transcripts read in one pass can yield an agent's replies in
+    either order; the newest must win regardless."""
+    path_a = transcript(projects, name="aaaaaaaa-1111-2222-3333-444444444444.jsonl")
+    path_b = transcript(projects, name="bbbbbbbb-1111-2222-3333-444444444444.jsonl")
+    append(path_a, [report_record("NEEDS-YOU", "newer", ts=NOW - 1,
+                                  session_id="s-a")])
+    append(path_b, [report_record("WORKING", "older", ts=NOW - 40,
+                                  session_id="s-b")])
+    w = report_watcher(projects)
+    w.poll()
+    rows = w.rows()
+    assert len(rows) == 1
+    assert rows[0][ib.MSG_FIELD_INDEX] == "newer"
+
+
+def test_the_sid_is_stable_per_agent_across_a_state_change(projects):
+    """The card keeps its identity while the state changes under it, which is
+    what makes WORKING -> NEEDS-YOU slide the existing card up. The notify set
+    still fires once, because only the waiting states are ever in it."""
+    path = transcript(projects)
+    append(path, [report_record("WORKING", "still going", ts=NOW - 60)])
+    w = report_watcher(projects)
+    w.poll()
+    first = w.rows()[0][0]
+    append(path, [report_record("NEEDS-YOU", "ok now what?", ts=NOW - 1)])
+    w.poll()
+    assert w.rows()[0][0] == first
+
+
+def test_report_sids_cannot_alias_a_message_or_session_sid():
+    """Message and session sids are both two hex characters and already share
+    one 256-value space. A third hex producer -- ten of them at once -- would
+    have made that worse, so report sids use a leading letter hex cannot
+    produce."""
+    sids = {ib.report_sid(f"AGENT-{i}") for i in range(200)}
+    assert all(s[0] in ib._SID_HEAD for s in sids)
+    assert all(s[0] not in "0123456789abcdef" for s in sids)
+    assert ib.MORE_SID[0] not in ib._SID_HEAD
+    assert len(sids) > 150, "the alphabet should spread, not clump"
+
+
+def test_the_summary_keeps_its_hangul_and_the_agent_name_does_not():
+    """Same asymmetry the message body has, for the same reason: only the
+    body's font carries the Hangul fallback."""
+    m = ib.Message("k1", NOW, "한국-데스크",
+                   "body", report_state=ib.STATE_REPORT_NEEDS_YOU,
+                   summary="빌드 끝났어요")
+    row = ib.report_row(m, NOW)
+    assert row[ib.MSG_FIELD_INDEX] == "빌드 끝났어요"
+    assert row[1] == "hanguk-deseukeu"
+
+
+def test_a_korean_report_survives_the_whole_pipeline(projects):
+    path = transcript(projects)
+    append(path, [report_record(
+        "NEEDS-YOU",
+        "빌드 끝났어요 머지할까요?",
+        ts=NOW)])
+    w = report_watcher(projects)
+    w.poll()
+    row = w.rows()[0]
+    assert row[2] == ib.STATE_REPORT_NEEDS_YOU
+    assert row[ib.MSG_FIELD_INDEX].startswith("빌드")
+    # Hangul is three bytes a syllable, and the wire counts bytes.
+    assert len(row[ib.MSG_FIELD_INDEX].encode("utf-8")) <= ib.report_text_max(500)
+
+
+def test_korean_reports_can_be_romanised_for_older_firmware(projects):
+    path = transcript(projects)
+    append(path, [report_record("DONE", "빌드 끝", ts=NOW)])
+    w = report_watcher(projects, keep_hangul=False)
+    w.poll()
+    assert "bild" in w.rows()[0][ib.MSG_FIELD_INDEX]
+
+
+def _report_rows(cases, budget=500, now=NOW):
+    """cases: (sender, state, summary, age) -> fitted wire rows."""
+    msgs = [ib.Message(f"m{i}", now - age, sender, "body",
+                       report_state=state, summary=summary)
+            for i, (sender, state, summary, age) in enumerate(cases)]
+    cap = ib.report_text_max(budget)
+    rows = [ib.report_row(m, now, cap) for m in msgs]
+    rows.sort(key=ib.row_rank)
+    return ib.fit_round(rows, budget)
+
+
+def test_reports_are_ordered_by_how_much_they_need():
+    """needs-you, blocked, message, done, working -- and the rank is what
+    protects the top of the list, because fitting drops from the tail."""
+    msg = ib.message_row(ib.Message("aa11", NOW - 5, "PEER", "hello"), NOW)
+    rows = _report_rows([
+        ("W", ib.STATE_REPORT_WORKING,   "compiling", 1),
+        ("D", ib.STATE_REPORT_DONE,      "finished", 2),
+        ("B", ib.STATE_REPORT_BLOCKED,   "allow Bash?", 3),
+        ("N", ib.STATE_REPORT_NEEDS_YOU, "which one?", 4),
+    ], budget=900)
+    merged = sorted(rows + [msg], key=ib.row_rank)
+    assert [r[2] for r in merged] == [
+        ib.STATE_REPORT_NEEDS_YOU, ib.STATE_REPORT_BLOCKED, ib.STATE_MESSAGE,
+        ib.STATE_REPORT_DONE, ib.STATE_REPORT_WORKING,
+    ]
+
+
+def test_two_reports_in_the_same_state_are_newest_first():
+    rows = _report_rows([
+        ("OLD", ib.STATE_REPORT_NEEDS_YOU, "asked ages ago", 300),
+        ("NEW", ib.STATE_REPORT_NEEDS_YOU, "asked just now", 3),
+    ], budget=900)
+    assert [r[1] for r in rows] == ["NEW", "OLD"]
+
+
+TEN_AGENTS = (
+    [("ORCHESTRATOR",  ib.STATE_REPORT_NEEDS_YOU, "rebase done - force-push to main?", 8),
+     ("WT-SESSIONS",   ib.STATE_REPORT_NEEDS_YOU, "two designs - which one do you want?", 20),
+     ("RAINCHECK-API", ib.STATE_REPORT_BLOCKED,   "permission prompt: allow Bash?", 33),
+     ("DOTFILES",      ib.STATE_REPORT_DONE,      "chezmoi apply finished clean", 44)]
+    + [(f"WORKER-{i}", ib.STATE_REPORT_WORKING, f"running task {i} of the sweep", 50 + i)
+       for i in range(6)]
+)
+
+
+def test_ten_agents_fit_the_recommended_budget_and_fill_the_device():
+    """500 bytes is the knee: five agent rows plus the marker, which is the
+    most SESSION_MAX_ROWS = 6 can ever draw. See daemon/REPORT.md."""
+    rows = _report_rows(TEN_AGENTS, budget=500)
+    assert len(rows) == ib.DEVICE_MAX_ROWS == 6
+    assert len(cs.encode_payload(rows).encode("utf-8")) <= 500
+    assert rows[-1][2] == ib.STATE_REPORT_MORE
+    assert rows[-1][1] == "+5 MORE"
+    assert rows[-1][ib.MSG_FIELD_INDEX] == "5 working"
+
+
+def test_the_needs_you_reports_are_never_the_ones_dropped():
+    for budget in (180, 220, 260, 320, 400, 500):
+        rows = _report_rows(TEN_AGENTS, budget=budget)
+        shown = [r for r in rows if r[2] != ib.STATE_REPORT_MORE]
+        assert shown, budget
+        assert shown[0][2] == ib.STATE_REPORT_NEEDS_YOU, budget
+        assert len(cs.encode_payload(rows).encode("utf-8")) <= budget, budget
+
+
+def test_the_default_budget_still_says_what_it_could_not_show():
+    """Ten agents at the conservative 180 shows one card -- and a footnote
+    that makes the other nine visible rather than silent."""
+    rows = _report_rows(TEN_AGENTS, budget=cs.DEFAULT_BUDGET_BYTES)
+    assert rows[-1][2] == ib.STATE_REPORT_MORE
+    assert rows[-1][1] == "+9 MORE"
+    assert rows[-1][ib.MSG_FIELD_INDEX] == \
+        "1 need you, 1 blocked, 1 done, 6 working"
+    assert len(cs.encode_payload(rows).encode("utf-8")) <= cs.DEFAULT_BUDGET_BYTES
+
+
+def test_the_marker_counts_messages_it_dropped_too():
+    msg = ib.message_row(ib.Message("aa11", NOW - 5, "PEER", "hello"), NOW)
+    rows = sorted(_report_rows(TEN_AGENTS, budget=900) + [msg], key=ib.row_rank)
+    fitted = ib.fit_round(rows, 200)
+    assert fitted[-1][2] == ib.STATE_REPORT_MORE
+    assert "msg" in fitted[-1][ib.MSG_FIELD_INDEX]
+
+
+def test_the_marker_is_never_itself_the_row_that_is_dropped():
+    """cs.fit_payload drops from the tail, and the tail IS the marker -- which
+    is exactly why the round is fitted here instead of there."""
+    rows = _report_rows(TEN_AGENTS, budget=40)
+    assert rows and rows[-1][2] == ib.STATE_REPORT_MORE
+
+
+def test_no_marker_when_everything_fitted():
+    rows = _report_rows(TEN_AGENTS[:3], budget=500)
+    assert len(rows) == 3
+    assert all(r[2] != ib.STATE_REPORT_MORE for r in rows)
+
+
+def test_report_text_max_scales_with_the_budget():
+    # 41 B at the recommended budget, which is why the dispatcher asks for
+    # 40 CHARACTERS: one byte of slack for an ASCII summary.
+    assert ib.report_text_max(500) == 41
+    assert ib.report_text_max(180) == ib.REPORT_TEXT_MIN
+    assert ib.report_text_max(10_000) == ib.REPORT_TEXT_MAX
+    assert ib.report_text_max("nonsense") == ib.REPORT_TEXT_MAX
+
+
+def test_a_long_summary_is_head_elided_not_dropped():
+    m = ib.Message("z1", NOW, "AGENT", "body",
+                   report_state=ib.STATE_REPORT_WORKING,
+                   summary="the first words are the ones worth the pixels " * 4)
+    text = ib.report_row(m, NOW, text_max=40)[ib.MSG_FIELD_INDEX]
+    assert text.startswith("the first words")
+    assert text.endswith(cs.ELLIPSIS)
+    assert len(text.encode("utf-8")) <= 40
+
+
+def test_a_report_round_evicts_session_cards_not_reports():
+    """Pressing the report button asked for the fleet, so a full round taking
+    the whole payload is the intended answer, not a bug."""
+    rows = _report_rows(TEN_AGENTS, budget=500)
+    payload = fleet.build_payload(_api(4), 500, inbox_rows=rows)
+    out = json.loads(payload)["ss"]
+    assert len(payload.encode("utf-8")) <= 500
+    assert [r[2] for r in out] == [r[2] for r in rows]
+
+
+def test_reports_can_be_read_as_ordinary_messages(projects):
+    """`reports = off` changes the interpretation, not the transport: the
+    words still reach the panel."""
+    path = transcript(projects)
+    append(path, [report_record("NEEDS-YOU", "which one?", ts=NOW)])
+    w = report_watcher(projects, reports=False)
+    w.poll()
+    rows = w.rows()
+    assert rows[0][2] == ib.STATE_MESSAGE
+    assert rows[0][ib.MSG_FIELD_INDEX] == report_body("NEEDS-YOU", "which one?")
+
+
+def test_reports_have_their_own_expiry_window(projects):
+    path = transcript(projects)
+    append(path, [report_record("WORKING", "compiling", ts=NOW - 240)])
+    w = report_watcher(projects, freshness_s=600, expire_s=180,
+                       report_expire_s=300)
+    w.poll()
+    assert len(w.rows()) == 1          # past the message window, inside its own
+    w.report_expire_s = 200
+    w.poll()
+    assert w.rows() == []
+
+
+def test_a_message_only_payload_is_untouched_by_the_report_path(projects):
+    """The report round is an added path, not a rewrite of the message one.
+    With no report live, rows() must be byte-identical to what it always
+    returned -- no reordering, no fitting, no marker."""
+    path = transcript(projects)
+    append(path, [msg_record("can you take a look at the C6 build?", ts=NOW - 4)])
+    w = report_watcher(projects)
+    w.poll()
+    rows = w.rows()
+    assert len(rows) == 1
+    assert rows[0][2] == ib.STATE_MESSAGE
+    assert cs.encode_payload(rows) == (
+        '{"ss":[["' + rows[0][0] + '","CLAWDMETER",11,-1,4,0,0,0,0,0,0,-1,-1,'
+        '"can you take a look at the C6 build?"]]}')
+
+
+def test_a_report_and_a_message_share_a_panel(projects):
+    path = transcript(projects)
+    append(path, [msg_record("hello there", sender="PEER", ts=NOW - 2),
+                  report_record("NEEDS-YOU", "which one?", ts=NOW - 9)])
+    w = report_watcher(projects)
+    w.poll()
+    rows = w.rows()
+    assert [r[2] for r in rows] == [ib.STATE_REPORT_NEEDS_YOU, ib.STATE_MESSAGE]
+
+
+def test_reports_are_configurable(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.write_text("reports = off\nreport_expire_s = 90\n", encoding="utf-8")
+    w = ib.watcher_from_config(500, str(cfg), roots=[])
+    assert w.reports is False
+    assert w.report_expire_s == 90
+    assert w.budget == 500
+    cfg.write_text("", encoding="utf-8")
+    w = ib.watcher_from_config(500, str(cfg), roots=[])
+    assert w.reports is True
+    assert w.report_expire_s == ib.DEFAULT_REPORT_EXPIRE_S
+
+
+def test_an_agent_can_report_the_same_state_twice(projects):
+    """The mid dedup remembers ids for at least 512 entries whatever their
+    age -- right for mail, fatal for a report: an agent re-reporting the same
+    words could never get its card back once the first had expired."""
+    path = transcript(projects)
+    append(path, [report_record("WORKING", "still compiling", ts=NOW - 400)])
+    w = report_watcher(projects, freshness_s=600, report_expire_s=300)
+    w.poll()
+    assert w.rows() == []                      # the first one expired
+    append(path, [report_record("WORKING", "still compiling", ts=NOW - 5)])
+    w.poll()
+    rows = w.rows()
+    assert len(rows) == 1
+    assert rows[0][2] == ib.STATE_REPORT_WORKING
+    assert rows[0][4] == 5                     # dated from the NEW record

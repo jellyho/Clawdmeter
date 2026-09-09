@@ -269,6 +269,14 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 
 Bash daemon (`daemon/claude-usage-daemon.sh`) reads OAuth token, polls Anthropic API, sends JSON over BLE GATT. Run with `systemctl --user start claude-usage-daemon`. The unit file's `ExecStart` is the absolute path to the script — repoint it when switching between the worktree and the main checkout.
 
+**Session rows and agent reports:** `daemon/FLEET.md` covers the remote-fleet
+poll and the cross-session message inbox; `daemon/REPORT.md` covers **agent
+reports** — a one-line contract (`CLAWDMETER-REPORT/1 <STATE>: <summary>`) an
+agent replies with, which the inbox turns into a message-shaped card whose
+*state* (wire codes 12–16, `SESSION_REPORT_*` in `data.h`) drives its colour,
+its sort bucket and the auto-jump. Report rounds want
+`sessions_budget_bytes = 500`; the arithmetic is in REPORT.md.
+
 **Discovery & resilience:**
 
 - Connects by name (`"Clawdmeter"`) on first run, caches resolved MAC at `~/.config/claude-usage-monitor/ble-address`. ESP32 BLE addresses are factory-burned per-chip, so swapping any board invalidates the cache.

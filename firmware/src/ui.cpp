@@ -708,6 +708,7 @@ static bool     s_notify_now_kind[SESSION_MAX_ROWS];
 static uint8_t  s_notify_now_n  = 0;
 static bool     s_new_notify    = false;  // a sid entered the set this payload
 static bool     s_new_notify_msg = false; // …and one of them is a message
+static bool     s_new_notify_report = false; // …or an agent report needing you
 static bool     s_focus_waiting = false;  // rows[0] waiting → drives the pulse
 static bool     s_chats_linger  = false;  // holding a chat view after the last chat closed
 static uint32_t s_chats_gone_ms = 0;
@@ -739,8 +740,30 @@ static bool sid_in_set(const char set[][3], const bool kind[], uint8_t n,
 }
 
 static int session_bucket(uint8_t state) {
-    if (state == SESSION_MESSAGE)
+    switch (state) {
+    case SESSION_MESSAGE:
         return SESSION_BUCKET_MESSAGE;
+    // An agent that says NEEDS-YOU or BLOCKED is a chat blocked on a human,
+    // which is exactly what the waiting bucket means — so it gets the accent,
+    // the pulse and the top of the list, and the auto-jump fires for it. That
+    // is the entire point of giving reports their own states instead of
+    // filing every reply under SESSION_MESSAGE. (What it does NOT get is the
+    // waiting LEVEL that holds the panel on this tab; see note_notify_set.)
+    case SESSION_REPORT_NEEDS_YOU:
+    case SESSION_REPORT_BLOCKED:
+        return SESSION_BUCKET_WAITING;
+    // Working and done both need nothing from the owner. Done is separated by
+    // its dot colour, not by a bucket: dimming it would put the rarer, more
+    // informative answer behind the expected one.
+    case SESSION_REPORT_WORKING:
+    case SESSION_REPORT_DONE:
+        return SESSION_BUCKET_WORKING;
+    // The overflow footnote recedes like an idle chat: the rows it is a
+    // footnote to are the ones worth looking at.
+    case SESSION_REPORT_MORE:
+        return SESSION_BUCKET_IDLE;
+    default: break;
+    }
     if (state >= SESSION_WAITING_PERMISSION && state <= SESSION_ERROR)
         return SESSION_BUCKET_WAITING;
     if (state >= SESSION_THINKING && state <= SESSION_COMPACTING)
@@ -750,8 +773,57 @@ static int session_bucket(uint8_t state) {
     return SESSION_BUCKET_WORKING;  // unknown future codes render neutral, never alarming
 }
 
+// Message cards and report cards share one anatomy (see chat_card_apply_kind)
+// and one sid namespace in the card pool; sessions are the other kind.
 static bool session_is_message(const SessionRow* r) {
-    return r->state == SESSION_MESSAGE;
+    return session_state_has_words(r->state);
+}
+
+// The word that makes a report card readable as a report at a glance. Drawn
+// in the state's own colour on the sender line, where a session card puts
+// nothing — so "has a chip" is what separates a report from plain mail, and
+// the chip's colour and text separate the four reports from each other.
+// Empty means no chip: an ordinary message, and the overflow row, whose own
+// label already carries its count.
+static const char* session_report_chip(uint8_t state) {
+    switch (state) {
+    case SESSION_REPORT_WORKING:   return "working";
+    case SESSION_REPORT_NEEDS_YOU: return "needs you";
+    case SESSION_REPORT_BLOCKED:   return "blocked";
+    case SESSION_REPORT_DONE:      return "done";
+    default:                       return "";
+    }
+}
+
+// The indicator colour for a card that has words. Reports borrow the session
+// card's own vocabulary rather than inventing one: accent = a human is
+// needed, COL_TEXT = running, dim = nothing here. Purple stays what it has
+// always been — another Claude talking to you — and green is the palette's
+// "finished" colour, already the usage bar's.
+static lv_color_t session_words_color(uint8_t state) {
+    switch (state) {
+    case SESSION_REPORT_NEEDS_YOU:
+    case SESSION_REPORT_BLOCKED:   return COL_ACCENT;
+    case SESSION_REPORT_WORKING:   return COL_TEXT;
+    case SESSION_REPORT_DONE:      return COL_GREEN;
+    case SESSION_REPORT_MORE:      return COL_DIM;
+    default:                       return COL_PURPLE;   // SESSION_MESSAGE
+    }
+}
+
+// The chip's own colour, which is NOT always the dot's. A session card draws
+// its indicator in COL_TEXT while it works and its state line in COL_DIM —
+// the dot says "alive", the words stay quiet — and the chip is words. So
+// "working" recedes to dim while its dot stays bright, and only the two
+// states that want your eye (accent) and the one that is news (green) are
+// allowed to be louder than the sender beside them.
+static lv_color_t session_chip_color(uint8_t state) {
+    switch (state) {
+    case SESSION_REPORT_NEEDS_YOU:
+    case SESSION_REPORT_BLOCKED:   return COL_ACCENT;
+    case SESSION_REPORT_DONE:      return COL_GREEN;
+    default:                       return COL_DIM;
+    }
 }
 
 static const char* const session_tool_names[] = {
@@ -769,6 +841,15 @@ static void session_state_text(const SessionRow* r, char* buf, size_t n) {
     // MSG_BODY_FONT and docs/fonts.md). Empty means a host that sends state 11
     // without index 13: say so rather than draw a blank line.
     case SESSION_MESSAGE:
+    // A report's summary lives in the same field and on the same line, for
+    // the same reason: where a session says what it is doing, a report says
+    // what its agent said it is doing. The difference is the chip beside the
+    // sender, not the words.
+    case SESSION_REPORT_WORKING:
+    case SESSION_REPORT_NEEDS_YOU:
+    case SESSION_REPORT_BLOCKED:
+    case SESSION_REPORT_DONE:
+    case SESSION_REPORT_MORE:
         snprintf(buf, n, "%s", r->msg[0] ? r->msg : "(no message text)");
         return;
     case SESSION_STARTING:   snprintf(buf, n, "starting");   return;
@@ -913,19 +994,25 @@ static int label_set_clamped(lv_obj_t* lbl, const char* txt,
 // pulse; the text never does.
 static int32_t pulse_val = (int32_t)LV_OPA_COVER;
 
+// On a session card the pulsing text is the STATE LINE — three words that
+// stay legible at 30% because you already know what they say. On a card with
+// words the same label is a whole sentence you have not read yet, and fading
+// it in and out is a card you cannot finish reading. So the words hold at
+// full brightness and the chip beside the sender pulses instead: same phase,
+// same accent, same "act on this", one thing you can actually read.
+static void pulse_card(ChatCard* c, int32_t v) {
+    lv_obj_set_style_bg_opa(c->dot, (lv_opa_t)v, 0);
+    lv_obj_set_style_text_opa(c->is_msg ? c->lbl_agents : c->lbl_state,
+                              (lv_opa_t)v, 0);
+}
+
 static void pulse_exec_cb(void* var, int32_t v) {
     (void)var;
     pulse_val = v;
     // Indicator and state text pulse together, in one shared phase.
     for (auto& c : chat_cards)
-        if (c.used && c.waiting) {
-            lv_obj_set_style_bg_opa(c.dot, (lv_opa_t)v, 0);
-            lv_obj_set_style_text_opa(c.lbl_state, (lv_opa_t)v, 0);
-        }
-    if (s_focus_waiting && focus_card.dot) {
-        lv_obj_set_style_bg_opa(focus_card.dot, (lv_opa_t)v, 0);
-        lv_obj_set_style_text_opa(focus_card.lbl_state, (lv_opa_t)v, 0);
-    }
+        if (c.used && c.waiting) pulse_card(&c, v);
+    if (s_focus_waiting && focus_card.dot) pulse_card(&focus_card, v);
 }
 
 // ---- Card motion callbacks (§2.3) ----
@@ -1127,6 +1214,7 @@ static const lv_font_t* msg_body_font(void) {
 #define MSG_GUTTER   18    // dot column; the body hangs under the sender text
 #define MSG_ROW_GAP  4     // sender row ↓ body
 #define MSG_MAX_LINES 3    // past three the card is a wall of text
+#define MSG_CHIP_GAP  14   // report chip ↔ age, on the sender row
 
 // A message is not a session with holes in it, so it does not borrow the
 // session composition and hide four of its five parts. It restacks the same
@@ -1164,6 +1252,14 @@ static void chat_card_apply_kind(ChatCard* c, bool msg) {
 
         lv_obj_set_style_text_font(c->lbl_elapsed, c->line_font, 0);
         lv_obj_align(c->lbl_elapsed, LV_ALIGN_BOTTOM_RIGHT, 0, c->text_dy);
+
+        // lbl_agents was a report chip: put the subagent-count badge back
+        // whole. Font, colour AND opacity — a card left mid-pulse would
+        // otherwise show a permanently half-faded count (layout_badge_cluster
+        // repositions it, so only the styling has to be undone here).
+        lv_obj_set_style_text_font(c->lbl_agents, c->line_font, 0);
+        lv_obj_set_style_text_color(c->lbl_agents, COL_PURPLE, 0);
+        lv_obj_set_style_text_opa(c->lbl_agents, LV_OPA_COVER, 0);
         return;
     }
 
@@ -1186,6 +1282,12 @@ static void chat_card_apply_kind(ChatCard* c, bool msg) {
     // "elapsed" is how long ago it arrived, which belongs with the sender,
     // not in the badge cluster the card no longer has.
     lv_obj_set_style_text_font(c->lbl_elapsed, c->name_font, 0);
+
+    // lbl_agents is the subagent COUNT on a session card and the report CHIP
+    // here — the same widget restacked, exactly as the other four are. It
+    // borrows the sender's font and sits on the sender's row; its icon
+    // (img_agents) stays hidden, since a word is its own badge.
+    lv_obj_set_style_text_font(c->lbl_agents, c->name_font, 0);
 }
 
 // How many body lines this card has room for under its sender row. Derived,
@@ -1226,6 +1328,14 @@ static void msg_card_layout(ChatCard* c, int used_lines) {
                  top + (from_h - MSG_DOT_SZ) / 2);
     lv_obj_align(c->lbl_state,   LV_ALIGN_TOP_LEFT,  MSG_GUTTER,
                  top + from_h + MSG_ROW_GAP);
+    // The chip rides the sender row, right-aligned against the age — the
+    // same cluster logic a session card's badges use, minus the chaining,
+    // because there is only ever one of them.
+    if (!lv_obj_has_flag(c->lbl_agents, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_update_layout(c->card);
+        lv_obj_align_to(c->lbl_agents, c->lbl_elapsed,
+                        LV_ALIGN_OUT_LEFT_MID, -MSG_CHIP_GAP, 0);
+    }
 }
 
 // Right-align the badge cluster: timer rightmost, subagent badge to its left,
@@ -1252,7 +1362,12 @@ static void layout_badge_cluster(ChatCard* c) {
 static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
     const int bucket = session_bucket(r->state);
     c->waiting = (bucket == SESSION_BUCKET_WAITING);
-    chat_card_apply_kind(c, bucket == SESSION_BUCKET_MESSAGE);
+    // The anatomy follows the WORDS, not the bucket: a report is a card with
+    // a sender and a sentence exactly like a message, and it is in the
+    // waiting bucket precisely so the rest of the card can take its colour
+    // and its sort from that. The two questions came apart the moment a
+    // message-shaped row stopped always being state 11.
+    chat_card_apply_kind(c, session_state_has_words(r->state));
 
     // Body text can be a whole message now, so the buffer is sized for one.
     char sbuf[SESSION_MSG_MAX + 8];
@@ -1268,7 +1383,34 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
         lv_obj_add_flag(c->img_todo, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(c->lbl_todo, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(c->img_agents, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(c->lbl_agents, LV_OBJ_FLAG_HIDDEN);
+
+        const lv_color_t wcol = session_words_color(r->state);
+        // The sender is purple on every card that has one, because every one
+        // of them IS another Claude. The overflow footnote is the exception:
+        // "+5 MORE" is a count this host wrote, not a peer, and giving it the
+        // sender colour would claim a machine of that name reported in.
+        lv_obj_set_style_text_color(c->lbl_name,
+            r->state == SESSION_REPORT_MORE ? COL_DIM : COL_PURPLE, 0);
+
+        // The report chip: the one thing on the card that says this is a
+        // status and not mail. An empty chip (a plain message, or the
+        // overflow footnote whose label already carries its count) hides the
+        // widget instead.
+        const char* chip = session_report_chip(r->state);
+        int chip_w = 0;   // rendered width + gap; 0 when there is no chip
+        if (chip[0]) {
+            set_label_if_changed(c->lbl_agents, chip);
+            lv_obj_set_style_text_color(c->lbl_agents, session_chip_color(r->state), 0);
+            lv_obj_set_style_text_opa(c->lbl_agents,
+                                      c->waiting ? (lv_opa_t)pulse_val : LV_OPA_COVER, 0);
+            lv_obj_clear_flag(c->lbl_agents, LV_OBJ_FLAG_HIDDEN);
+            lv_point_t csz;
+            lv_text_get_size(&csz, chip, c->name_font, 0, 0,
+                             LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+            chip_w = csz.x + MSG_CHIP_GAP;
+        } else {
+            lv_obj_add_flag(c->lbl_agents, LV_OBJ_FLAG_HIDDEN);
+        }
 
         // Age first, so the sender's ellipsis budget can be measured against
         // the width actually rendered next to it (same trick as the token
@@ -1278,7 +1420,20 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
         lv_point_t sz;
         lv_text_get_size(&sz, buf, c->name_font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
         const int cw = L.scr_w - 2 * CHAT_CARD_PAD_X;
-        const int nw = cw - MSG_GUTTER - sz.x - 12 /*min gap*/;
+        int nw = cw - MSG_GUTTER - sz.x - chip_w - 12 /*min gap*/;
+        // On a panel narrow enough that the three of them cannot share the
+        // row, the CHIP is what goes. The dot already carries the state in
+        // colour and the words say the rest, whereas a sender elided to "O..."
+        // stops telling you which machine reported — and only the sender can
+        // do that job. Today's session-view boards are all 480 px wide so this
+        // never fires; it is here so a 368 or 240 port turning the views on
+        // degrades instead of drawing a negative-width label.
+        if (chip_w && nw < cw / 3) {
+            lv_obj_add_flag(c->lbl_agents, LV_OBJ_FLAG_HIDDEN);
+            nw += chip_w;
+            chip_w = 0;
+        }
+        if (nw < 1) nw = 1;
         if (nw != c->name_w) {
             c->name_w = nw;
             lv_obj_set_width(c->lbl_name, nw);
@@ -1294,8 +1449,13 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
         msg_card_layout(c, lines);
         lv_obj_set_style_text_color(c->lbl_state, COL_TEXT, 0);   // the words are the point
         lv_obj_set_style_text_opa(c->lbl_state, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(c->dot, COL_PURPLE, 0);         // another Claude, as
-        lv_obj_set_style_bg_opa(c->dot, LV_OPA_COVER, 0);         // on the subagents badge
+        // Purple on a message (another Claude talking to you, as on the
+        // subagents badge); the state's own colour on a report, so a card
+        // that needs you carries the same terra-cotta a waiting chat does and
+        // reads as urgent from across the room.
+        lv_obj_set_style_bg_color(c->dot, wcol, 0);
+        lv_obj_set_style_bg_opa(c->dot,
+                                c->waiting ? (lv_opa_t)pulse_val : LV_OPA_COVER, 0);
         return;
     }
 
@@ -1848,19 +2008,36 @@ static void note_notify_set(const SessionList* list) {
     s_notify_now_n = 0;
     s_new_notify   = false;
     s_new_notify_msg = false;
+    s_new_notify_report = false;
     bool any_waiting = false;
     for (int i = 0; list && i < list->count && s_notify_now_n < SESSION_MAX_ROWS; i++) {
         const SessionRow* r = &list->rows[i];
         const int bucket = session_bucket(r->state);
         if (bucket != SESSION_BUCKET_WAITING && bucket != SESSION_BUCKET_MESSAGE) continue;
-        const bool is_msg = (bucket == SESSION_BUCKET_MESSAGE);
+        // The kind bit is the CARD ANATOMY, not the bucket: a report is in
+        // the waiting bucket and still shares the message card's sid
+        // namespace, so that is what has to travel with the sid here (see
+        // s_notify_sids on why a sid alone is not an identity).
+        const bool has_words = session_state_has_words(r->state);
+        const bool is_report = has_words && r->state != SESSION_MESSAGE;
         snprintf(s_notify_now[s_notify_now_n], sizeof(s_notify_now[0]), "%s", r->sid);
-        s_notify_now_kind[s_notify_now_n] = is_msg;
-        if (!sid_in_set(s_notify_sids, s_notify_kind, s_notify_n, r->sid, is_msg)) {
+        s_notify_now_kind[s_notify_now_n] = has_words;
+        if (!sid_in_set(s_notify_sids, s_notify_kind, s_notify_n, r->sid, has_words)) {
             s_new_notify = true;
-            if (is_msg) s_new_notify_msg = true;
+            if (is_report)       s_new_notify_report = true;
+            else if (has_words)  s_new_notify_msg = true;
         }
-        if (!is_msg) any_waiting = true;
+        // A REPORT does not hold the level either, and for a sharper reason
+        // than a message does. The level is what the auto-return waits on: it
+        // means "a session is STILL blocked on you", and it clears when the
+        // host says the session moved. A report has no such falling edge —
+        // the host cannot see the remote agent at all, it only knows what
+        // that agent said N seconds ago, and the row goes away by EXPIRY. So
+        // holding the level would pin the panel on this tab for the whole
+        // report window, and an agent that never reports again would pin it
+        // for good. It gets the accent, the pulse, the top of the list and
+        // one auto-jump; it does not get to own the screen.
+        if (!has_words) any_waiting = true;
         s_notify_now_n++;
     }
     // A message joins the set (so it gets its one rising edge, and only one)
@@ -1919,11 +2096,14 @@ static void maybe_auto_jump(void) {
         show_screen(SCREEN_SESSIONS, false);             // not manual: keeps the claim
         s_auto_jumped  = true;
         s_auto_jump_ms = lv_tick_get();
-        Serial.println(s_new_notify_msg
+        Serial.println(s_new_notify_report
+            ? "An agent reported that it needs you — auto-jump to the sessions tab"
+            : s_new_notify_msg
             ? "Message from another Claude session — auto-jump to the sessions tab"
             : "Session needs you — auto-jump to the sessions tab");
-        // Nothing is WAITING, so this jump was mail: arm the return now.
-        // sessions_tick() still holds the dwell, and any touch disarms it.
+        // Nothing is WAITING, so this jump was mail or an agent report —
+        // neither of which will ever produce a falling edge. Arm the return
+        // now; sessions_tick() still holds the dwell, and any touch disarms it.
         if (!s_any_notify) s_auto_return_due = true;
     } else if (falling && s_auto_jumped) {
         s_auto_return_due = true;                        // sessions_tick() finishes it
@@ -1957,6 +2137,7 @@ static void sessions_link_lost(void) {
     s_notify_now_n    = 0;
     s_new_notify      = false;
     s_new_notify_msg  = false;
+    s_new_notify_report = false;
     s_focus_waiting   = false;
     s_chats_linger    = false;
     s_auto_jumped     = false;

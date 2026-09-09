@@ -154,8 +154,10 @@ static void utf8_drop_partial_tail(char* s) {
 //           remote,msg],...]}
 // Trailing fields are optional — the wire is append-only, so each was added by
 // a later host and every index past the guard below defaults to "unknown"
-// rather than to a confident value. `msg` (13) rides only on SESSION_MESSAGE
-// rows; `remote` (12) is parsed by nothing here yet and is skipped on purpose.
+// rather than to a confident value. `msg` (13) rides on the rows that have
+// WORDS — a message body or an agent report's summary
+// (session_state_has_words) — and `remote` (12) is parsed by nothing here yet
+// and is skipped on purpose.
 // Returns false on a malformed payload — caller keeps the last good list.
 static bool parse_sessions(const char* json, SessionList* out) {
     JsonDocument doc;
@@ -192,8 +194,9 @@ static bool parse_sessions(const char* json, SessionList* out) {
         // Index 11 (tok, 1k units) was appended after the first host release —
         // absent on older hosts, so out-of-range reads default to "unknown".
         r->tok       = (int32_t)(row[11]      | -1);
-        // Index 13 (message body) rides ONLY on SESSION_MESSAGE rows: session
-        // rows stay 13 fields long, and a host without the inbox watcher never
+        // Index 13 (the card's words) rides only on rows that have any:
+        // a message body, or an agent report's one-line summary. Session rows
+        // stay 13 fields long, and a host without the inbox watcher never
         // sends it at all. An out-of-range or non-string index yields "" here,
         // so absent means empty rather than whatever was in the row before —
         // the same defaulting the short-row guard above relies on.

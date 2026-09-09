@@ -351,12 +351,16 @@ def select_rows(api_rows, exclude_ids=None, show_offline=False):
 # ---------------------------------------------------------------------------
 
 def merge_rows(api_rows, exclude_ids=None, show_offline=False, inbox_rows=None):
-    """Message rows FIRST, then the remote sessions.
+    """Inbox rows FIRST (messages and agent reports), then the remote sessions.
 
     Messages jump the attention-first sort rather than being fed through it:
     a message is a person asking for something, which outranks any machine
     state, and the sort key it would need does not exist (state_bucket() lives
-    in the sidecar and puts an unknown code in the idle bucket).
+    in the sidecar and puts an unknown code in the idle bucket). Reports ride
+    the same lane and are already rank-sorted among themselves by
+    inbox.row_rank; a full report round can legitimately fill the payload and
+    evict every session card, which is what pressing the report button asked
+    for.
 
     Order matters for more than looks -- cs.fit_payload() drops from the TAIL
     when the byte budget runs out, so putting messages first is also what
@@ -388,7 +392,11 @@ def poll_once(budget, show_offline=False, opener=None, token=None, watcher=None)
     inbox_rows = []
     if watcher is not None:
         watcher.poll()
-        inbox_rows = watcher.rows()
+        # The budget goes in explicitly: a report ROUND is fitted by the
+        # watcher itself (inbox.fit_round), because cs.fit_payload below drops
+        # from the tail and the tail of a round is the marker that says what
+        # was dropped.
+        inbox_rows = watcher.rows(budget=budget)
     token = token or read_token()
     if not token:
         log("no OAuth token found -- log in with `claude` first")
@@ -446,7 +454,7 @@ def run_loop(budget, show_offline=False, watcher=None, tick_s=TICK_S,
         inbox_rows = []
         if watcher is not None:
             watcher.poll()
-            inbox_rows = watcher.rows(now)
+            inbox_rows = watcher.rows(now, budget=budget)
         rows = merge_rows(api_rows, exclude, show_offline, inbox_rows)
 
         # Stay quiet only until this loop has published something. The guard

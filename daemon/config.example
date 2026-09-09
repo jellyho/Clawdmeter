@@ -59,3 +59,26 @@ clock = off
 # until the payload fits. Keep below the BLE MTU the device negotiates; the
 # default is conservative and fits 3-4 chat rows.
 # sessions_budget_bytes = 180
+
+# ---------------------------------------------------------------------------
+# Agent reports (daemon/REPORT.md) — status check-ins from the fleet
+# ---------------------------------------------------------------------------
+# A cross-session message whose body opens with `CLAWDMETER-REPORT/1 STATE:
+# summary` becomes a status card instead of an anonymous message row: the
+# state drives the dot colour, the sort and the auto-jump. Anything that does
+# not match the contract stays an ordinary message, unchanged.
+#
+# `off` reads report replies as the plain messages they are made of. The words
+# still reach the panel; only the state colouring goes away.
+# reports = on
+
+# How long an agent report stays on the panel (seconds). Longer than a
+# message's 180 s because a report is a snapshot you asked for -- but bounded,
+# because the host cannot see the agent change its mind.
+# report_expire_s = 300
+
+# Report rounds want a bigger payload than the conservative default: ten
+# agents can answer at once, the device draws six rows, and 500 bytes is what
+# fits five reports plus the "+N MORE" marker in ONE ATT write at the 517-byte
+# MTU the firmware requests. See daemon/REPORT.md for the arithmetic.
+# sessions_budget_bytes = 500

@@ -26,6 +26,12 @@ Two sources, one payload. The remote-session rows come from the API poll
 below; the message rows come from `clawdmeter_inbox.py`, which is documented
 in [its own section](#messages-from-other-claude-code-sessions).
 
+A message whose body matches the contract in [REPORT.md](REPORT.md) is an
+**agent report** — the same row, a different state code, and a card that says
+what that agent is doing and whether it needs you. Everything below about how
+mail is found, folded, deduped and budgeted applies to reports unchanged;
+REPORT.md covers only what is different.
+
 ## Read this before you turn it on
 
 The listing endpoint is **internal and undocumented**. It appears nowhere in
@@ -388,6 +394,8 @@ then immediately expired by the 180 s default.
 | `inbox_max_rows` | `2` | Concurrent message rows. The per-message text shortens when two are live so both fit — and the count is capped to **1** while `sessions_budget_bytes` is under 200, because two rows there leave no room for a session card. |
 | `inbox_translit` | `on` | `off` drops non-ASCII instead of transliterating it. |
 | `inbox_hangul` | `on` | `off` romanises Korean message bodies instead of sending them as Hangul. Set it when the device is running firmware older than `font_nanum_kr_28`, which draws Hangul as empty boxes. Sender names and session labels are always romanised — their fonts have no Hangul fallback. |
+| `reports` | `on` | `off` reads agent reports as ordinary messages. See [REPORT.md](REPORT.md#config). |
+| `report_expire_s` | `300` | How long an agent report stays on the panel. |
 
 The watcher reads `config_dirs` (shared with the daemons) the same way the hook
 sidecar does, so extra Claude config dirs are watched too.
@@ -400,7 +408,7 @@ new **trailing** field:
 | # | Field | Value on a message row |
 | - | --- | --- |
 | 1 | `label` | the sender's `from-name` |
-| 2 | `state` | **11** — new state code, `SESSION_MESSAGE`. Appended after `SESSION_ENDED = 10` in `firmware/src/data.h`; the codes are append-only because they cross the BLE boundary |
+| 2 | `state` | **11** — new state code, `SESSION_MESSAGE`. Appended after `SESSION_ENDED = 10` in `firmware/src/data.h`; the codes are append-only because they cross the BLE boundary. Agent reports reuse this same row with codes **12–16** — see [REPORT.md](REPORT.md#wire-format) |
 | 3, 11 | `ctx`, `tok` | `-1` — not applicable to a message |
 | 4 | `elapsed_s` | age of the message |
 | 12 | `remote` | `-1` (unknown) — Remote Control is meaningless for a message |
