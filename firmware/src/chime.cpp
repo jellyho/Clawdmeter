@@ -32,10 +32,60 @@ static bool es8311_setup(void) {
     return true;
 }
 
+// ---- The volume preview ----------------------------------------------------
+// A prefix of the same clip rather than a second asset. The bell opens with
+// 48 ms of silence, one struck note that has decayed to a third of its attack
+// by 150 ms, and a second note starting at 175 ms — so 170 ms is exactly one
+// whole note and no fragment of the next. The last 20 ms ramp to zero: cutting
+// PCM mid-cycle steps the DAC to silence in one sample, which is a click.
+#define PREVIEW_MS      170
+#define PREVIEW_FADE_MS 20
+#define PCM_FRAME_BYTES 4          // 16-bit stereo
+
+// The clip lives in .rodata (memory-mapped flash) and is byte-addressed, so
+// samples are assembled a byte at a time: a uint16_t load off an odd address
+// is not something to rely on across two CPU families.
+static inline int16_t pcm_sample(const uint8_t* p) {
+    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+// Stream `frames` frames from `src`, ramping the gain linearly to zero across
+// the whole span. Chunked through a small stack buffer so the fade costs
+// bounded stack rather than a 3.5 KB allocation on a board with none to spare.
+static void write_faded(const uint8_t* src, uint32_t frames) {
+    if (!frames) return;
+    int16_t buf[128 * 2];
+    uint32_t done = 0;
+    while (done < frames) {
+        uint32_t n = frames - done;
+        if (n > 128) n = 128;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint8_t* f = src + (uint32_t)(done + i) * PCM_FRAME_BYTES;
+            const int32_t gain = (int32_t)(frames - (done + i));   // frames..1
+            buf[i * 2]     = (int16_t)((int32_t)pcm_sample(f)     * gain / (int32_t)frames);
+            buf[i * 2 + 1] = (int16_t)((int32_t)pcm_sample(f + 2) * gain / (int32_t)frames);
+        }
+        i2s.write((uint8_t*)buf, n * PCM_FRAME_BYTES);
+        done += n;
+    }
+}
+
 static void chime_task(void* arg) {
+    const bool preview = (arg != nullptr);
     if (cfg.amp_enable) cfg.amp_enable(true);
     delay(8);                                  // let the amp settle (avoids turn-on pop)
-    i2s.write((uint8_t*)bell_pcm, bell_pcm_len);
+    if (preview) {
+        const uint32_t total = (uint32_t)cfg.sample_rate * PREVIEW_MS / 1000;
+        const uint32_t fade  = (uint32_t)cfg.sample_rate * PREVIEW_FADE_MS / 1000;
+        uint32_t frames = total;
+        const uint32_t have = bell_pcm_len / PCM_FRAME_BYTES;
+        if (frames > have) frames = have;      // a shorter clip than the prefix
+        const uint32_t flat = frames > fade ? frames - fade : 0;
+        if (flat) i2s.write((uint8_t*)bell_pcm, flat * PCM_FRAME_BYTES);
+        write_faded(bell_pcm + flat * PCM_FRAME_BYTES, frames - flat);
+    } else {
+        i2s.write((uint8_t*)bell_pcm, bell_pcm_len);
+    }
     delay(20);
     if (cfg.amp_enable) cfg.amp_enable(false);
     playing = false;
@@ -61,12 +111,18 @@ bool chime_init(const ChimeConfig& c) {
     return true;
 }
 
-void chime_play(void) {
+// The task argument is the whole difference between the two: non-null means
+// "play the preview prefix". One task, one guard, one amp-enable sequence.
+static void chime_start(bool preview) {
     if (!ready || playing) return;
     playing = true;
-    if (xTaskCreatePinnedToCore(chime_task, "chime", 4096, nullptr, 1, nullptr, 0) != pdPASS)
+    if (xTaskCreatePinnedToCore(chime_task, "chime", 4096,
+                                preview ? (void*)1 : nullptr, 1, nullptr, 0) != pdPASS)
         playing = false;   // couldn't spawn — stay silent rather than wedge the flag
 }
+
+void chime_play(void)         { chime_start(false); }
+void chime_play_preview(void) { chime_start(true); }
 
 void chime_set_volume(uint8_t volume) {
     if (!codec) return;                       // no codec on this board, or init failed

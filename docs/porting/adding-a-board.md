@@ -23,7 +23,7 @@ At minimum:
 
 Optional:
 
-- A second physical button (e.g. for HID Shift+Tab mode toggle).
+- A second physical button (the report button: asks the host for a fleet round).
 - An AXP2101 PMU for battery monitoring + a power button.
 - A QMI8658 (or compatible) IMU for automatic rotation.
 - An XCA9554 / PCA9554 IO expander if reset / enable lines are routed

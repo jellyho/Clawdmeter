@@ -25,15 +25,32 @@
 static UsageData usage = {};
 
 // ---- LVGL draw buffers (partial render mode) ----
-// PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
-// boards (e.g. ESP32-C6) allocate from internal SRAM, so we shrink the strip
-// — 480×20 RGB565 = 19 KB × 2 buffers = 38 KB, fits beside everything else.
+// PSRAM-equipped boards (S3) can comfortably hold larger strips and keep the
+// classic two of them. PSRAM-free boards (e.g. ESP32-C6) allocate from
+// internal SRAM and get ONE buffer of twice the height instead — the same
+// 38 KB, spent on half as many strips.
+//
+// The second buffer was never doing anything: my_flush_cb pushes a strip with
+// a BLOCKING display_hal_draw_bitmap() and calls lv_display_flush_ready() the
+// moment it returns, so LVGL never has a transfer in flight to render against.
+// What the same bytes DO buy, spent on one taller strip, is fewer passes over
+// the scene — everything LVGL does per strip is paid that many fewer times:
+// the object-tree walk, each label's per-strip setup, every glyph that
+// straddles a boundary being expanded from 4bpp twice, the cards'
+// rounded-corner masks, and one panel address-window command per flush.
+// Measured on the C6 chat list: 17 strips per frame became 9, and render went
+// from 72.9 ms to 54 ms before any of the drawing itself got cheaper.
+//
+// The PSRAM boards are left as they were because none was on the bench to
+// re-measure; the same trade is available to them.
 #ifdef BOARD_HAS_PSRAM
 #define BUF_LINES 40
 #define LV_BUF_CAPS (MALLOC_CAP_SPIRAM)
+#define LV_BUF_COUNT 2
 #else
-#define BUF_LINES 20
+#define BUF_LINES 40
 #define LV_BUF_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#define LV_BUF_COUNT 1
 #endif
 static uint16_t* buf1 = nullptr;
 static uint16_t* buf2 = nullptr;
@@ -312,7 +329,9 @@ void setup() {
     lv_tick_set_cb(my_tick);
 
     buf1 = (uint16_t*)heap_caps_malloc(W * BUF_LINES * 2, LV_BUF_CAPS);
+#if LV_BUF_COUNT > 1
     buf2 = (uint16_t*)heap_caps_malloc(W * BUF_LINES * 2, LV_BUF_CAPS);
+#endif
 
     lv_display_t* disp = lv_display_create(W, H);
     lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
@@ -412,14 +431,22 @@ void loop() {
     if (!idle_is_asleep()) display_hal_tick();
 
     // ---- Physical buttons ----
-    //   PRIMARY   → HID Space  (Claude Code voice-mode PTT)
-    //   SECONDARY → HID Shift+Tab  (mode toggle; only if the board has one)
+    //   PRIMARY   → HID Space, on press AND release. Hold-to-talk: Claude
+    //               Code's voice mode wants the key held down, not tapped.
+    //   SECONDARY → report round, on the PRESS edge only (boards with a second
+    //               button). Not a keystroke: it asks the host over the data
+    //               link for a round of the fleet and the replies come back as
+    //               cards. It used to send HID Shift+Tab, which typed into
+    //               whatever window happened to have focus every time you
+    //               asked for a report — that is gone, not made conditional.
     //   PWR       → on splash: cycle animations; on usage: cycle brightness;
     //               hold ~3s + release: pairing mode
     // First press from sleep is consumed as a wake-only event by
     // idle_consume_wake_press(); the normal action fires from the second
     // press. Activity bookkeeping happens inside idle_consume_wake_press
-    // so no separate idle_note_activity() call is needed here.
+    // so no separate idle_note_activity() call is needed here. That gate
+    // matters most on the report button: a round costs real quota, so waking
+    // the panel must never spend one.
     {
         static bool primary_was = false;
         static bool primary_wake_swallowed = false;
@@ -435,18 +462,15 @@ void loop() {
             primary_was = primary_now;
         }
 
+        // The report button. One edge, one event, no release half — so the
+        // "did I swallow this press?" latch the HID path needed has nothing
+        // left to do and went with it.
         if (board_caps().button_count >= 2) {
             static bool secondary_was = false;
-            static bool secondary_wake_swallowed = false;
             bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
             if (secondary_now != secondary_was) {
-                if (secondary_now) {
-                    if (idle_consume_wake_press()) secondary_wake_swallowed = true;
-                    else                            ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
-                } else {
-                    if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
-                }
+                if (secondary_now && !idle_consume_wake_press())
+                    ble_send_report_request();
                 secondary_was = secondary_now;
             }
         }
@@ -486,12 +510,26 @@ void loop() {
     // The settings screen writes straight to NVS, so the cheapest way to notice
     // a volume change is to compare it here rather than thread a callback back
     // out of the UI. One byte compare per iteration.
+    //
+    // A change also PLAYS the new level, because a row that reads "High" tells
+    // you nothing until you have heard it and the only other way to find out
+    // was to wait for the next session reset. It is a sample, not the chime:
+    // sound_hal_play_preview() cuts the same clip to its first note (~170 ms),
+    // so a press is answered immediately and three presses in a row don't stack
+    // into three overlapping bells.
+    //
+    // Two cases stay silent. The first pass after boot is not a change —
+    // setup() already applied the stored level and the user chose nothing — so
+    // it seeds the comparison and makes no sound. And with Sound off there is
+    // nothing to preview: the chime this is the volume OF would never play.
     {
-        static uint8_t applied_volume = 0xFF;
+        static uint8_t applied_volume = 0xFF;   // 0xFF: nothing applied yet
         uint8_t v = settings_volume();
         if (v != applied_volume) {
+            const bool first = (applied_volume == 0xFF);
             applied_volume = v;
             sound_hal_set_volume(v);
+            if (!first && settings_sound_enabled()) sound_hal_play_preview();
         }
     }
 

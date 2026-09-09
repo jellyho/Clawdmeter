@@ -28,6 +28,7 @@ LV_FONT_DECLARE(font_mono_18);
 struct Layout {
     int16_t scr_w, scr_h;
     int16_t margin;
+    int16_t overscroll_max;          // how far a list may rubber-band past an end
     int16_t title_y;
     int16_t content_y;
     int16_t content_w;
@@ -88,6 +89,13 @@ static void compute_layout(const BoardCaps& c) {
     L.scr_h = c.height;
     L.margin = 20;
     L.title_y = 30;
+    // The rubber band is a signal, not a journey: enough travel to read as
+    // elastic, not enough to pull a whole card clear of the edge. Scaled with
+    // the panel like everything else here, and clamped so a 240 px port still
+    // gets a visible one and a 502 px port doesn't get a slack one.
+    L.overscroll_max = c.height / 20;
+    if (L.overscroll_max < 12) L.overscroll_max = 12;
+    if (L.overscroll_max > 24) L.overscroll_max = 24;
 
     // Values shared by the two original breakpoints; the small branch below
     // overrides them wholesale.
@@ -402,6 +410,43 @@ static void global_click_cb(lv_event_t* e);
 // navigation (swipe / tap / button) from a firmware-initiated one (auto-jump).
 static void show_screen(screen_t screen, bool manual);
 
+// ---- Overscroll: a short rubber band, not a long one ----
+// LVGL's elastic overscroll has no depth limit. It divides a drag past either
+// end by a fixed factor and then lets you keep pulling, and a flick that
+// reaches the end throws a long way beyond it before easing back — far enough
+// on a 480 px panel to leave most of a card's worth of empty space showing.
+//
+// The bounce itself is worth keeping: it is what says "that was the last one",
+// where a list that stops dead reads as a list that is stuck. It is the
+// DISTANCE that is wrong, so this caps it rather than turning it off.
+//
+// It caps it by taking LVGL's own elastic away at the cap and giving it back
+// on the way home, which is the one move that does not fight the scroller.
+// Pulling the content back with lv_obj_scroll_by() — the obvious
+// implementation, and the first one here — puts this in a feedback loop with
+// LVGL's elastic and throw handling: measured on the C6 it turned a steady 2
+// invalidations per frame into bursts of up to 594, past LV_INV_BUF_SIZE, at
+// which point LVGL gives up and repaints the whole 480x480 screen. Frames of
+// ~225 ms, a worse stutter than the long bounce it was fixing. With the flag
+// cleared instead, lv_indev_scroll's elastic_diff() simply declines to move
+// the content further out and the band holds where it is; nothing is scrolled
+// from out here, so there is no loop to get into. Release still eases back to
+// the edge — that path does not consult the flag.
+//
+// Called from ui_tick_anim(), so the state is read one frame after the drag
+// that caused it: the band can overshoot the cap by a single frame's worth of
+// give before it locks, which if anything reads softer than a hard wall.
+static void clamp_overscroll(lv_obj_t* cont) {
+    if (!cont) return;
+    const int32_t max = L.overscroll_max;
+    // Negative means "pulled past this end by that many pixels".
+    const bool at_cap = lv_obj_get_scroll_top(cont)    < -max ||
+                        lv_obj_get_scroll_bottom(cont) < -max;
+    const bool elastic = lv_obj_has_flag(cont, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    if (at_cap && elastic)        lv_obj_remove_flag(cont, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    else if (!at_cap && !elastic) lv_obj_add_flag(cont, LV_OBJ_FLAG_SCROLL_ELASTIC);
+}
+
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
     lv_obj_set_pos(panel, x, y);
@@ -638,6 +683,10 @@ struct ChatCard {
     bool used;
     bool waiting;
     bool claimed;           // per-update matching scratch
+    // Is this card on the receding IDLE tier? Carried on the card because the
+    // tier lives in the COLOURS now, not in an opacity layer (see card_col),
+    // so every colour the card paints has to know about it.
+    bool dim;
     // The card has two anatomies now — session and message (§ chat_card_apply
     // _kind). Cards are pooled by sid, so the same widget set can be a session
     // card one payload and a message card the next: the session geometry has
@@ -1031,10 +1080,69 @@ static void card_y_anim_cb(void* obj, int32_t v)   { lv_obj_set_y((lv_obj_t*)obj
 static void card_opa_anim_cb(void* obj, int32_t v) { lv_obj_set_style_opa((lv_obj_t*)obj, (lv_opa_t)v, 0); }
 static void card_fadeout_done_cb(lv_anim_t* a)     { lv_obj_add_flag((lv_obj_t*)a->var, LV_OBJ_FLAG_HIDDEN); }
 
-// Idle cards recede wholesale (§3): plain opa on the card fades labels, bar
-// and both icons through the recursive style lookup.
-static lv_opa_t session_tier_opa(uint8_t state) {
-    return session_bucket(state) == SESSION_BUCKET_IDLE ? LV_OPA_60 : LV_OPA_COVER;
+// ---- The idle tier, without an opacity layer (§3) ----
+// An idle card recedes to 60%. That used to be plain `opa` on the CARD, which
+// LVGL resolves recursively down the draw path — so the panel fill, every
+// glyph, the context bar and both icons were each ALPHA-BLENDED against what
+// was behind them, on every strip of every frame the list scrolls. Measured on
+// the C6: 8.5 ms of a 73 ms render, for pixels that are reachable with no
+// blending at all.
+//
+// Drawing colour X at opacity a over background B lands on the same pixel as
+// drawing lv_color_mix(X, B, a) opaque — and it still holds at the antialiased
+// edge of a glyph, where coverage c gives a·c·X + (1-a·c)·B either way. So the
+// tier is baked into the COLOURS: identical output, plain fills.
+//
+// What it costs is that a colour can no longer be written straight onto a card
+// widget — it goes through card_col() — and that the build-time defaults have
+// to be re-applied whenever a card crosses the tier boundary, which is
+// chat_card_refresh_tier()'s whole job.
+#define CARD_DIM_OPA LV_OPA_60
+
+static bool session_tier_is_dim(uint8_t state) {
+    return session_bucket(state) == SESSION_BUCKET_IDLE;
+}
+
+// The card's own fill, pre-blended against the screen behind it.
+static lv_color_t card_bg_col(const ChatCard* c) {
+    return c->dim ? lv_color_mix(COL_PANEL, COL_BG, CARD_DIM_OPA) : COL_PANEL;
+}
+
+// Anything drawn ON the card blends against that already-dimmed fill.
+static lv_color_t card_col(const ChatCard* c, lv_color_t col) {
+    return c->dim ? lv_color_mix(col, card_bg_col(c), CARD_DIM_OPA) : col;
+}
+
+// Re-state every colour the card was BUILT with, at the current tier. Only the
+// ones that change per update (the dot, the state line, a message's sender and
+// report chip) go through card_col() where they are set; these are the ones
+// build_chat_card wrote once and nothing has touched since, so crossing the
+// tier boundary is the only moment they are wrong.
+static void chat_card_refresh_tier(ChatCard* c) {
+    if (!c->card) return;
+    lv_obj_set_style_bg_color(c->card, card_bg_col(c), 0);
+    lv_obj_set_style_text_color(c->lbl_name,
+        card_col(c, c->is_msg ? COL_PURPLE : COL_TEXT), 0);
+    if (c->lbl_ctx) lv_obj_set_style_text_color(c->lbl_ctx, card_col(c, COL_TEXT), 0);
+    lv_obj_set_style_bg_color(c->bar, card_col(c, COL_BAR_BG), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(c->bar, card_col(c, COL_DIM), LV_PART_INDICATOR);
+    lv_obj_set_style_image_recolor(c->img_todo,   card_col(c, COL_ACCENT), 0);
+    lv_obj_set_style_image_recolor(c->img_agents, card_col(c, COL_PURPLE), 0);
+    lv_obj_set_style_text_color(c->lbl_todo,    card_col(c, COL_ACCENT), 0);
+    lv_obj_set_style_text_color(c->lbl_elapsed, card_col(c, COL_DIM), 0);
+    // On a message card lbl_agents is the report chip and carries the state's
+    // own colour, set per update; on a session card it is the subagent count.
+    if (!c->is_msg)
+        lv_obj_set_style_text_color(c->lbl_agents, card_col(c, COL_PURPLE), 0);
+    if (c->focus) {
+        // ONE-CHAT extras — they hang off focus_card.card, so they dim with it.
+        if (focus_lbl_model) {
+            lv_obj_set_style_text_color(focus_lbl_model, card_col(c, COL_TEXT), 0);
+            lv_obj_set_style_bg_color(focus_lbl_model, card_col(c, COL_BAR_BG), 0);
+        }
+        if (focus_lbl_ctx) lv_obj_set_style_text_color(focus_lbl_ctx, card_col(c, COL_TEXT), 0);
+        if (focus_lbl_tok) lv_obj_set_style_text_color(focus_lbl_tok, card_col(c, COL_TEXT), 0);
+    }
 }
 
 // ---- Card construction ----
@@ -1148,6 +1256,7 @@ static void build_chat_card(ChatCard* c, lv_obj_t* parent, int x, int y, bool fo
     c->sid[0] = 0;
     c->target_y = -1;
     c->used = c->waiting = c->claimed = false;
+    c->dim  = false;   // built at full strength; chat_card_set_row decides the tier
     // Remembered so chat_card_apply_kind can put the session anatomy back
     // exactly as it is here after a message card has borrowed the widgets.
     c->focus     = focus;
@@ -1247,7 +1356,7 @@ static void chat_card_apply_kind(ChatCard* c, bool msg) {
         // Back to the session anatomy build_chat_card laid down.
         c->name_font = c->name_font_base;
         lv_obj_set_style_text_font(c->lbl_name, c->name_font, 0);
-        lv_obj_set_style_text_color(c->lbl_name, COL_TEXT, 0);
+        lv_obj_set_style_text_color(c->lbl_name, card_col(c, COL_TEXT), 0);
         lv_obj_set_height(c->lbl_name, lv_font_get_line_height(c->name_font));
         lv_obj_align(c->lbl_name, LV_ALIGN_TOP_LEFT, 0, 0);
 
@@ -1267,7 +1376,7 @@ static void chat_card_apply_kind(ChatCard* c, bool msg) {
         // otherwise show a permanently half-faded count (layout_badge_cluster
         // repositions it, so only the styling has to be undone here).
         lv_obj_set_style_text_font(c->lbl_agents, c->line_font, 0);
-        lv_obj_set_style_text_color(c->lbl_agents, COL_PURPLE, 0);
+        lv_obj_set_style_text_color(c->lbl_agents, card_col(c, COL_PURPLE), 0);
         lv_obj_set_style_text_opa(c->lbl_agents, LV_OPA_COVER, 0);
         return;
     }
@@ -1279,7 +1388,7 @@ static void chat_card_apply_kind(ChatCard* c, bool msg) {
     // so it is done per update in msg_card_layout().
     c->name_font = MSG_FROM_FONT(c);
     lv_obj_set_style_text_font(c->lbl_name, c->name_font, 0);
-    lv_obj_set_style_text_color(c->lbl_name, COL_PURPLE, 0);
+    lv_obj_set_style_text_color(c->lbl_name, card_col(c, COL_PURPLE), 0);
     lv_obj_set_height(c->lbl_name, lv_font_get_line_height(c->name_font));
 
     lv_obj_set_size(c->dot, MSG_DOT_SZ, MSG_DOT_SZ);
@@ -1371,12 +1480,22 @@ static void layout_badge_cluster(ChatCard* c) {
 static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
     const int bucket = session_bucket(r->state);
     c->waiting = (bucket == SESSION_BUCKET_WAITING);
+    // The tier is the first thing decided, because it is an input to every
+    // colour written below it (card_col) — including the ones inside
+    // chat_card_apply_kind.
+    const bool want_dim = session_tier_is_dim(r->state);
+    const bool tier_changed = (want_dim != c->dim);
+    c->dim = want_dim;
     // The anatomy follows the WORDS, not the bucket: a report is a card with
     // a sender and a sentence exactly like a message, and it is in the
     // waiting bucket precisely so the rest of the card can take its colour
     // and its sort from that. The two questions came apart the moment a
     // message-shaped row stopped always being state 11.
     chat_card_apply_kind(c, session_state_has_words(r->state));
+    // apply_kind writes the colours its own anatomy owns and already reads the
+    // tier through card_col; this restates the rest of the card's palette,
+    // which is only ever wrong on the payload where the tier flipped.
+    if (tier_changed) chat_card_refresh_tier(c);
 
     // Body text can be a whole message now, so the buffer is sized for one.
     char sbuf[SESSION_MSG_MAX + 8];
@@ -1400,7 +1519,7 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
         // fault it noticed, not peers, and giving either the sender colour
         // would claim a machine of that name reported in.
         lv_obj_set_style_text_color(c->lbl_name,
-            session_state_host_minted(r->state) ? COL_DIM : COL_PURPLE, 0);
+            card_col(c, session_state_host_minted(r->state) ? COL_DIM : COL_PURPLE), 0);
 
         // The report chip: the one thing on the card that says this is a
         // status and not mail. An empty chip (a plain message, or the
@@ -1410,7 +1529,7 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
         int chip_w = 0;   // rendered width + gap; 0 when there is no chip
         if (chip[0]) {
             set_label_if_changed(c->lbl_agents, chip);
-            lv_obj_set_style_text_color(c->lbl_agents, session_chip_color(r->state), 0);
+            lv_obj_set_style_text_color(c->lbl_agents, card_col(c, session_chip_color(r->state)), 0);
             lv_obj_set_style_text_opa(c->lbl_agents,
                                       c->waiting ? (lv_opa_t)pulse_val : LV_OPA_COVER, 0);
             lv_obj_clear_flag(c->lbl_agents, LV_OBJ_FLAG_HIDDEN);
@@ -1465,13 +1584,13 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
         // of the overflow row ("the quietest thing on the screen") and what
         // makes the staleness marker calm rather than another alarm.
         lv_obj_set_style_text_color(c->lbl_state,
-            session_state_host_minted(r->state) ? COL_DIM : COL_TEXT, 0);
+            card_col(c, session_state_host_minted(r->state) ? COL_DIM : COL_TEXT), 0);
         lv_obj_set_style_text_opa(c->lbl_state, LV_OPA_COVER, 0);
         // Purple on a message (another Claude talking to you, as on the
         // subagents badge); the state's own colour on a report, so a card
         // that needs you carries the same terra-cotta a waiting chat does and
         // reads as urgent from across the room.
-        lv_obj_set_style_bg_color(c->dot, wcol, 0);
+        lv_obj_set_style_bg_color(c->dot, card_col(c, wcol), 0);
         lv_obj_set_style_bg_opa(c->dot,
                                 c->waiting ? (lv_opa_t)pulse_val : LV_OPA_COVER, 0);
         return;
@@ -1521,15 +1640,15 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
 
     session_state_text(r, sbuf, sizeof(sbuf));
     set_label_if_changed(c->lbl_state, sbuf);
-    lv_obj_set_style_text_color(c->lbl_state, c->waiting ? COL_ACCENT : COL_DIM, 0);
+    lv_obj_set_style_text_color(c->lbl_state, card_col(c, c->waiting ? COL_ACCENT : COL_DIM), 0);
     // Waiting text pulses in phase with the indicator; anything else is solid.
     lv_obj_set_style_text_opa(c->lbl_state, c->waiting ? (lv_opa_t)pulse_val : LV_OPA_COVER, 0);
 
     // Indicator: dim when idle, neutral when working, accent + pulse when
     // the session needs a human (§1.1).
-    lv_obj_set_style_bg_color(c->dot,
+    lv_obj_set_style_bg_color(c->dot, card_col(c,
         c->waiting ? COL_ACCENT :
-        (bucket == SESSION_BUCKET_WORKING) ? COL_TEXT : COL_DIM, 0);
+        (bucket == SESSION_BUCKET_WORKING) ? COL_TEXT : COL_DIM), 0);
     lv_obj_set_style_bg_opa(c->dot, c->waiting ? (lv_opa_t)pulse_val : LV_OPA_COVER, 0);
 
     // Badges are hidden when they'd say nothing (§1.1).
@@ -1608,8 +1727,10 @@ static void focus_set_content(const SessionRow* r) {
         lv_obj_clear_flag(focus_lbl_tok, LV_OBJ_FLAG_HIDDEN);
     }
 
+    // The idle tier rides in the colours now (card_col), so the card itself
+    // is always fully opaque — this only cancels an in-flight fade.
     lv_anim_delete(focus_card.card, card_opa_anim_cb);
-    lv_obj_set_style_opa(focus_card.card, session_tier_opa(r->state), 0);
+    lv_obj_set_style_opa(focus_card.card, LV_OPA_COVER, 0);
 }
 
 // The bottom fade is an affordance for content below the fold, so it is drawn
@@ -1667,7 +1788,7 @@ static void chats_set_content(const SessionList* list) {
             c->claimed = true;
             chat_card_set_row(c, r);
             lv_anim_delete(c->card, card_opa_anim_cb);   // cancel a stale fade before restyling
-            lv_obj_set_style_opa(c->card, session_tier_opa(r->state), 0);
+            lv_obj_set_style_opa(c->card, LV_OPA_COVER, 0);
             if (c->target_y != target_y) {
                 c->target_y = target_y;
                 lv_anim_delete(c->card, card_y_anim_cb);  // re-sort mid-flight: restart from here
@@ -1695,7 +1816,11 @@ static void chats_set_content(const SessionList* list) {
             lv_obj_set_y(c->card, target_y);
             chat_card_set_row(c, r);
             lv_obj_clear_flag(c->card, LV_OBJ_FLAG_HIDDEN);
-            const lv_opa_t tier = session_tier_opa(r->state);
+            // Cards fade IN from transparent and OUT to it; the receding
+            // idle tier is not an opacity any more, so the destination is
+            // simply "fully drawn" (chat_card_set_row already picked the
+            // dimmed palette if this row is on that tier).
+            const lv_opa_t tier = LV_OPA_COVER;
             if (animate) {
                 // New chat: fade in at its slot (§2.3)
                 lv_obj_set_style_opa(c->card, LV_OPA_TRANSP, 0);
@@ -2764,6 +2889,15 @@ static void update_view_state(void) {
 }
 
 void ui_tick_anim(void) {
+    // Both scroll regions get their rubber band capped here rather than in
+    // their own scroll events — see clamp_overscroll for why that matters.
+    // The card list only exists where the session views are compiled in; the
+    // settings rows are on every board.
+#if BOARD_HAS_SESSION_VIEWS
+    clamp_overscroll(cards_cont);
+#endif
+    clamp_overscroll(set_rows_cont);
+
     // Both resolvers run on every tick regardless of the visible tab, so a
     // swipe arrives at a sub-view that is already correct rather than one
     // frame stale — and the sessions tab's linger timer keeps expiring while

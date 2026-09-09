@@ -29,6 +29,15 @@ bool chime_init(const ChimeConfig& cfg);
 // or already playing.
 void chime_play(void);
 
+// Queue one playback of just the clip's FIRST NOTE (~170 ms), faded out over
+// its last 20 ms so the cut does not click. This is the Volume row's preview:
+// the whole clip is 2.4 s, far too long to hang off a button press, and long
+// enough that a second press would land on top of the first. Non-blocking,
+// and it shares chime_play()'s "already playing" guard — a press arriving
+// mid-sample is dropped rather than queued, which at 170 ms is a press the
+// user has effectively already been answered for.
+void chime_play_preview(void);
+
 // Set the codec's output volume, 0..100. Takes effect on the next playback
 // (and immediately for a clip already streaming). No-op if the codec never
 // came up, so a caller never has to ask whether the board has a speaker.

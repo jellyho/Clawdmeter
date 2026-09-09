@@ -31,7 +31,7 @@ Connects to a host daemon over BLE; daemon polls Anthropic API for usage data. T
 - Touch: **CST9220** via I2C (SDA=15, SCL=14, INT=11, addr=0x5A)
 - PMU: **AXP2101** on same I2C bus (addr=0x34) — battery, USB VBUS, PWR button IRQ
 - IMU: **QMI8658** on same I2C bus (addr=0x6B) — accelerometer for auto-rotation
-- Buttons: GPIO 0 (left → Space/voice-mode), GPIO 18 (right → Shift+Tab/mode-toggle), AXP PKEY (middle → cycle screens; on splash → cycle animations)
+- Buttons: GPIO 0 (left → Space/voice-mode), GPIO 18 (right → **report round**, `ble_send_report_request()` on the press edge; it used to send HID Shift+Tab and no longer sends HID at all), AXP PKEY (middle → cycle screens; on splash → cycle animations)
 
 ### AMOLED-1.8 (newer port)
 **Two hardware revisions ship under this name; the firmware probes I2C at boot and picks drivers automatically (`board_rev()`):**
@@ -254,6 +254,35 @@ methodology, including the Lottie sources and the assets-proxy).
 See `~/.claude/projects/.../memory/` files for persistent context (user is an embedded-beginner senior dev, brand-conscious, prefers iterative UI refinement, dislikes me authoring my own art when third-party assets are intended). Always read those memory files at session start.
 
 ## Recent session highlights
+
+- **Scroll performance on the C6, and three queued UI changes (2026-09-09).**
+  A drag of the chat list ran at 8.7 fps (render 72.9 ms, transfer 33 ms,
+  loop 114 ms). It now runs at 11.3 fps, render 48.5 ms mean / 53 ms worst,
+  with no full-screen repaints at all. Two changes, both pixel-for-pixel
+  invisible: (1) **one draw buffer instead of two.** The flush is blocking and
+  calls `lv_display_flush_ready` immediately, so LVGL never overlapped a
+  transfer with rendering and the second buffer was idle memory; the same
+  38 KB spent on one 40-line strip halves the strip count (17 -> 9) and with
+  it every per-strip cost. Worth ~19 ms. (2) **the idle tier is a palette, not
+  an opacity layer.** `LV_OPA_60` on a card made LVGL alpha-blend the whole
+  subtree, per pixel, per strip; the identical pixels come out of
+  `lv_color_mix(colour, background, 60%)` drawn opaque (`card_col()` in
+  ui.cpp). Worth 8.5 ms - the ablation now prices the tier at 0.3 ms.
+  Also landed: the **report button** (`ble_send_report_request()` on the press
+  edge; it no longer sends HID Shift+Tab into whatever window had focus), a
+  **capped overscroll** (`clamp_overscroll()` takes LVGL's elastic flag away at
+  the cap rather than scrolling against it), and a **volume preview** -
+  changing the Sound level plays the chime's first note at the new level
+  (`sound_hal_play_preview()` -> `chime_play_preview()`).
+  Two measurement notes worth keeping. The 198 ms spikes and 343-invalidation
+  bursts an earlier pass blamed on the pulse and the AUTO scrollbar were the
+  harness's own screen-switch frames: in steady state both cost about nothing
+  and a drag runs at exactly 2 invalidations per frame. And what is left is
+  **text - 29 ms of the 48**, because LVGL 9.5 expands every 4bpp glyph to A8
+  on every draw (`lv_font_get_bitmap_fmt_txt`); the zero-copy path wants
+  `bpp = 8` plus `static_bitmap`, which costs font flash and is the obvious
+  next move. Corner radius is 4.8 ms, the floor is 9 ms, and past ~20 fps the
+  QSPI transfer binds.
 
 - **Sessions tab became an attention surface (2026-09-09).** Three changes, one
   idea. (1) The remote fleet poller now ships only rows that need a *person* —

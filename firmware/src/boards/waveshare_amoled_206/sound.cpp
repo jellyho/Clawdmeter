@@ -8,5 +8,6 @@
 
 void sound_hal_init(void) {}
 void sound_hal_tick(void) {}
-void sound_hal_play_reset(void) {}
+void sound_hal_play_reset(void)   {}
+void sound_hal_play_preview(void) {}
 void sound_hal_set_volume(uint8_t v) { (void)v; }
