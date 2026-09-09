@@ -97,6 +97,9 @@ firmware/src/
   ui.{h,cpp}                — tabbed UI: splash / usage / sessions / settings. The tab ring is
                               built at init from board_caps(), so a board without has_session_views
                               never has that tab; swipe left/right moves between tabs (wrapping).
+                              Session cards are TAP TARGETS (card_tap_cb): a NEEDS-YOU report card
+                              sends go-ahead, anything else dismisses. Clearing the last card
+                              reveals the town hall button, which fires a report round.
                               compute_layout() picks fonts/positions from board_caps() (responsive
                               — current breakpoint: H >= 460 → large, else compact)
   settings.{h,cpp}          — NVS-backed user settings behind the settings tab. One generic row
@@ -255,6 +258,33 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 
 ## Recent session highlights
 
+- **The sessions tab became something you act on (2026-09-09).** Every card is
+  a tap target and the state is the whole switch: `SESSION_REPORT_NEEDS_YOU`
+  sends **go ahead** to that agent, anything else **dismisses** the card. The
+  three other report states deliberately do *not* offer go-ahead — `BLOCKED`
+  is parked on a permission dialog on another machine, where a message queues
+  *behind* the dialog, and `WORKING`/`DONE` are not waiting for anything. A
+  go-ahead that fails to send keeps its card, because dismissing on a send
+  that did not land would claim the answer went out when it did not.
+  Clearing the last card reveals the **town hall button** — a terracotta
+  circle on the empty view that fires the same round the hardware button
+  does. It exists only there: with cards on screen the meeting has already
+  happened. Dismissal is keyed on the **words** at both ends (the firmware on
+  a hash of sid+label+body+state, the host on the message id, itself a hash of
+  session+sender+body), so the same agent saying something new comes back —
+  suppressing by *name* would silence it for good. The device hides a card
+  under the finger with no round trip; `~/.clawdmeter/dismissed.json` (one
+  writer, one reader, hour TTL, 64 entries) only stops the host re-sending it.
+  Also fixed here: **the volume curve was wrong by 60 dB of range.**
+  `es8311_voice_volume_set` maps a percentage to DAC register 0x32 as
+  `pct * 256 / 100 - 1`, and that register is **half a decibel per step** with
+  0 dB at 0xBF — so the evenly-spaced-looking 40/65/90 was −45 / −13 / +19 dB,
+  two settings barely audible and one clipping the bell (whose peak measures
+  −7.0 dBFS) by twelve. Now 70/75/80 = −6.5 / 0 / +6.0 dB.
+  And the console window that flashed on every press: the daemon spawns the
+  dispatcher windowless, but the dispatcher's own two spawns did not pass
+  `CREATE_NO_WINDOW`, and under `pythonw` a console child gets its own window.
+
 - **Scroll performance on the C6, and three queued UI changes (2026-09-09).**
   A drag of the chat list ran at 8.7 fps (render 72.9 ms, transfer 33 ms,
   loop 114 ms). It now runs at 11.3 fps, render 48.5 ms mean / 53 ms worst,
@@ -334,9 +364,14 @@ its sort bucket and the auto-jump. Report rounds want
 - `...0003` TX — firmware notifies ack/nack **and device button events**, to the
   bonded owner only. Events are `{"ev":<code>}` (plus an optional `"sid"`); the
   `ev` key is the discriminator the ack traffic does not carry, and codes are
-  append-only. `1` = report round; `2` = go-ahead, reserved. Every TX notify goes
+  append-only. `1` = report round; `2` = go-ahead (carries a `sid`); `3` =
+  dismiss (carries a `sid`). Every TX notify goes
   through `tx_notify_owner()` in `ble.cpp` — per-connection-handle, encrypted
   links only, owner address only — because NimBLE's bare `notify()` fans out to
   every subscribed peer. The Windows daemon subscribes and runs a report round
   as a child process off the poll tick; see `daemon/REPORT.md` § The button.
+  A `sid` is two characters minted by the *poller*, not the daemon, so the
+  sidecar's handoff file carries an `index` (`sid` → state / raw sender /
+  message id) — without it a tap cannot be turned back into an agent to
+  message.
 - `...0004` REQ — firmware fires `0x01` notify in `onSubscribe` if `has_received_data` is false. Daemon subscribes via `setsid bash -c "stdbuf -oL dbus-monitor … | awk …"`; awk drops a flag file the inner loop picks up. See the `feedback_dbus_monitor_pipe` memory for the three subtle gotchas (pipe buffering, busctl-exits race, `wait` blocking on pipeline jobs).
