@@ -102,6 +102,15 @@ static NimBLECharacteristic* ss_char = nullptr;
 static ble_state_t state = BLE_STATE_INIT;
 static bool need_advertise = false;
 
+// Connection handles currently subscribed to TX notifications. NimBLE exposes
+// no per-characteristic subscriber list, and we need one: a button event that
+// nobody is listening for must be reported to the caller as "not sent" rather
+// than as a success (the owner is standing at the device waiting for something
+// to happen). Written from host-task callbacks, read from the loop task; the
+// array is CONFIG_BT_NIMBLE_MAX_CONNECTIONS wide, so no allocation and no lock.
+#define TX_SUBS_MAX CONFIG_BT_NIMBLE_MAX_CONNECTIONS
+static volatile uint16_t tx_subs[TX_SUBS_MAX];
+
 // One-shot supervision-timeout pushback (see onConnParamsUpdate). Written by
 // NimBLE host-task callbacks, consumed by ble_tick() on the loop task.
 static const uint16_t CONN_HANDLE_NONE  = 0xFFFF;
@@ -475,6 +484,64 @@ static void gatt_arm_link_recycle(uint16_t conn_handle) {
     gatt_recycle_at_ms  = millis() + GATT_RECYCLE_DELAY_MS;
 }
 
+// --- TX: the device's outbound channel, owner-only ------------------------
+//
+// Everything the device says on TX goes through tx_notify_owner(). That is the
+// same single-owner rule write_allowed() enforces on the inbound side, applied
+// in the other direction: a stranger who connects (or pairs, in the window
+// before onAuthenticationComplete un-bonds them) is not merely ignored - it is
+// never notified at all, so it cannot see the ack/nack traffic and cannot see
+// a button event either.
+//
+// NimBLE's parameterless notify() fans out to EVERY subscribed peer, which is
+// exactly what must not happen here, so this walks the live connections and
+// notifies per handle. The link must be encrypted; when an owner is set the
+// identity address must be that owner. Before a first bond there is no owner
+// to compare against, so an encrypted peer is accepted - the same latitude
+// write_allowed() gives the first encrypted writer, and the reason it is safe
+// is the same: an unencrypted link never gets here.
+
+static void tx_forget_subscriber(uint16_t conn_handle) {
+    for (int i = 0; i < TX_SUBS_MAX; i++) {
+        if (tx_subs[i] == conn_handle) tx_subs[i] = CONN_HANDLE_NONE;
+    }
+}
+
+static void tx_note_subscriber(uint16_t conn_handle, bool on) {
+    if (!on) { tx_forget_subscriber(conn_handle); return; }
+    for (int i = 0; i < TX_SUBS_MAX; i++) {
+        if (tx_subs[i] == conn_handle) return;
+    }
+    for (int i = 0; i < TX_SUBS_MAX; i++) {
+        if (tx_subs[i] == CONN_HANDLE_NONE) { tx_subs[i] = conn_handle; return; }
+    }
+}
+
+static bool tx_is_subscribed(uint16_t conn_handle) {
+    for (int i = 0; i < TX_SUBS_MAX; i++) {
+        if (tx_subs[i] == conn_handle) return true;
+    }
+    return false;
+}
+
+// Returns true when the payload was handed to the stack for at least one
+// subscribed owner link. False means nobody is listening - no daemon, an older
+// daemon that never subscribes, or a link that has gone away.
+static bool tx_notify_owner(const char* json) {
+    if (!tx_char || !server || state != BLE_STATE_CONNECTED) return false;
+    tx_char->setValue(json);   // READ_ENC keeps the stored value off a stranger's read
+    bool sent = false;
+    for (uint16_t h : server->getPeerDevices()) {
+        if (!tx_is_subscribed(h)) continue;
+        NimBLEConnInfo info = server->getPeerInfoByHandle(h);
+        if (!info.isEncrypted()) continue;
+        std::string id = info.getIdAddress().toString();
+        if (owner_set && strcmp(id.c_str(), owner_addr) != 0) continue;
+        if (tx_char->notify(h)) sent = true;
+    }
+    return sent;
+}
+
 static void start_advertising() {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->reset();
@@ -538,6 +605,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         // Same for the pending cache-recycle drop: if the link went away on its
         // own, the host will re-enumerate on reconnect anyway.
         if (gatt_recycle_handle == info.getConnHandle()) gatt_recycle_handle = CONN_HANDLE_NONE;
+        // ...and the TX subscription: a CCCD is per-connection, and NimBLE
+        // reuses conn handles, so a stale entry would make the next link look
+        // subscribed before it has said so.
+        tx_forget_subscriber(info.getConnHandle());
         Serial.printf("BLE: disconnected (reason=%d, remaining=%u)\n",
             reason, (unsigned)s->getConnectedCount());
     }
@@ -646,6 +717,19 @@ class SsCallbacks : public NimBLECharacteristicCallbacks {
 };
 #endif
 
+// TX subscription bookkeeping. Subscribing is what turns the button into a
+// working button, so it is logged: on hardware this line is how the owner tells
+// "the daemon is listening" from "the press went nowhere".
+class TxCallbacks : public NimBLECharacteristicCallbacks {
+    void onSubscribe(NimBLECharacteristic* chr, NimBLEConnInfo& info, uint16_t subValue) override {
+        (void)chr;
+        bool on = (subValue & 0x0001) != 0;   // bit 0 = notifications
+        tx_note_subscriber(info.getConnHandle(), on);
+        Serial.printf("BLE: tx_char onSubscribe subValue=%u peer=%s -> button events %s\n",
+            subValue, info.getIdAddress().toString().c_str(), on ? "live" : "off");
+    }
+};
+
 // When the daemon enables notifications on the refresh char, ask for data
 // if we have none yet. Firing on subscribe (not on connect) ensures the
 // notification isn't dropped before the daemon's CCCD write completes.
@@ -659,6 +743,7 @@ class ReqCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 void ble_init(void) {
+    for (int i = 0; i < TX_SUBS_MAX; i++) tx_subs[i] = CONN_HANDLE_NONE;
     NimBLEDevice::init(DEVICE_NAME);
     NimBLEDevice::setSecurityAuth(true, false, true);  // bonding, no MITM, SC
 #if BOARD_HAS_SESSION_VIEWS
@@ -714,10 +799,23 @@ void ble_init(void) {
     static RxCallbacks rxCb;
     rx_char->setCallbacks(&rxCb);
 
+    // READ_ENC, added with the button events: TX now carries device-initiated
+    // events and not just an ack, and the last one stays readable in the
+    // characteristic. An unbonded stranger must not be able to read it. The
+    // CCCD's own permissions are global in NimBLE (plain READ|WRITE) and are
+    // NOT derived from these flags, so subscribing is unaffected - which is
+    // deliberate: who may SUBSCRIBE is not the gate, who gets NOTIFIED is, and
+    // that is tx_notify_owner()'s job.
+    //
+    // This is a properties change, so gatt_layout_signature() moves and bonded
+    // hosts are told to drop their cached attribute table on the next connect.
+    // That is the machinery working as designed, not a reason to avoid it.
     tx_char = svc->createCharacteristic(
         TX_CHAR_UUID,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::NOTIFY
     );
+    static TxCallbacks txCb;
+    tx_char->setCallbacks(&txCb);
 
     req_char = svc->createCharacteristic(
         REQ_CHAR_UUID,
@@ -831,17 +929,60 @@ const char* ble_get_session_data(void) { return ""; }
 #endif
 
 void ble_send_ack(void) {
-    if (state == BLE_STATE_CONNECTED && tx_char) {
-        tx_char->setValue("{\"ack\":true}");
-        tx_char->notify();
-    }
+    tx_notify_owner("{\"ack\":true}");
 }
 
 void ble_send_nack(void) {
-    if (state == BLE_STATE_CONNECTED && tx_char) {
-        tx_char->setValue("{\"err\":true}");
-        tx_char->notify();
+    tx_notify_owner("{\"err\":true}");
+}
+
+// --- Button events ---------------------------------------------------------
+//
+// Wire format (ble.h documents the contract; this is the encoder):
+//
+//   {"ev":1}              report round
+//   {"ev":2,"sid":"g4"}   go ahead, to the agent on that card  (reserved)
+//
+// "ev" is the discriminator. Nothing else this characteristic has ever sent
+// carries it, so a subscriber that sees no "ev" is looking at ack/nack traffic
+// and ignores it - which is what makes adding the next button a new code and a
+// new handler rather than a new channel.
+bool ble_send_event(ble_event_t ev, const char* sid) {
+    char json[48];
+    if (sid && *sid) {
+        // The sid comes from a session row the host sent us, so it is not
+        // hostile - but it is host-supplied text about to be spliced into JSON,
+        // and the only thing standing between a malformed row and a payload the
+        // daemon cannot parse is this filter. Report sids are [g-y][0-9a-z];
+        // anything outside [0-9A-Za-z] is dropped, and the length is capped.
+        char clean[9];
+        size_t n = 0;
+        for (const char* p = sid; *p && n < sizeof(clean) - 1; p++) {
+            char c = *p;
+            bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                      (c >= 'A' && c <= 'Z');
+            if (ok) clean[n++] = c;
+        }
+        clean[n] = '\0';
+        if (n == 0) {
+            snprintf(json, sizeof(json), "{\"ev\":%d}", (int)ev);
+        } else {
+            snprintf(json, sizeof(json), "{\"ev\":%d,\"sid\":\"%s\"}", (int)ev, clean);
+        }
+    } else {
+        snprintf(json, sizeof(json), "{\"ev\":%d}", (int)ev);
     }
+    bool sent = tx_notify_owner(json);
+    // Both outcomes are logged. A press that reached nobody is the failure the
+    // owner is most likely to be standing in front of, and silence about it is
+    // indistinguishable from the firmware not having the feature at all.
+    Serial.printf("BLE: event %s -> %s\n", json,
+        sent ? "sent to owner" : "NOT sent (no subscribed owner link)");
+    return sent;
+}
+
+bool ble_send_report_request(void) {
+    return ble_send_event(BLE_EVENT_REPORT, nullptr);
 }
 
 void ble_set_battery_level(int pct) {

@@ -9,12 +9,11 @@ This file is the contract in the middle: **what an agent must say**, **the
 exact words the dispatcher asks it in**, and **what the device does with the
 answer**.
 
-> **The button does not exist yet; the dispatcher does.**
-> [`clawdmeter_report.py`](clawdmeter_report.py) fires a round from the command
-> line — see [The dispatcher](#the-dispatcher) — and the hardware button that
-> will eventually call it is still to come. Everything below works today: fire
-> a round, or write a reply that matches the contract from any Claude Code
-> session, and the card appears.
+> **The button is wired.** The device notifies a button event to the host over
+> BLE, the Windows daemon runs a round on the spot, and
+> [`clawdmeter_report.py`](clawdmeter_report.py) still fires one from the
+> command line — see [The dispatcher](#the-dispatcher). How the press travels
+> is [The button](#the-button-device--host) below.
 
 ---
 
@@ -186,6 +185,82 @@ Four things in there are load-bearing and should survive any rewording:
    is drawn by the firmware from the code, so it is English regardless; the
    *agent name* is romanised, its font having no fallback. See
    [FLEET.md](FLEET.md#non-ascii-and-why-the-panel-does-not-just-go-blank).)
+
+## The button (device → host)
+
+A press has to cross the BLE link before any of the above happens, and the
+channel it crosses on already existed: **the TX characteristic (`…0003`)**. The
+firmware has notified `{"ack":true}` / `{"err":true}` on it since the first
+release and **no daemon has ever subscribed**, so every one of those went into
+the void. That is the channel — nothing new is added to the GATT table, so
+every board in the field already has it.
+
+### The payload
+
+One JSON object, and one key does all the work:
+
+```
+{"ev":1}                report round — "tell me what the fleet is doing"
+{"ev":2,"sid":"g4"}     go ahead, to the agent on that card   (reserved)
+```
+
+`ev` is the **discriminator**. The ack traffic does not carry it, so a
+subscriber that sees no `ev` is looking at an ack and ignores it. Codes are
+**append-only** for the same reason the session state codes are: they cross the
+BLE boundary, so a released code is never renumbered and a code the host does
+not recognise is ignored rather than guessed at. Guessing is the expensive
+failure here — an unknown code quietly falling through to the report handler
+would spend the fleet's quota on a button nobody pressed.
+
+`sid` is optional and only the second button needs it. It is sanitised in the
+firmware (`[0-9A-Za-z]`, 8 characters) before it is spliced into the JSON.
+
+### Owner-only, in both directions
+
+The single-owner lock the RX path already enforces (`write_allowed()` in
+`firmware/src/ble.cpp`) now applies outbound too. Every TX notification —
+acks included — goes through `tx_notify_owner()`, which walks the live
+connections and notifies **per connection handle**: the link must be encrypted,
+and when an owner address is set it must be that owner. NimBLE's parameterless
+`notify()` fans out to every subscribed peer, which is exactly what must not
+happen on a channel that now carries button presses. TX also gained `READ_ENC`,
+so a stranger cannot read the last event back out of the characteristic either.
+
+A stranger who pairs is still un-bonded and dropped by
+`onAuthenticationComplete`; what changed is that in the window before that, it
+sees nothing and can trigger nothing.
+
+### The daemon side
+
+`claude_usage_daemon_windows.py` subscribes to TX on connect and handles what
+arrives **on the existing poll tick** — no second timer, no thread. The
+notification callback only queues; `Session.handle_events()` dispatches through
+a table (`EVENT_HANDLERS`), which is why the second button is a new code and a
+new handler rather than a redesign.
+
+A round spawns `claude -p` and then watches the inbox for replies, so it can run
+for minutes. It runs as a **child process the poll loop never waits on**
+(`run_report_round()`), and its output is streamed into the daemon log line by
+line as it arrives rather than collected at exit — so a refusal is visible a
+second after the press, not three minutes later:
+
+```
+[14:22:08] REPORT: button pressed — dispatching a round
+[14:22:09] report: refused: rate limited: 240s to go (one round per 300s)
+[14:22:09] REPORT ROUND DID NOT RUN (dispatcher exit 2): refused: rate limited: 240s to go (one round per 300s)
+```
+
+**Every refusal is the dispatcher's own** — the five-minute rate limit, the
+missing mail drop, no reachable agents. None of that logic is duplicated in the
+daemon; it calls the CLI and relays what it says. The one judgement the daemon
+does make is narrower: a press that lands while the previous round's child
+process is still alive is ignored, and says so.
+
+**A board that never notifies is simply quiet.** Subscribing to TX is new
+behaviour on a characteristic every board has, so all three ways it can come to
+nothing — no TX in the peer's GATT table, a CCCD write that WinRT fails, or
+firmware that subscribes fine and then never sends an event — log one line at
+most and leave the rest of the daemon running.
 
 ## The dispatcher
 

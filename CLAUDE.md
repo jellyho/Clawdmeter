@@ -302,5 +302,12 @@ its sort bucket and the auto-jump. Report rounds want
 **GATT characteristics on service `4c41555a-...0001`:**
 
 - `...0002` RX — daemon writes JSON usage payload here.
-- `...0003` TX — firmware notifies ack/nack (daemon doesn't subscribe).
+- `...0003` TX — firmware notifies ack/nack **and device button events**, to the
+  bonded owner only. Events are `{"ev":<code>}` (plus an optional `"sid"`); the
+  `ev` key is the discriminator the ack traffic does not carry, and codes are
+  append-only. `1` = report round; `2` = go-ahead, reserved. Every TX notify goes
+  through `tx_notify_owner()` in `ble.cpp` — per-connection-handle, encrypted
+  links only, owner address only — because NimBLE's bare `notify()` fans out to
+  every subscribed peer. The Windows daemon subscribes and runs a report round
+  as a child process off the poll tick; see `daemon/REPORT.md` § The button.
 - `...0004` REQ — firmware fires `0x01` notify in `onSubscribe` if `has_received_data` is false. Daemon subscribes via `setsid bash -c "stdbuf -oL dbus-monitor … | awk …"`; awk drops a flag file the inner loop picks up. See the `feedback_dbus_monitor_pipe` memory for the three subtle gotchas (pipe buffering, busctl-exits race, `wait` blocking on pipeline jobs).

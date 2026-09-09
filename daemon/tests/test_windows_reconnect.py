@@ -15,6 +15,8 @@ import pytest
 from bleak.exc import BleakError
 
 from daemon.claude_usage_daemon_windows import (
+    REQ_CHAR_UUID,
+    TX_CHAR_UUID,
     AuthError,
     Session,
     _wait_first,
@@ -599,8 +601,13 @@ def test_start_notify_oserror_does_not_crash_connect_and_run():
         # Must NOT raise OSError — graceful degradation into the poll loop.
         result = _run(connect_and_run(device, stop_event))
 
-    # start_notify was actually attempted (and raised), but was swallowed.
-    assert mock_client.start_notify.call_count == 1
+    # start_notify was actually attempted (and raised), but was swallowed. Both
+    # optional subscriptions are attempted now -- the refresh characteristic and
+    # the device's button events -- and BOTH must degrade the same way, so this
+    # asserts on which ones were tried rather than on how many there are.
+    tried = [c.args[0] for c in mock_client.start_notify.call_args_list]
+    assert REQ_CHAR_UUID in tried
+    assert TX_CHAR_UUID in tried
     # Function returned normally instead of propagating the OSError.
     assert result is False
     # The link was cleaned up via the finally block.

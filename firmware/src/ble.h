@@ -26,6 +26,33 @@ void ble_send_ack(void);
 void ble_send_nack(void);
 void ble_request_refresh(void);
 
+// --- Device -> host button events (TX characteristic ...0003) --------------
+//
+// TX has notified {"ack":true} / {"err":true} since the first firmware and no
+// host has ever subscribed to it. A button event rides the same characteristic
+// with one extra key: an "ev" integer that the ack/nack traffic does not carry,
+// so a subscriber dispatches on its presence and ignores everything else.
+//
+//   {"ev":1}                report round - "tell me what the fleet is doing"
+//   {"ev":2,"sid":"g4"}     (reserved) go ahead, to the agent on that card
+//
+// Codes are APPEND-ONLY. They cross the BLE boundary exactly like the session
+// state codes in data.h, so a released code is never renumbered or reused.
+enum ble_event_t {
+    BLE_EVENT_REPORT   = 1,   // report button
+    BLE_EVENT_GO_AHEAD = 2,   // reserved - carries a sid; nothing sends it yet
+};
+
+// Notify one button event to the BONDED OWNER only, on its encrypted link.
+// `sid` is optional (NULL for BLE_EVENT_REPORT) and is sanitised before it goes
+// on the wire. Returns true when the event was handed to the stack for at least
+// one subscribed owner link; false means nobody is listening and nothing was
+// sent - a normal state (no daemon, older daemon, link down), not an error.
+bool ble_send_event(ble_event_t ev, const char* sid);
+
+// The one line main.cpp calls from the report button.
+bool ble_send_report_request(void);
+
 void ble_set_battery_level(int pct);
 
 // BLE HID keyboard

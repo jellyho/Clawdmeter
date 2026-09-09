@@ -188,6 +188,16 @@ const char* ble_get_session_data(void) {
 void ble_send_ack(void)  {}
 void ble_send_nack(void) { printf("[sim] payload NACKed — check the scenario JSON\n"); }
 void ble_request_refresh(void) {}
+
+// Button events (TX ...0003). The sim has no daemon to notify, so this is the
+// print that stands in for one: pressing the report button in the SDL window
+// shows the exact bytes the firmware would have put on the wire.
+bool ble_send_event(ble_event_t ev, const char* sid) {
+    if (sid && *sid) printf("[sim] BLE event {\"ev\":%d,\"sid\":\"%s\"}\n", (int)ev, sid);
+    else             printf("[sim] BLE event {\"ev\":%d}\n", (int)ev);
+    return connected;
+}
+bool ble_send_report_request(void) { return ble_send_event(BLE_EVENT_REPORT, nullptr); }
 void ble_set_battery_level(int pct) { (void)pct; }
 
 void ble_keyboard_press(uint8_t key, uint8_t modifier) {

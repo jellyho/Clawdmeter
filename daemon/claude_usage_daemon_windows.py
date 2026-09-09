@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import httpx
@@ -40,11 +41,33 @@ except ImportError:  # pragma: no cover - bleak < 0.22
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
+# The device's own outbound channel. It has notified {"ack":true}/{"err":true}
+# since the first firmware and nothing ever subscribed, so those notifications
+# went into the void. Button events ride the same characteristic, told apart by
+# an integer "ev" key that the ack/nack traffic does not carry (firmware/src/
+# ble.h is the contract). OPTIONAL in practice: a board running firmware older
+# than the buttons subscribes fine and simply never notifies an event, which
+# must read as "quiet", not as a fault.
+TX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000003"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 # Live session rows (issue #135). OPTIONAL on the device: the firmware only
 # creates it when BOARD_HAS_SESSION_VIEWS is set, so on most boards it is simply
 # absent and this daemon must stay quiet rather than error every tick.
 SS_CHAR_UUID = "4c41555a-4465-7669-6365-000000000005"
+
+# Device button events (firmware/src/ble.h). Codes are APPEND-ONLY -- they
+# cross the BLE boundary, so a released code is never renumbered or reused, and
+# a code this daemon does not know is ignored rather than guessed at.
+EVENT_REPORT = 1    # "tell me what the fleet is doing"
+EVENT_GO_AHEAD = 2  # reserved: {"ev":2,"sid":"g4"} -- not built, not handled
+
+# The report dispatcher, run as a child process. Its own --timeout bounds the
+# `claude -p` spawn (120 s) and its follow phase watches for replies for another
+# 90 s, so a healthy round is ~20 s of work inside a ~210 s process. This is the
+# outer bound on the whole thing: past it the child is killed, because a
+# dispatcher that never exits would block every later press for good.
+REPORT_SCRIPT = Path(__file__).resolve().parent / "clawdmeter_report.py"
+REPORT_ROUND_TIMEOUT = 300.0
 
 POLL_INTERVAL = 60
 TICK = 5
@@ -421,6 +444,109 @@ def read_sessions_payload(path: Path | None = None) -> str | None:
     return payload
 
 
+# ---------------------------------------------------------------------------
+# Report rounds — what the report button actually does
+# ---------------------------------------------------------------------------
+
+# The round in flight, if any. Module scope rather than per-Session on purpose:
+# a round is host-side work with a life of its own, and it outlives the BLE link
+# that started it. Hanging it off the Session would let a reconnect mid-round
+# forget about it, and the next press would dispatch a second round on top of
+# the first — which is precisely the double-spend the dispatcher's rate limit
+# exists to stop.
+_report_round = None
+
+
+def report_round_in_flight() -> bool:
+    return _report_round is not None and not _report_round.done()
+
+
+async def run_report_round(script=None, timeout=REPORT_ROUND_TIMEOUT,
+                           exec_fn=None) -> int | None:
+    """Run one report round in a child process. Never raises; never blocks.
+
+    A round spawns `claude -p`, waits for it, then watches the inbox for
+    replies — minutes of work in the worst case. Doing any of that inline would
+    stop the usage payload flowing and the link would look dead, so it runs as
+    a child process the poll loop never waits on.
+
+    A CHILD PROCESS rather than a thread, and rather than calling
+    clawdmeter_report.dispatch() in-process, for three reasons: it is genuinely
+    asynchronous (asyncio owns the pipe, no executor, no thread of ours to
+    supervise), the dispatcher's own failure modes cannot reach the daemon's
+    event loop, and the CLI already prints exactly the prose a human needs. Its
+    output is streamed here line by line as it arrives — not collected at exit —
+    so a refusal shows up in the daemon log within a second of the press rather
+    than three minutes later.
+
+    Returns the child's exit code, or None if it could not be started or had to
+    be killed. Every one of the dispatcher's refusals (rate limited, no mail
+    drop, no reachable agents) is ITS decision, surfaced here verbatim: none of
+    that logic is duplicated in this daemon.
+    """
+    path = Path(script) if script else REPORT_SCRIPT
+    exec_fn = exec_fn or asyncio.create_subprocess_exec
+    argv = [sys.executable, str(path)]
+    kwargs = {
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.STDOUT,
+    }
+    if sys.platform == "win32":
+        # Under the tray the daemon runs windowless; without this a round would
+        # flash a console at the owner on every press.
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = await exec_fn(*argv, **kwargs)
+    except (OSError, ValueError, NotImplementedError) as e:
+        # NotImplementedError is the honest one: a non-Proactor event loop has
+        # no subprocess support on Windows. Say so rather than dying.
+        log(f"REPORT ROUND FAILED to start ({type(e).__name__}: {e})")
+        return None
+
+    try:
+        rc, last = await asyncio.wait_for(_pump_round(proc), timeout=timeout)
+    except asyncio.TimeoutError:
+        log(f"REPORT ROUND TIMED OUT after {int(timeout)}s; killing the dispatcher"
+            f" (anything it had already sent stays sent)")
+        try:
+            proc.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        return None
+    except (OSError, ValueError) as e:
+        log(f"REPORT ROUND FAILED while running ({type(e).__name__}: {e})")
+        return None
+    if rc == 0:
+        log("REPORT: round finished")
+    else:
+        # Loud on purpose. The owner pressed a button and is standing in front
+        # of the device; a round that refused or failed in silence is worse than
+        # one that never started, because nothing on the panel will change and
+        # nothing says why.
+        log(f"REPORT ROUND DID NOT RUN (dispatcher exit {rc})"
+            + (f": {last}" if last else ""))
+    return rc
+
+
+async def _pump_round(proc):
+    """Relay the dispatcher's output into the daemon log as it arrives.
+
+    Returns (exit code, last non-empty line) — that last line is what the
+    "did not run" log line quotes, because the CLI prints its reason
+    ("refused: rate limited: 240s to go") and then stops.
+    """
+    last = ""
+    stream = getattr(proc, "stdout", None)
+    if stream is not None:
+        async for raw in stream:
+            line = raw.decode("utf-8", "replace").rstrip()
+            if not line:
+                continue
+            log(f"report: {line}")
+            last = line
+    return await proc.wait(), last
+
+
 async def acquire_target():
     """Return a connectable handle for the Clawdmeter, or None.
 
@@ -452,6 +578,13 @@ class Session:
         self.ss_supported = True            # until this device says otherwise
         self.last_sessions_payload: str | None = None
         self._ss_write_logged = False       # at most one write-failure log per link
+        # Button events arrive on a notification callback and are handled on the
+        # poll tick, exactly like refresh_requested above: the callback stays a
+        # few microseconds long, and everything that can be slow happens on the
+        # loop where the rest of the daemon's work already lives.
+        self.tx_supported = True            # until this device says otherwise
+        self.events: deque = deque()
+        self.event_pending = asyncio.Event()
 
     def _on_refresh(self, _char, _data: bytearray) -> None:
         log("Refresh requested by device")
@@ -468,6 +601,103 @@ class Session:
             await self.client.start_notify(REQ_CHAR_UUID, self._on_refresh)
         except (BleakError, ValueError, OSError) as e:
             log(f"Refresh subscription unavailable: {e}")
+
+    def _on_tx(self, _char, data: bytearray) -> None:
+        """A TX notification. Most of them are not button events.
+
+        TX has carried {"ack":true} and {"err":true} since the first firmware,
+        and neither may ever be read as a press — a round costs real quota on
+        somebody else's machine. So the ONLY thing treated as an event is a JSON
+        object with an integer "ev"; an ack, a nack, a key from a firmware newer
+        than this daemon, or bytes that are not JSON at all are dropped right
+        here and silently, so a healthy link does not fill the log with acks.
+        """
+        try:
+            doc = json.loads(bytes(data).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, TypeError):
+            return
+        if not isinstance(doc, dict):
+            return
+        code = doc.get("ev")
+        # bool is an int in Python, and {"ev":true} is not event 1.
+        if not isinstance(code, int) or isinstance(code, bool):
+            return
+        self.events.append(doc)
+        self.event_pending.set()
+
+    async def setup_event_subscription(self) -> None:
+        """Subscribe to the device's button events. Optional, and quiet.
+
+        Every board builds TX, but subscribing to it is new behaviour: a device
+        running older firmware subscribes perfectly well and then never notifies
+        an event, which is the normal, silent case and not a fault. A device
+        that has no TX at all (or a WinRT CCCD write that fails the way
+        setup_refresh_subscription() guards against) turns the feature off for
+        this link and leaves everything else running.
+        """
+        try:
+            found = self.client.services.get_characteristic(TX_CHAR_UUID)
+        except (BleakError, AttributeError, OSError):
+            found = None  # older bleak / no service collection: try anyway
+        if found is None and self._services_readable():
+            self.tx_supported = False
+            log("Device has no event characteristic; buttons are off for this link")
+            return
+        try:
+            await self.client.start_notify(TX_CHAR_UUID, self._on_tx)
+        except BleakCharacteristicNotFoundError:
+            self.tx_supported = False
+            log("Device has no event characteristic; buttons are off for this link")
+        except (BleakError, ValueError, OSError) as e:
+            self.tx_supported = False
+            log(f"Button-event subscription unavailable: {e}")
+
+    def _services_readable(self) -> bool:
+        """True when the client's service collection can actually be consulted.
+
+        Without this, an older bleak (or a mock) whose lookup returns None for
+        everything would be read as "this board has no TX" and the feature would
+        switch itself off on a device that has it.
+        """
+        try:
+            return self.client.services is not None
+        except (BleakError, AttributeError, OSError):
+            return False
+
+    async def handle_events(self) -> None:
+        """Act on whatever the device notified since the last tick.
+
+        Rides the existing tick, like maybe_send_sessions(). Nothing here waits
+        for a round: dispatching one hands off to a child process and returns.
+        """
+        self.event_pending.clear()
+        while self.events:
+            doc = self.events.popleft()
+            code = doc.get("ev")
+            handler = EVENT_HANDLERS.get(code)
+            if handler is None:
+                # A firmware newer than this daemon. Log it once per event so an
+                # unrecognised button is visible in the field, and do nothing —
+                # guessing at an unknown code is how a "go ahead" turns into a
+                # report round nobody asked for.
+                log(f"Ignoring unknown device event {code}")
+                continue
+            await handler(self, doc)
+
+    async def on_report_event(self, _doc: dict) -> None:
+        """The report button: ask the fleet what it is doing."""
+        global _report_round
+        if report_round_in_flight():
+            # Not the dispatcher's 5-minute rate limit (that is its own, and it
+            # still applies) — this is the narrower case of a press landing
+            # while the previous round's child process is still alive.
+            log("REPORT: a round is already running; ignoring this press")
+            return
+        log("REPORT: button pressed — dispatching a round")
+        _report_round = asyncio.ensure_future(run_report_round())
+        # Retrieve the result so a task nobody awaits cannot log
+        # "exception was never retrieved" at shutdown.
+        _report_round.add_done_callback(_report_round_done)
 
     def probe_session_support(self) -> None:
         """Decide once per connection whether this device has the SS characteristic.
@@ -539,6 +769,22 @@ class Session:
             # silent-freeze failure mode, SC#2 field report).
             log(f"Write failed: {e}")
             return False
+
+
+def _report_round_done(task) -> None:
+    """Drain a finished round's result. Nothing here can raise into the loop."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:  # pragma: no cover - run_report_round catches its own
+        log(f"REPORT ROUND CRASHED: {type(exc).__name__}: {exc}")
+
+
+# One entry per device event code. Adding the "go ahead" button is a new code
+# and a new handler in this table — not a redesign of the channel.
+EVENT_HANDLERS = {
+    EVENT_REPORT: Session.on_report_event,
+}
 
 
 def _extract_access_token(blob: str) -> str | None:
@@ -718,6 +964,7 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
     log("Connected")
     session = Session(client)
     await session.setup_refresh_subscription()
+    await session.setup_event_subscription()
     session.probe_session_support()
 
     last_poll = 0.0  # D-03: poll immediately on first connect
@@ -805,12 +1052,18 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
             # usually finds nothing and, when it does, one small GATT write.
             await session.maybe_send_sessions()
 
+            # Whatever the device's buttons notified since the last tick. A
+            # report round hands off to a child process and returns, so this
+            # costs the tick nothing even when a round takes three minutes.
+            await session.handle_events()
+
             # Wake on a refresh request OR a stop, whichever comes first. Waking
             # promptly on stop_event is what lets the finally below run
             # client.disconnect() before the process exits, so the peer gets a
             # clean GATT disconnect (returns to its waiting screen) instead of
             # being left frozen on stale data after Quit (SC#3 graceful shutdown).
-            await _wait_first(session.refresh_requested, stop_event, timeout=TICK)
+            await _wait_first(session.refresh_requested, session.event_pending,
+                              stop_event, timeout=TICK)
     finally:
         # Clean GATT disconnect on the way out — this is what tells the peripheral
         # the link is gone. WinRT can surface a raw OSError (not BleakError) here,
