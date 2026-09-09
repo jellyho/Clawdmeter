@@ -235,6 +235,29 @@ on a card that never had one, and `mid` is what a dismissal remembers.
 
 Older readers ignore the key, so the payload contract is untouched.
 
+### Tapping a card asks; it does not act
+
+A tap on a card **selects** it and raises an action bar along the bottom of the
+tab:
+
+```
+[ GO AHEAD ]  [ WAIT ]      on a report that says an agent is waiting
+[ DISMISS  ]  [ WAIT ]      on anything else
+```
+
+The first cut acted on the tap itself — a tap on a NEEDS-YOU card sent the go
+ahead, a tap on anything else cleared it — and that was wrong in a way worth
+writing down. It left **no way to be simply done with a card you had decided to
+answer yourself**, and answering it yourself is the normal case: the panel is
+four inches wide and the session is on a keyboard somewhere. It also made the
+one card that matters most behave unlike every other card on the tab.
+
+So **WAIT is a real answer**, and the common one. It sends nothing, clears
+nothing, and leaves the card exactly where it is. **The card goes when the
+AGENT moves** and the host stops sending the row — not when the owner has
+finished looking at it. That is what makes the tab worth glancing at: a card
+still on screen means a session that still needs somebody.
+
 ### Go ahead
 
 `{"ev":2}` is the answer to a `NEEDS-YOU` card, and only to that one. The other
@@ -243,6 +266,13 @@ three report states do not get it, for a reason sharper than tidiness:
 message queues *behind* the dialog and changes nothing, and `WORKING` / `DONE`
 are not waiting for anything. A button that appeared to resume those would be a
 button that silently did nothing.
+
+**It does not remove the card either.** The agent has to actually move first,
+and the host stops sending the row when it does. In between, the card's chip
+changes from `needs you` to `go ahead sent` and its pulse stops — which is what
+keeps the owner from pressing again and interrupting the agent twice while it
+gets going. That marker is keyed on the row's content hash, so the moment the
+agent says anything new it lapses by itself.
 
 The daemon resolves the sid through the index and spawns
 `clawdmeter_report.py --go-ahead <agent>`. That is **not a round**: no listing
@@ -271,11 +301,13 @@ rather than a nudge will ask again, and that answer belongs on a keyboard.
 
 ### Dismiss
 
-`{"ev":3}` is what a tap on any other card sends. **The device has already
-hidden it** — that happens under the finger, with no round trip, and it is what
-makes the gesture feel like anything. The event exists so the *host* stops
-re-sending the row, which is what makes the dismissal outlive a reboot of the
-panel.
+`{"ev":3}` is the other primary action, and it is offered on the cards nothing
+is waiting on: mail you have read, a report that says an agent is busy, the
+overflow footnote. Those have no "the session moved" moment to wait for, so the
+owner is the only thing that can end them. **The device hides the card
+immediately** — with no round trip, so it leaves under the finger — and the
+event exists so the *host* stops re-sending the row, which is what makes the
+dismissal outlive a reboot of the panel.
 
 Both ends key the dismissal on the **words**, not on the sid: the firmware on a
 hash of (sid, label, body, state), the host on the message id, which is already

@@ -709,6 +709,13 @@ struct ChatCard {
     uint32_t sig;                // row_sig() of the row on screen; what a
                                  // dismissal remembers, so the same words stay
                                  // gone and new ones come back
+    // The sig this card was ANSWERED at, or 0. A go-ahead does not remove the
+    // card -- the agent has to actually move first, and the host will stop
+    // sending the row when it does -- so between the press and that moment the
+    // card has to say that its word is already on its way, or the owner
+    // presses again and interrupts the agent twice. Cleared by the agent
+    // saying anything new, because that changes the sig.
+    uint32_t answered_sig;
 };
 
 static lv_obj_t* focus_group = nullptr;   // ONE-CHAT (§1.3)
@@ -936,6 +943,41 @@ static uint32_t  s_th_called_ms = 0;  // 0 = idle, else the tick of the press
 #define TOWN_HALL_COOLDOWN_MS 30000
 
 static void town_hall_tap_cb(lv_event_t* e);
+
+
+// ---- The action bar ----
+// Tapping a card does not DO anything. It SELECTS the card and offers what can
+// be done with it, in a bar along the bottom of the tab:
+//
+//   [ GO AHEAD ]  [ WAIT ]     on a report that says an agent is waiting
+//   [ DISMISS  ]  [ WAIT ]     on anything else
+//
+// The first cut acted on the tap itself, and it was wrong in a way worth
+// writing down. A tap that sent the owner's "go ahead" left no way to be
+// simply DONE with a card you had decided to answer yourself -- and answering
+// it yourself is the normal case, because the panel is four inches wide and
+// the session is on a keyboard somewhere. So the tap asks, and WAIT is a real
+// answer: it sends nothing, clears nothing, and leaves the card exactly where
+// it is.
+//
+// WHICH MEANS THE CARD OUTLIVES THE GESTURE. It goes when the AGENT moves and
+// the host stops sending the row -- not when the owner has finished looking at
+// it. That is the whole point of the tab: it mirrors what is true elsewhere,
+// so a card that is still there means a session that still needs somebody.
+static lv_obj_t* act_bar    = nullptr;
+static lv_obj_t* act_do     = nullptr;   // GO AHEAD / DISMISS
+static lv_obj_t* act_do_lbl = nullptr;
+static lv_obj_t* act_wait   = nullptr;
+static ChatCard* s_sel      = nullptr;   // the selected card, or none
+
+#define ACT_BAR_H   64
+#define ACT_BTN_H   48
+
+static void card_select(ChatCard* c);
+static void card_deselect(void);
+static void act_do_cb(lv_event_t* e);
+static void act_wait_cb(lv_event_t* e);
+static void chat_card_mark_answered(ChatCard* c);
 
 static void card_tap_cb(lv_event_t* e);
 
@@ -1645,6 +1687,13 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
     // What a tap on this card will mean, and what a dismissal will remember.
     c->state = r->state;
     c->sig   = row_sig(r);
+    // Answered, and the agent has not said anything since -- the go-ahead is
+    // on its way but nothing has moved yet. The card stays (only the agent
+    // moving can remove it) and stops asking: no pulse, and the chip says so.
+    // The instant the agent reports again the sig changes and this lapses by
+    // itself, which is the whole reason it is keyed on the sig and not a bool.
+    const bool answered = (c->answered_sig != 0 && c->answered_sig == c->sig);
+    if (answered) c->waiting = false;
     // The tier is the first thing decided, because it is an input to every
     // colour written below it (card_col) — including the ones inside
     // chat_card_apply_kind.
@@ -1690,11 +1739,14 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
         // status and not mail. An empty chip (a plain message, or the
         // overflow footnote whose label already carries its count) hides the
         // widget instead.
-        const char* chip = session_report_chip(r->state);
+        const char* chip = answered ? "go ahead sent"
+                                    : session_report_chip(r->state);
+        const lv_color_t chip_col = answered ? COL_DIM
+                                             : session_chip_color(r->state);
         int chip_w = 0;   // rendered width + gap; 0 when there is no chip
         if (chip[0]) {
             set_label_if_changed(c->lbl_agents, chip);
-            lv_obj_set_style_text_color(c->lbl_agents, card_col(c, session_chip_color(r->state)), 0);
+            lv_obj_set_style_text_color(c->lbl_agents, card_col(c, chip_col), 0);
             lv_obj_set_style_text_opa(c->lbl_agents,
                                       c->waiting ? (lv_opa_t)pulse_val : LV_OPA_COVER, 0);
             lv_obj_clear_flag(c->lbl_agents, LV_OBJ_FLAG_HIDDEN);
@@ -2012,7 +2064,12 @@ static void chats_set_content(const SessionList* list) {
     // Chats that closed: fade out; their slot is reclaimed by the slide (§2.3).
     for (auto& c : chat_cards) {
         if (!c.used || c.claimed) continue;
+        // The selection cannot outlive its card -- the pool is about to hand
+        // this widget to a different chat, and a bar still pointing at it
+        // would act on whatever moved in.
+        if (s_sel == &c) card_deselect();
         c.used = false;
+        c.answered_sig = 0;
         c.waiting = false;
         c.sid[0] = 0;
         c.target_y = -1;
@@ -2047,23 +2104,8 @@ static void sessions_render(void) {
 }
 
 // ---- What a tap on a card means ----
-// One gesture, two meanings, and the state is the whole switch (see the note
-// on SESSION_REPORT_NEEDS_YOU in data.h):
-//
-//   NEEDS_YOU   an agent stopped and is waiting for a word    -> GO AHEAD
-//   everything else                                           -> CLEAR IT
-//
-// GO AHEAD is not offered on the other three report states on purpose, and the
-// reason is not tidiness: BLOCKED is parked on a permission dialog on somebody
-// else's machine, where a message queues BEHIND the dialog and changes nothing,
-// and WORKING/DONE are not waiting for anything. A button that appeared to
-// resume those would be a button that silently did nothing.
-//
-// A FAILED GO AHEAD KEEPS THE CARD. Dismissing on a send that did not land
-// would tell the owner their answer went out when it did not -- the one lie
-// this tab must not tell. A dismissal, by contrast, goes through whatever the
-// link is doing: it is a local decision, and the event to the host is only
-// there to make it outlive a reboot.
+// It SELECTS the card. It does not act on it -- see the note on the action bar
+// above for why the first cut, which acted on the tap itself, was wrong.
 static void card_tap_cb(lv_event_t* e) {
     // LVGL still delivers CLICKED on the release that ended a swipe. The tab
     // has already changed underneath the finger by then; the flag the splash
@@ -2071,22 +2113,111 @@ static void card_tap_cb(lv_event_t* e) {
     if (s_gesture_used) return;
     ChatCard* c = (ChatCard*)lv_event_get_user_data(e);
     if (!c || !c->used) return;
+    if (s_sel == c) { card_deselect(); return; }   // a second tap closes it
+    card_select(c);
+}
 
-    if (c->state == SESSION_REPORT_NEEDS_YOU) {
+// Is this card one an agent is waiting on? The whole action-bar vocabulary
+// turns on it (see the note on SESSION_REPORT_NEEDS_YOU in data.h). The other
+// three report states are excluded on purpose: BLOCKED is parked on a
+// permission dialog on another machine, where a message queues BEHIND the
+// dialog and changes nothing, and WORKING/DONE are not waiting for anything.
+static bool card_can_resume(const ChatCard* c) {
+    return c && c->state == SESSION_REPORT_NEEDS_YOU &&
+           c->answered_sig != c->sig;
+}
+
+static void card_select(ChatCard* c) {
+    s_sel = c;
+    if (act_do_lbl)
+        lv_label_set_text(act_do_lbl, card_can_resume(c) ? "GO AHEAD" : "DISMISS");
+    if (act_bar) {
+        lv_obj_remove_flag(act_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(act_bar);
+    }
+    // Give the list a bar's worth of extra scroll, so the card the bar covers
+    // can still be brought into view instead of being unreachable while a
+    // selection is open.
+    if (cards_cont) lv_obj_set_style_pad_bottom(cards_cont, ACT_BAR_H, 0);
+    // The selected card says so. A border rather than a fill: the card's own
+    // colours already carry its state, and a highlight that changed them would
+    // make a waiting card look like a different kind of waiting.
+    if (c->card) {
+        lv_obj_set_style_border_color(c->card, COL_ACCENT, 0);
+        lv_obj_set_style_border_opa(c->card, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(c->card, 2, 0);
+    }
+}
+
+static void card_deselect(void) {
+    if (s_sel && s_sel->card) lv_obj_set_style_border_width(s_sel->card, 0, 0);
+    s_sel = nullptr;
+    if (act_bar) lv_obj_add_flag(act_bar, LV_OBJ_FLAG_HIDDEN);
+    if (cards_cont) lv_obj_set_style_pad_bottom(cards_cont, 0, 0);
+}
+
+// Repaint one card as answered right now. The next payload would do it anyway
+// (chat_card_set_row reads answered_sig), but the next payload is up to five
+// seconds away and the owner has just pressed a button.
+static void chat_card_mark_answered(ChatCard* c) {
+    if (!c || !c->card) return;
+    c->waiting = false;
+    if (c->lbl_agents) {
+        lv_obj_remove_flag(c->lbl_agents, LV_OBJ_FLAG_HIDDEN);
+        set_label_if_changed(c->lbl_agents, "go ahead sent");
+        lv_obj_set_style_text_color(c->lbl_agents, card_col(c, COL_DIM), 0);
+        lv_obj_set_style_text_opa(c->lbl_agents, LV_OPA_COVER, 0);
+    }
+    // The pulse leaves the dot and the words wherever it was mid-cycle;
+    // put them back to fully drawn.
+    if (c->dot) lv_obj_set_style_bg_opa(c->dot, LV_OPA_COVER, 0);
+    if (c->lbl_state) lv_obj_set_style_text_opa(c->lbl_state, LV_OPA_COVER, 0);
+}
+
+// WAIT. Sends nothing, clears nothing, and leaves the card where it is --
+// which is the point: the owner is going to answer that session on a keyboard,
+// and the card should go when the SESSION moves, not when they have finished
+// reading it.
+static void act_wait_cb(lv_event_t* e) {
+    (void)e;
+    if (s_gesture_used) return;
+    card_deselect();
+}
+
+static void act_do_cb(lv_event_t* e) {
+    (void)e;
+    if (s_gesture_used) return;
+    ChatCard* c = s_sel;
+    if (!c || !c->used) { card_deselect(); return; }
+
+    if (card_can_resume(c)) {
+        // GO AHEAD. The card is NOT removed: the agent has to actually move
+        // first, and the host stops sending the row when it does. Marking it
+        // answered is what stops a second press interrupting the agent twice
+        // while it gets going.
         if (!ble_send_event(BLE_EVENT_GO_AHEAD, c->sid)) {
             session_toast("No host - not sent", COL_AMBER);
-            return;                       // nothing went anywhere; keep the card
+            card_deselect();
+            return;
         }
+        c->answered_sig = c->sig;
         session_toast("Go ahead sent", COL_GREEN);
-    } else {
-        ble_send_event(BLE_EVENT_DISMISS, c->sid);   // advisory; see ble.h
-        session_toast("Cleared", COL_DIM);
+        card_deselect();
+        chat_card_mark_answered(c);
+        return;
     }
 
+    // DISMISS. Only for the cards nothing is waiting on -- mail already read,
+    // a report that says an agent is busy, the overflow footnote. These have
+    // no "the session moved" moment to wait for, so the owner is the only
+    // thing that can end them.
+    ble_send_event(BLE_EVENT_DISMISS, c->sid);   // advisory; see ble.h
+    session_toast("Cleared", COL_DIM);
     remember_dismissed(c->sig);
-    // The owner cleared these themselves, so the linger -- which exists to stop
+    card_deselect();
+    // The owner cleared this themselves, so the linger -- which exists to stop
     // the view snapping away when a chat closes on its own -- would be exactly
-    // wrong here: they are waiting for the cards to go.
+    // wrong here: they are waiting for the card to go.
     s_chats_linger = false;
     filter_dismissed(&s_shown, &s_shown);
     sessions_render();
@@ -2429,6 +2560,68 @@ static void build_session_views(lv_obj_t* parent) {
     lv_obj_align(th_cap, LV_ALIGN_CENTER, 0, th_dy + th_d / 2 + 34);
     empty_hint = th_cap;   // the resolver still hides this line when the link is down
 
+    // The action bar. Parented on the TAB rather than on a card, because the
+    // cards live in a scrolling viewport: a bar inside it would scroll away
+    // from the selection it belongs to, and one anchored to a card would have
+    // to move every time the list re-sorts underneath.
+    act_bar = lv_obj_create(parent);
+    lv_obj_set_size(act_bar, L.scr_w, ACT_BAR_H);
+    lv_obj_set_style_bg_color(act_bar, COL_BG, 0);
+    lv_obj_set_style_bg_opa(act_bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(act_bar, 0, 0);
+    lv_obj_set_style_border_width(act_bar, 0, 0);
+    lv_obj_set_style_pad_all(act_bar, 0, 0);
+    lv_obj_clear_flag(act_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(act_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(act_bar, LV_OBJ_FLAG_HIDDEN);
+
+    {
+        // Two buttons, and the split is not even: the one that SENDS gets the
+        // room and the colour, the one that does nothing is an outline. A bar
+        // where both looked equally like the thing to press would make WAIT --
+        // the safe answer, and the common one -- as easy to hit by accident as
+        // interrupting an agent.
+        const int gap  = 12;
+        const int side = L.margin;
+        const int w    = L.scr_w - 2 * side - gap;
+        const int wide = w * 3 / 5;
+
+        act_do = lv_obj_create(act_bar);
+        lv_obj_set_size(act_do, wide, ACT_BTN_H);
+        lv_obj_set_style_radius(act_do, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(act_do, COL_ACCENT, 0);
+        lv_obj_set_style_bg_color(act_do, lv_color_hex(0xa85639), LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(act_do, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(act_do, 0, 0);
+        lv_obj_set_style_pad_all(act_do, 0, 0);
+        lv_obj_clear_flag(act_do, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(act_do, act_do_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_align(act_do, LV_ALIGN_LEFT_MID, side, 0);
+        act_do_lbl = lv_label_create(act_do);
+        lv_obj_set_style_text_font(act_do_lbl, L.bt_credit_2_font, 0);
+        lv_obj_set_style_text_color(act_do_lbl, COL_BG, 0);
+        lv_obj_center(act_do_lbl);
+
+        act_wait = lv_obj_create(act_bar);
+        lv_obj_set_size(act_wait, w - wide, ACT_BTN_H);
+        lv_obj_set_style_radius(act_wait, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(act_wait, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_bg_color(act_wait, COL_PANEL, LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(act_wait, LV_OPA_COVER, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(act_wait, COL_DIM, 0);
+        lv_obj_set_style_border_width(act_wait, 1, 0);
+        lv_obj_set_style_border_opa(act_wait, LV_OPA_40, 0);
+        lv_obj_set_style_pad_all(act_wait, 0, 0);
+        lv_obj_clear_flag(act_wait, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(act_wait, act_wait_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_align(act_wait, LV_ALIGN_RIGHT_MID, -side, 0);
+        lv_obj_t* wl = lv_label_create(act_wait);
+        lv_label_set_text(wl, "WAIT");
+        lv_obj_set_style_text_font(wl, L.bt_credit_2_font, 0);
+        lv_obj_set_style_text_color(wl, COL_DIM, 0);
+        lv_obj_center(wl);
+    }
+
     // The toast. Parented on the TAB, above both sub-views, so a tap that
     // clears the last card can still be acknowledged by a screen that has just
     // become the empty one.
@@ -2513,6 +2706,7 @@ static void update_session_view(void) {
         }
     }
     if (v == session_view) return;
+    if (v == 0) card_deselect();     // nothing left to act on
     session_view = v;
     lv_obj_add_flag(focus_group, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
@@ -2680,6 +2874,7 @@ static void sessions_tick(void) {
 // that is STILL waiting when the host comes back notifies again instead of
 // being swallowed as "no rising edge".
 static void sessions_link_lost(void) {
+    card_deselect();      // the bar offers actions the link cannot carry
     s_live_count      = 0;
     s_any_notify      = false;
     s_notify_n        = 0;     // re-arms the edge for every sid still in the set
@@ -2700,6 +2895,7 @@ static void sessions_link_lost(void) {
 static void update_session_view(void) {}
 static void sessions_tick(void) {}
 static void sessions_link_lost(void) {}
+static void card_deselect(void) {}
 
 #endif  // BOARD_HAS_SESSION_VIEWS
 
@@ -3386,6 +3582,11 @@ static void show_screen(screen_t screen, bool manual) {
     // The user just chose this screen — the auto-jump no longer has a claim on
     // it, so the return trip won't move it back under them.
     if (manual) s_auto_jumped = false;
+
+    // Leaving the sessions tab closes the action bar. Coming back to a
+    // selection made minutes ago, about a card the host may have replaced
+    // since, is a bar whose buttons no longer mean what they said.
+    if (screen != SCREEN_SESSIONS) card_deselect();
 
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     if (sessions_container) lv_obj_add_flag(sessions_container, LV_OBJ_FLAG_HIDDEN);

@@ -5,8 +5,9 @@
 A small ESP32 dashboard I made for my desk to keep an eye on Claude Code usage.
 
 It runs on a [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786) as well as a few other alternative boards and pairs over Bluetooth, the splash screen plays pixel-art Clawd animations that get
-busier when your usage rate climbs. The two side buttons send Space and
-Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
+busier when your usage rate climbs. It also shows the Claude Code sessions that
+need you — including agents on other machines — and lets you answer them from
+the panel.
 
 <img width="1179" height="994" alt="Usage meter" src="https://github.com/user-attachments/assets/83e54aea-0932-428f-94aa-b3ede3a360aa" />
 
@@ -22,11 +23,26 @@ Screens are tabs. **Swipe horizontally to move between them** — left for the n
 |                Sessions                 |                Settings                 |
 | :-------------------------------------: | :-------------------------------------: |
 | ![Sessions](screenshots/sessions.png)   | ![Settings](screenshots/settings.png)   |
-| Live Claude Code chats and what each is doing | On-device preferences, saved to flash |
+| Only what needs a person: agent reports and messages | On-device preferences, saved to flash |
 
-The **Sessions** tab shows every Claude Code chat you have open: what it is doing, how full its context window is, its todo progress, and how long it has been in that state. A chat that needs you — a permission prompt, a question, an error — is drawn in terracotta and sorted to the top. When one of them starts waiting, the device **jumps to this tab on its own** so you notice from across the room. That jump fires once per event, never repeatedly, and it leaves you alone while you are on the Settings tab. When the last waiting chat clears it hands the screen back to where you were about ten seconds later — unless you touched the panel in the meantime, in which case it stays where you left it. Turn the whole thing off in Settings if you would rather it stayed put.
+|                Tap a card                     |               Nothing waiting                |
+| :-------------------------------------------: | :------------------------------------------: |
+| ![Actions](screenshots/sessions-action.png)   | ![Town hall](screenshots/townhall.png)       |
+| Go ahead, or leave it for the keyboard        | The town hall button calls the fleet in      |
 
-This tab needs the session sidecar on the host — see [`daemon/SESSIONS.md`](daemon/SESSIONS.md). Without it the tab is still in the swipe ring but has nothing to list ("No active sessions"); boards too small to host chat cards never have it in their swipe order at all. More than three live sessions scroll: drag the list vertically — the swipe ring only listens to horizontal drags, so the two never fight.
+The **Sessions** tab is not a roster. It shows only what needs a person, which on most days is nothing:
+
+- a Claude Code session **blocked on you** — a permission prompt, a question, an error;
+- a **message another session sent you** (the cross-session `SendMessage` channel);
+- an **agent report** — an answer to a round you called, saying what that agent is doing and whether it is stuck.
+
+Everything idle or busy is dropped on the host before it costs a byte of the payload, so an empty tab means a calm desk rather than a broken feed. When something does start waiting, the device **jumps to this tab on its own** so you notice from across the room. That jump fires once per event, never repeatedly, and it leaves you alone while you are on the Settings tab. When the last waiting session clears it hands the screen back to where you were about ten seconds later — unless you touched the panel in the meantime. Turn it off in Settings if you would rather it stayed put.
+
+**Tap a card and it offers what can be done with it.** A report that says an agent has stopped and is waiting for direction gets **GO AHEAD**, which sends that agent one message telling it to continue — the panel is four inches wide, so it deliberately says nothing more specific than that. Everything else gets **DISMISS**. Both cards also offer **WAIT**, which is the answer most of the time: it sends nothing, clears nothing, and leaves the card exactly where it is, because you are going to answer that session on a keyboard. **The card then disappears when the session actually moves**, not when you have finished looking at it — the tab mirrors what is true elsewhere, so a card still on screen means a session that still needs somebody.
+
+**When there is nothing waiting, the empty space holds the town hall button.** Press it and the host asks every reachable agent to report in; a few seconds later their answers arrive as cards. It exists only on the empty view, and that is deliberate: with cards on screen the meeting has already happened and its minutes are what you are reading. See [`daemon/REPORT.md`](daemon/REPORT.md) for the reply contract and what a round costs.
+
+This tab needs a session source on the host. Two exist: the **hook sidecar** for sessions on this machine ([`daemon/SESSIONS.md`](daemon/SESSIONS.md)) and the **fleet poller** for remote-control sessions, cross-session mail and agent reports ([`daemon/FLEET.md`](daemon/FLEET.md)). Without either, the tab is still in the swipe ring but has nothing to list; boards too small to host chat cards never have it in their swipe order at all. More cards than fit will scroll: drag the list vertically — the swipe ring only listens to horizontal drags, so the two never fight.
 
 The **Settings** tab holds the preferences that used to require a reflash: the reset chime and its volume, auto-jump, whether the device boots to the splash, the clock format, and screen brightness. Each one is written to flash the moment you change it, so they survive a power cut. Rows that a board cannot honour are not shown at all, so a port with no speaker has no chime rows.
 
@@ -210,30 +226,32 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 4. The daemon connects to the ESP32 over BLE and writes a JSON payload to the GATT RX characteristic.
 5. The firmware parses it and updates the LVGL dashboard.
 6. The firmware also tracks the rate of change of session % over a 5-minute window and picks splash animations from the matching mood group.
-7. The two side buttons are independent of all of this — they send Space and Shift+Tab as BLE HID keyboard input to the paired host directly.
+7. Traffic goes the other way too: the device notifies the daemon when you press a button or tap a card, and the daemon acts on it — running a report round, or passing your "go ahead" to the agent on that card.
 
 ## Physical buttons
 
-The board has three side buttons. Left and right send HID keys; the middle (PWR) button cycles splash animations and, held for 3 seconds, triggers pairing mode.
+The board has three side buttons.
 
 | Button           | GPIO         | Function                                                     |
 | ---------------- | ------------ | ------------------------------------------------------------ |
 | **Left**         | GPIO 0       | Hold to send Space (Claude Code voice-mode push-to-talk)     |
 | **Middle** (PWR) | AXP2101 PKEY | On splash: cycle animations. Hold 3s + release: pairing mode |
-| **Right**        | GPIO 18      | Press to send Shift+Tab (Claude Code mode toggle)            |
+| **Right**        | GPIO 18      | Call a report round — the same thing the town hall button does |
 
-Space and Shift+Tab go out as standard BLE HID keyboard reports, so they trigger in whatever window has focus on the paired host — not just Claude Code.
+Space goes out as a standard BLE HID keyboard report, so it triggers in whatever window has focus on the paired host — not just Claude Code. The right button used to send Shift+Tab the same way and no longer sends HID at all: a round costs quota on other people's machines, and a button that also typed into whatever happened to have focus was the wrong thing to put that behind. Its first press on a dark panel only wakes the screen.
 
 ## BLE protocol
 
 The device advertises a custom GATT service alongside the standard HID keyboard service:
 
-|                            | UUID                                   |
-| -------------------------- | -------------------------------------- |
-| **Data Service**           | `4c41555a-4465-7669-6365-000000000001` |
-| RX Characteristic (write)  | `4c41555a-4465-7669-6365-000000000002` |
-| TX Characteristic (notify) | `4c41555a-4465-7669-6365-000000000003` |
-| **HID Service**            | `00001812-0000-1000-8000-00805f9b34fb` |
+|                                | UUID                                   |
+| ------------------------------ | -------------------------------------- |
+| **Data Service**               | `4c41555a-4465-7669-6365-000000000001` |
+| RX — usage payload (write)     | `4c41555a-4465-7669-6365-000000000002` |
+| TX — acks and device events    | `4c41555a-4465-7669-6365-000000000003` |
+| REQ — "send me data" (notify)  | `4c41555a-4465-7669-6365-000000000004` |
+| SS — session rows (write)      | `4c41555a-4465-7669-6365-000000000005` |
+| **HID Service**                | `00001812-0000-1000-8000-00805f9b34fb` |
 
 JSON payload format (written to RX):
 
@@ -242,6 +260,18 @@ JSON payload format (written to RX):
 ```
 
 Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
+
+Session rows go to **SS** as a positional array — see [`daemon/SESSIONS.md`](daemon/SESSIONS.md) for the field order, which is append-only so an older device and a newer host still understand each other.
+
+**TX carries device → host events**, which is how the buttons and the card taps reach the daemon:
+
+```json
+{"ev":1}                 run a report round
+{"ev":2,"sid":"g4"}      go ahead, to the agent on that card
+{"ev":3,"sid":"g4"}      dismiss that card
+```
+
+`ev` is the discriminator — the ack traffic TX has always carried does not have it, so a subscriber that sees no `ev` knows it is looking at an ack. Every TX notification goes to the **bonded owner only**, on an encrypted link, per connection handle: the channel now carries presses, and NimBLE's plain `notify()` would fan them out to anyone who subscribed.
 
 ## Development
 

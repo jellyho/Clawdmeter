@@ -97,9 +97,10 @@ firmware/src/
   ui.{h,cpp}                — tabbed UI: splash / usage / sessions / settings. The tab ring is
                               built at init from board_caps(), so a board without has_session_views
                               never has that tab; swipe left/right moves between tabs (wrapping).
-                              Session cards are TAP TARGETS (card_tap_cb): a NEEDS-YOU report card
-                              sends go-ahead, anything else dismisses. Clearing the last card
-                              reveals the town hall button, which fires a report round.
+                              Session cards are TAP TARGETS: a tap SELECTS a card and raises the
+                              action bar (GO AHEAD / DISMISS, plus WAIT which does nothing on
+                              purpose). With no cards left, the empty view holds the town hall
+                              button, which fires a report round.
                               compute_layout() picks fonts/positions from board_caps() (responsive
                               — current breakpoint: H >= 460 → large, else compact)
   settings.{h,cpp}          — NVS-backed user settings behind the settings tab. One generic row
@@ -258,14 +259,20 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 
 ## Recent session highlights
 
-- **The sessions tab became something you act on (2026-09-09).** Every card is
-  a tap target and the state is the whole switch: `SESSION_REPORT_NEEDS_YOU`
-  sends **go ahead** to that agent, anything else **dismisses** the card. The
-  three other report states deliberately do *not* offer go-ahead — `BLOCKED`
-  is parked on a permission dialog on another machine, where a message queues
-  *behind* the dialog, and `WORKING`/`DONE` are not waiting for anything. A
-  go-ahead that fails to send keeps its card, because dismissing on a send
-  that did not land would claim the answer went out when it did not.
+- **The sessions tab became something you act on (2026-09-09).** A tap
+  **selects** a card and raises an action bar: `GO AHEAD` on a
+  `SESSION_REPORT_NEEDS_YOU` report, `DISMISS` on anything else, and `WAIT`
+  on both. The first cut acted on the tap itself and had to be redone — it
+  left no way to be *done* with a card you had decided to answer on a
+  keyboard, which is the normal case. **WAIT sends nothing and clears
+  nothing**, and neither does GO AHEAD remove its card: the row goes when the
+  AGENT moves and the host stops sending it, so a card on screen always means
+  a session that still needs somebody. Between the press and that moment the
+  chip reads `go ahead sent` and the pulse stops (keyed on the row's content
+  hash, so it lapses the instant the agent says anything new). The three other
+  report states deliberately do *not* offer go-ahead — `BLOCKED` is parked on
+  a permission dialog on another machine, where a message queues *behind* the
+  dialog, and `WORKING`/`DONE` are not waiting for anything.
   Clearing the last card reveals the **town hall button** — a terracotta
   circle on the empty view that fires the same round the hardware button
   does. It exists only there: with cards on screen the meeting has already
