@@ -82,3 +82,34 @@ clock = off
 # fits five reports plus the "+N MORE" marker in ONE ATT write at the 517-byte
 # MTU the firmware requests. See daemon/REPORT.md for the arithmetic.
 # sessions_budget_bytes = 500
+
+# ---------------------------------------------------------------------------
+# Remote fleet (daemon/FLEET.md) -- sessions on your OTHER machines
+# ---------------------------------------------------------------------------
+# Off by default. Needs an interactive `claude` login on this machine; an
+# ANTHROPIC_API_KEY does not work. Run one producer at a time: this and the
+# hook sidecar above write the same ~/.clawdmeter/sessions.json.
+# fleet = off
+
+# Show only the remote sessions that need a PERSON -- an agent stopped at a
+# permission prompt, asking a question, or waiting for input. Idle and merely
+# working sessions never reach the panel.
+#
+# `off` restores the full roster, which is what this used to be and what made
+# it worth changing: nine rows, seven idle, two of them idle for five and seven
+# DAYS. A list like that is not information on a device you read at a glance,
+# and it crowds out the one row that mattered.
+# fleet_attention_only = on
+
+# How long the listing must fail CONTINUOUSLY before the device is told, in
+# seconds. Below this the last good rows keep shipping (a blip must not blank a
+# panel); above it the poller DROPS every row that came from the listing and
+# sends one dim "FLEET DATA STALE" card in their place, saying why and how old
+# the data is.
+#
+# 900 s is 30 consecutive poll failures, chosen against the common failure: the
+# OAuth token lives about five hours and Claude Code refreshes the credential
+# file itself, so a 401 usually heals on its own within a poll or two. Shouting
+# on the first one would mean shouting several times a day about nothing. Set 0
+# to mark the panel stale on the first failure.
+# fleet_stale_after_s = 900

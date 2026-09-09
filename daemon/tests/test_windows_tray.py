@@ -331,3 +331,137 @@ def test_main_runs_in_background_thread_without_signal_error():
 
     assert not t.is_alive(), "daemon main() hung in background thread"
     assert not errors, f"main() raised in a background thread: {errors!r}"
+
+
+# ---------------------------------------------------------------------------
+# FleetSupervisor — the fix for "it died and nothing noticed"
+# ---------------------------------------------------------------------------
+# Field failure: the remote-fleet poller stopped mid-afternoon and the device
+# went on showing the list it had captured nine hours earlier. The tray already
+# supervises its own daemon thread; this is the same treatment for a process it
+# does not own, watching a heartbeat because the poller may equally have been
+# started by its Run value, by the installer, or by hand.
+
+from daemon.tray_windows import FleetSupervisor
+
+
+def _sup(enabled=True, alive=False, **kw):
+    calls = {"launched": 0, "logs": [], "notices": []}
+
+    def launch():
+        calls["launched"] += 1
+
+    sup = FleetSupervisor(
+        is_enabled=lambda: enabled() if callable(enabled) else enabled,
+        is_alive=lambda now=None: alive() if callable(alive) else alive,
+        launch=launch,
+        log_fn=calls["logs"].append,
+        notify=lambda msg, title=None: calls["notices"].append(msg),
+        **kw)
+    return sup, calls
+
+
+def test_a_healthy_poller_is_left_alone():
+    sup, calls = _sup(enabled=True, alive=True)
+    assert sup.step(now=0.0) is False
+    assert calls["launched"] == 0
+    assert calls["notices"] == []
+
+
+def test_a_dead_poller_is_restarted():
+    sup, calls = _sup(enabled=True, alive=False)
+    assert sup.step(now=0.0) is True
+    assert calls["launched"] == 1
+
+
+def test_nothing_happens_when_the_owner_has_not_asked_for_a_poller():
+    """Do not turn on what is off today: supervision follows the autostart
+    entry, which is the owner's stated intent to have a poller running."""
+    sup, calls = _sup(enabled=False, alive=False)
+    assert sup.step(now=0.0) is False
+    assert calls["launched"] == 0
+    assert calls["notices"] == []
+
+
+def test_one_notice_per_outage_not_one_per_tick():
+    """Same rule the error toast follows: transitions, not ticks."""
+    sup, calls = _sup(enabled=True, alive=False)
+    for t in range(0, 3600, 30):
+        sup.step(now=float(t))
+    assert len(calls["notices"]) == 1
+
+
+def test_restarts_back_off_and_are_capped():
+    sup, calls = _sup(enabled=True, alive=False)
+    launched_at = []
+    for t in range(0, 4000):
+        if sup.step(now=float(t)):
+            launched_at.append(t)
+    gaps = [b - a for a, b in zip(launched_at, launched_at[1:])]
+    assert gaps[0] == FleetSupervisor.IDLE_BACKOFF_S
+    assert gaps == sorted(gaps), "backoff must never shrink while it is down"
+    assert max(gaps) <= FleetSupervisor.MAX_BACKOFF_S
+
+
+def test_recovery_rearms_the_whole_thing():
+    state = {"alive": False}
+    sup, calls = _sup(enabled=True, alive=lambda: state["alive"])
+    sup.step(now=0.0)
+    sup.step(now=100.0)
+    assert calls["launched"] >= 2
+    state["alive"] = True
+    sup.step(now=200.0)
+    assert sup.backoff == FleetSupervisor.IDLE_BACKOFF_S
+    assert sup.down is False
+    state["alive"] = False
+    assert sup.step(now=300.0) is True          # immediate, not still backed off
+    assert len(calls["notices"]) == 2           # a second outage is news again
+
+
+def test_a_broken_seam_never_stops_the_supervisor():
+    """A supervisor that raises is a supervisor that stops supervising —
+    exactly the failure it exists to prevent."""
+    def boom():
+        raise RuntimeError("registry on fire")
+
+    sup = FleetSupervisor(is_enabled=boom, is_alive=lambda now=None: False,
+                          launch=lambda: None, log_fn=lambda m: None)
+    assert sup.step(now=0.0) is False
+    assert sup.step(now=100.0) is False
+
+
+def test_a_failing_launch_is_survived_and_retried():
+    attempts = {"n": 0}
+
+    def launch():
+        attempts["n"] += 1
+        raise OSError("cannot spawn")
+
+    sup = FleetSupervisor(is_enabled=lambda: True,
+                          is_alive=lambda now=None: False,
+                          launch=launch, log_fn=lambda m: None)
+    for t in range(0, 2000):
+        sup.step(now=float(t))
+    assert attempts["n"] > 1
+
+
+def test_the_check_interval_matches_the_pollers_own_cadence():
+    import daemon.clawdmeter_fleet as fleet
+    from daemon.tray_windows import FLEET_CHECK_S
+    assert FLEET_CHECK_S == fleet.POLL_INTERVAL_S
+
+
+def test_the_supervisor_defaults_to_the_real_seams():
+    """No injection: the arming test is the fleet Run value and the liveness
+    test is the poller's heartbeat. If either name moved, this would not
+    resolve — and the supervisor would silently watch nothing."""
+    import daemon.autostart_windows as autostart
+    import daemon.clawdmeter_fleet as fleet
+    from daemon.tray_windows import (_fleet_autostart_enabled, _fleet_is_alive,
+                                     launch_fleet_poller)
+    sup = FleetSupervisor()
+    assert sup._is_enabled is _fleet_autostart_enabled
+    assert sup._is_alive is _fleet_is_alive
+    assert sup._launch is launch_fleet_poller
+    assert callable(autostart.is_fleet_enabled)
+    assert callable(fleet.is_alive)

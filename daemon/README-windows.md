@@ -253,6 +253,49 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ClawdmeterSes
 the sidecar from listening. The installed hooks can stay: they POST
 asynchronously to a port nobody is listening on, which costs a session nothing.
 
+### Remote fleet (optional)
+
+Shows the Claude Code sessions you drive through **Remote Control** on *other*
+machines — but only the ones that need a person. Full design:
+[FLEET.md](FLEET.md). **Off by default**, and it is the alternative producer to
+the hook sidecar above: run one or the other, never both.
+
+```powershell
+# 1. one interactive `claude` login on this machine (an API key does not work)
+# 2. in %LOCALAPPDATA%\Clawdmeter\config:
+#      fleet = on
+#      sessions_budget_bytes = 500
+# 3. see what it would send, without touching the device:
+python daemon\clawdmeter_fleet.py --once --force
+```
+
+To have it start at logon **and be restarted if it dies** — tick
+**Start fleet poller at login** in the tray menu, or:
+
+```powershell
+python -c "import daemon.autostart_windows as a; a.enable_fleet()"
+```
+
+That writes a third `HKCU\...\Run` value, `ClawdmeterFleet`, and arms the
+tray's supervisor: the poller stamps
+`%LOCALAPPDATA%\Clawdmeter\fleet.heartbeat` on every 30 s listing poll, and
+the tray restarts it after four missed stamps. Both halves exist because the
+poller once died mid-afternoon and the device showed a nine-hour-old list until
+somebody noticed by eye.
+
+Logs: `%LOCALAPPDATA%\Clawdmeter\fleet.log` (no console under `pythonw`).
+
+To turn it off:
+
+```powershell
+python -c "import daemon.autostart_windows as a; a.disable_fleet()"
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ClawdmeterFleet /f
+```
+
+...and set `fleet = off` in the config, which is what actually stops a running
+poller from publishing. Disabling the autostart entry also disarms the
+supervisor; it never restarts a poller the owner has not asked for.
+
 ### WSL independence
 
 The daemon operates fully independently of WSL. The token is read from native Windows

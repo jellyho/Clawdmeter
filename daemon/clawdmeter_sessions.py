@@ -174,8 +174,8 @@ _HANDLED = frozenset(HOOK_EVENTS)
 _FILE_LOGGER = None
 
 
-def enable_file_log():
-    """Mirror log output into %LOCALAPPDATA%\\Clawdmeter\\sessions.log (Windows).
+def enable_file_log(filename="sessions.log", logger_name="clawdmeter.sessions"):
+    """Mirror log output into %LOCALAPPDATA%\\Clawdmeter\\<filename> (Windows).
 
     Autostart launches the sidecar under pythonw.exe, which has no console at
     all: stdout is discarded and is in fact None. A rotating file is then the
@@ -183,6 +183,13 @@ def enable_file_log():
     reasoning (and the same directory) as the Windows daemon's daemon.log.
     Called from main() and never at import, so importing this module as a
     library or unit-testing its helpers writes no files.
+
+    The name is a parameter because the fleet poller is a SECOND autostarted,
+    console-less process with the same problem and no business writing into
+    the sidecar's log -- they are alternative producers of the same handoff
+    file, so interleaving their lines would make both unreadable. It calls
+    enable_file_log("fleet.log", "clawdmeter.fleet"); whichever of the two is
+    running claims _FILE_LOGGER, and they are never both running.
     """
     global _FILE_LOGGER
     if sys.platform != "win32" or _FILE_LOGGER is not None:
@@ -192,7 +199,7 @@ def enable_file_log():
     base = os.environ.get("LOCALAPPDATA") or os.path.join(
         os.path.expanduser("~"), "AppData", "Local"
     )
-    path = os.path.join(base, "Clawdmeter", "sessions.log")
+    path = os.path.join(base, "Clawdmeter", filename)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
@@ -201,11 +208,22 @@ def enable_file_log():
     except OSError:
         return  # best-effort: logging setup must never stop the sidecar
     handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
-    logger = logging.getLogger("clawdmeter.sessions")
+    logger = logging.getLogger(logger_name)
     logger.handlers = [handler]
     logger.setLevel(logging.INFO)
     logger.propagate = False
     _FILE_LOGGER = logger
+
+
+def file_log(msg):
+    """Write one line to the rotating file log, if enable_file_log() set one up.
+
+    Exposed so a second module (clawdmeter_fleet) can mirror its own prefixed
+    output into the same machinery without borrowing this module's log()
+    format on top of its own.
+    """
+    if _FILE_LOGGER is not None:
+        _FILE_LOGGER.info(msg)
 
 
 def log(msg):

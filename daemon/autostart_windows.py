@@ -20,6 +20,19 @@ it:
   enable_sessions(sidecar_script=None)
   disable_sessions()
   is_sessions_enabled()
+
+The remote-fleet poller (daemon/FLEET.md) is the third such process and gets
+the same treatment under its own name, for the same reason -- it is an
+independent opt-in, and turning one off must never turn another off:
+
+  enable_fleet(fleet_script=None)
+  disable_fleet()
+  is_fleet_enabled()
+
+Also here, because it belongs with "start exactly one of me at logon" rather
+than in any single process:
+
+  acquire_single_instance(name)  -- named-kernel-mutex process lock
 """
 
 import os
@@ -40,6 +53,10 @@ _VALUE_NAME = "Clawdmeter"
 # The session sidecar is a separate process with a separate opt-in, so it gets
 # its own value: disabling one must never disable the other.
 _SESSIONS_VALUE_NAME = "ClawdmeterSessions"
+# ...and so does the remote-fleet poller. It is the ALTERNATIVE producer of
+# ~/.clawdmeter/sessions.json to the sidecar above (FLEET.md: run one at a
+# time), which is precisely why it must not share a registry value with it.
+_FLEET_VALUE_NAME = "ClawdmeterFleet"
 
 
 def log(msg: str) -> None:
@@ -85,6 +102,22 @@ def _sessions_command(sidecar_script: str | None = None) -> str:
     default = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "clawdmeter_sessions.py")
     script = os.path.abspath(sidecar_script if sidecar_script is not None else default)
+    return f'"{pythonw}" "{script}"'
+
+
+def _fleet_command(fleet_script: str | None = None) -> str:
+    """Build the headless launch command for the remote-fleet poller.
+
+    Same base-pythonw reasoning as _command(); like the sidecar, the poller is
+    stdlib-only, so it needs nothing from the venv. No flags are passed: the
+    config file (`fleet`, `fleet_attention_only`, `fleet_stale_after_s`) is the
+    single source of truth, and a poller started with `fleet = off` logs why it
+    is off and exits.
+    """
+    pythonw = os.path.join(sys.base_exec_prefix, "pythonw.exe")
+    default = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "clawdmeter_fleet.py")
+    script = os.path.abspath(fleet_script if fleet_script is not None else default)
     return f'"{pythonw}" "{script}"'
 
 
@@ -169,3 +202,93 @@ def disable_sessions() -> None:
 def is_sessions_enabled() -> bool:
     """True if the session sidecar is registered to start at logon."""
     return _has_run_value(_SESSIONS_VALUE_NAME)
+
+
+def fleet_command(fleet_script: str | None = None) -> str:
+    """The exact command the fleet Run value launches.
+
+    Public because the tray relaunches a dead poller with it (see
+    tray_windows), and a supervisor that guessed at the command would drift
+    from the autostart entry the first time either changed.
+    """
+    return _fleet_command(fleet_script)
+
+
+def enable_fleet(fleet_script: str | None = None) -> None:
+    """Start the remote-fleet poller at logon (daemon/FLEET.md).  Opt-in:
+    nothing calls this unless the user asked for the remote fleet.
+
+    This is the fix for the failure that motivated it -- the poller died mid
+    afternoon and nothing started it again, so the panel showed a nine-hour-old
+    list.  Autostart covers the reboot; the tray's supervisor covers the death.
+    """
+    cmd = _fleet_command(fleet_script)
+    _set_run_value(_FLEET_VALUE_NAME, cmd)
+    log(f"Fleet poller autostart enabled: {cmd}")
+
+
+def disable_fleet() -> None:
+    """Stop starting the fleet poller at logon.  Idempotent.
+
+    Also disarms the tray's supervisor, which only ever restarts a poller the
+    owner has asked to have running.  It does NOT stop a poller that is running
+    right now, and it does not touch `fleet = on` in the config.
+    """
+    if _delete_run_value(_FLEET_VALUE_NAME):
+        log("Fleet poller autostart disabled")
+
+
+def is_fleet_enabled() -> bool:
+    """True if the fleet poller is registered to start at logon.
+
+    Doubles as the tray supervisor's arming switch: supervision follows the
+    owner's stated intent to have a poller, not the mere presence of one.
+    """
+    return _has_run_value(_FLEET_VALUE_NAME)
+
+
+# ---------------------------------------------------------------------------
+# Single-instance lock
+# ---------------------------------------------------------------------------
+
+_ERROR_ALREADY_EXISTS = 183
+
+
+def acquire_single_instance(name: str):
+    """Acquire a process-wide single-instance lock, or return None.
+
+    Returns a truthy handle to keep alive for the process lifetime when this is
+    the only instance, or None when another process already owns `name` -- the
+    caller must then exit immediately, before touching anything shared.
+
+    A named kernel mutex, not a pidfile: Windows releases it when the owning
+    process dies, however it dies, so there is no stale lock to clean up.  The
+    handle is never closed, because the handle's lifetime IS the lock's.
+
+    This lives here rather than in any one process because it is the other half
+    of an autostart entry: a Run value plus a supervisor that may relaunch means
+    the same program can be asked to start twice, and for the fleet poller two
+    copies would fight over ~/.clawdmeter/sessions.json.
+
+    Off-Windows it is a no-op that always succeeds -- these processes are
+    Windows-only, and the module has to stay importable on the Linux dev box.
+    """
+    if sys.platform != "win32":
+        return object()  # no-op sentinel; never blocks off-Windows
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+
+    handle = kernel32.CreateMutexW(None, True, name)
+    if not handle:
+        # Could not create the mutex at all -- fail OPEN, so a kernel quirk
+        # never stops the process from starting.  Single-instance is
+        # best-effort hardening, not a correctness requirement.
+        return object()
+    if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+        return None
+    return handle

@@ -998,7 +998,8 @@ class InboxWatcher(object):
 
     # -- wire rows ---------------------------------------------------------
 
-    def rows(self, now=None, text_max=None, budget=None):
+    def rows(self, now=None, text_max=None, budget=None,
+             max_rows=DEVICE_MAX_ROWS):
         """Live messages and reports as wire rows, most urgent first.
 
         The per-message length shrinks when several are live at once. Without
@@ -1009,6 +1010,12 @@ class InboxWatcher(object):
         With no reports live this returns exactly what it always did, byte for
         byte: the report round is an added path, not a rewrite of the message
         one, and mail must keep behaving the way it is documented to.
+
+        `max_rows` is the caller's share of the device's row cap. It is a
+        parameter and not the constant because the fleet poller sometimes has
+        to append a row of its own -- the staleness marker -- and a row
+        reserved after the round has been fitted is a row the firmware
+        silently discards (SESSION_MAX_ROWS is 6, and it drops the tail).
         """
         now = self._now() if now is None else now
         cap = self.text_max if text_max is None else text_max
@@ -1018,13 +1025,16 @@ class InboxWatcher(object):
         msg_rows = [message_row(m, now, cap, self.translit, self.keep_hangul)
                     for m in live]
         if not self._reports:
-            return msg_rows
+            # inbox_max_rows already caps this well under the device's own
+            # limit; the slice only matters when a caller has reserved a row.
+            return msg_rows[:max_rows]
 
         budget = self.budget if budget is None else budget
         rcap = report_text_max(budget)
         rep_rows = [report_row(m, now, rcap, self.translit, self.keep_hangul)
                     for m in self.reports_live()]
-        return fit_round(sorted(rep_rows + msg_rows, key=row_rank), budget)
+        return fit_round(sorted(rep_rows + msg_rows, key=row_rank), budget,
+                         max_rows)
 
 
 def message_row(msg, now, text_max=MSG_TEXT_MAX, translit=True,

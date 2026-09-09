@@ -33,3 +33,25 @@ def real_sessions_file():
 def _isolate_sessions_file(tmp_path, monkeypatch):
     if win_mod is not None:
         monkeypatch.setattr(win_mod, "SESSIONS_FILE", tmp_path / "no-sessions.json")
+
+
+try:
+    import daemon.clawdmeter_fleet as fleet_mod
+except Exception:  # pragma: no cover - defensive, same reason as above
+    fleet_mod = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fleet_heartbeat(tmp_path, monkeypatch):
+    """Same hazard as the handoff file, one door along.
+
+    run_loop() stamps a liveness file the tray supervisor reads, and its real
+    path is %LOCALAPPDATA%\\Clawdmeter\\fleet.heartbeat. On a machine that
+    actually runs the poller, a test exercising run_loop would stamp over the
+    live one -- telling the supervisor a dead poller was healthy, which is the
+    precise lie the heartbeat exists to prevent.
+    """
+    if fleet_mod is not None:
+        beat = tmp_path / "fleet.heartbeat"
+        monkeypatch.setattr(fleet_mod, "heartbeat_path",
+                            lambda base=None: str(base or beat))

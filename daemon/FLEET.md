@@ -14,8 +14,10 @@ wire field; see [Wire format additions](#wire-format-additions).)
 Anthropic sessions API ──30 s poll──▶ clawdmeter_fleet.py
                                           │ bridge rows only
 ~/.claude/projects/**/*.jsonl ─2 s tail─▶ │ this machine's own rows removed
-  (messages other sessions sent here)     │ messages first, then sessions
+  (messages other sessions sent here)     │ only rows that NEED A HUMAN
+                                          │ messages first, then sessions
                                           │ sorted attention-first, fitted
+                                          │ + a staleness card when blind
                                           ▼
                                 ~/.clawdmeter/sessions.json
                                           │ on change
@@ -96,6 +98,72 @@ usage screen.
 | Archived and failed rows dropped | Not live status. |
 | This machine's own rows dropped | Matched against `bridgeSessionId` in `~/.claude/sessions/<pid>.json`. You are already looking at that screen. |
 | Disconnected rows dropped | A disconnected bridge is a machine asleep or offline. On a device you read at a glance, a stale card is worse than no card. Pass `--show-offline` to keep them. |
+| **Everything that does not need a human dropped** | See below. Pass `--full-roster` (or `fleet_attention_only = off`) to keep them. |
+
+## Attention, not a roster
+
+**Only rows in the waiting bucket reach the panel.** An agent stopped at a
+permission prompt, asking a question, waiting for input, or in error — those
+are what the Sessions tab is for. An idle remote session does not appear. Nor
+does one that is merely working.
+
+The reason is a real payload, measured on the day this was written:
+
+```
+nine rows, seven of them idle
+  ...two of those idle for FIVE and SEVEN DAYS
+424 bytes of wire budget spent
+  0 of those nine rows needed anybody
+```
+
+That is not information, it is a roster, and on a device you read at a glance a
+roster crowds out the thing that matters. The firmware buys attention with a
+fixed currency — the accent colour, the pulse, the top of the sort, one
+auto-jump — and a list where nothing ever earns any of it teaches you to stop
+looking.
+
+Nothing is lost by dropping them. `requires_action` in the listing remains the
+whole point of the poll: it is the only way the device learns an agent needs a
+person **without being asked**, and that passive signal is the single most
+valuable thing this device does. The filter does not weaken it; it removes
+everything else that was standing next to it.
+
+**What still counts as needing a human**, in full:
+
+| Source | Shown | Why |
+| --- | --- | --- |
+| listing, `requires_action` | yes | A person unblocks it. This is the signal. |
+| listing, `running` / `idle` / anything else | **no** | Nothing to do. |
+| a message from another Claude Code session | yes | Somebody wrote to you, unbidden. |
+| an agent report (any of the four states) | yes | You pressed the button that asked. A round is an answer to a question you just asked, so `WORKING` and `DONE` stay: the round's shape is the information. |
+| the staleness card | yes | Not a session at all — see below. |
+
+Messages and reports are not filtered because they do not come from the
+listing: they are read from local disk, they carry their own expiry, and they
+are attention-shaped by construction.
+
+**What this frees.** The seven idle names were costing ~380 bytes of a 500-byte
+payload. They now cost nine (`{"ss":[]}`), and the whole budget is available
+to the rows that earn it — which matters most for a ten-agent report round,
+where every byte reclaimed is another agent's summary that fits.
+
+**Turning it off**: `fleet_attention_only = off` in the config, or
+`--full-roster` for one run. Everything above about kind, archived rows, this
+machine and disconnected bridges still applies.
+
+### "Nothing needs you" is a screen, not an accident
+
+With the filter on, an empty tab is the normal state and it is good news, so
+the device says so plainly: a dim `Nothing needs you`, with
+`only what needs you shows here` under it — the sub-line exists because a tab
+that used to list nine machines and now lists none has to say that this is the
+design and not a broken feed.
+
+It deliberately does **not** borrow the usage screen's "Zzz" creature. That
+treatment dresses up a *fault* (the host stopped talking) and putting it here
+would make the calm, healthy state the loudest thing on the tab. When the link
+is actually down, this same screen says `Host disconnected` instead, and the
+sub-line goes away.
 
 ## State mapping
 
@@ -113,6 +181,157 @@ subagent counts — go out as the documented "unknown" values, so the device
 **hides** those elements rather than drawing a confident zero. The label is the
 session `title`, falling back to the git repo name, then to "remote"; these
 rows carry no usable working directory.
+
+## When the host goes blind
+
+The poller writes the handoff file **only when something changes**. So "no
+write" is ambiguous between *the fleet is quiet* and *everything is broken* —
+and that ambiguity is not theoretical. It cost a nine-hour outage: an OAuth
+token expired, every poll took HTTP 401, the poller correctly kept the last
+good payload rather than blanking the panel, and then its process died. The
+device showed the previous night's list, all day, with nothing anywhere saying
+so.
+
+The device cannot break that tie on its own. A genuinely quiet fleet
+legitimately sends nothing for hours, so a firmware-side timer would either cry
+wolf on a calm desk or stay silent through a real outage. **The host knows when
+it last succeeded, so the host says it.**
+
+### The contract
+
+| State | What the device gets |
+| --- | --- |
+| listing healthy | the rows, as always |
+| listing failing, **under** `fleet_stale_after_s` | the last good rows, unchanged — a blip must not blank a panel |
+| listing failing, **over** `fleet_stale_after_s` | **every listing row dropped**, replaced by one host-minted card |
+| listing recovers | the card disappears on the next poll; the rows come back |
+
+The card is wire state **17**, `SESSION_HOST_STALE` — the same pattern as the
+report overflow marker (state 16): a row the host minted that is not an agent.
+It is drawn dim, in the idle bucket, and is never in the notify set, because it
+is a fault indication, not an alert. Nothing is waiting on you; the panel has
+simply stopped knowing whether anything is.
+
+```
+FLEET DATA STALE                                               9h
+auth expired - log in to claude
+```
+
+`elapsed` is the age of the last good listing, so the card dates itself. The
+body is the reason in the host's own words:
+
+| Failure | Body |
+| --- | --- |
+| HTTP 401 | `auth expired - log in to claude` |
+| HTTP 403 | `listing refused - no access` |
+| HTTP 404 / 410 | `listing moved or changed shape` |
+| a shape that is not the documented one | `listing moved or changed shape` |
+| network / DNS / timeout | `host cannot reach the listing` |
+| no credential file at all | `no login found - run claude` |
+| anything else | `listing error - HTTP <code>` |
+
+### Why the rows are dropped rather than dimmed
+
+Because of the filter above. After it, the only listing rows that survive at
+all are `requires_action` ones — *this agent needs you now* — and a nine-hour
+old one of those is worse than nothing: it is terra-cotta, it pulses, it sorts
+to the top of the tab and it can pull the panel there, all to send you to a
+machine where nobody is waiting. Keeping them and captioning them would be
+defensible for a roster. It is not defensible for an alert.
+
+The panel's own precedent agrees. The usage screen replaces stale numbers with
+the idle screen rather than dimming them, for the reason written in the
+firmware: *"we never render hours-old numbers as if they were live."*
+
+**Messages and reports are not dropped.** They are read from local disk and are
+still true. So the card means "the listing half of this tab is dark", not
+"nothing here can be trusted" — and it renders as a footnote *under* the live
+rows, exactly like the report round's `+N MORE`.
+
+Its bytes and its row slot are reserved out of the inbox's allowance before a
+report round is fitted, because both caps eat the tail: `fit_payload` drops
+from it, and the firmware parses six rows and discards the rest. The cost is
+that a full round shows one fewer agent while the listing is down, which is the
+right way round — the round has its own footnote to say what it dropped, and
+the staleness card is the only thing on the panel that says the other half of
+the tab is blind.
+
+### Why 900 seconds, and the 401 in particular
+
+`fleet_stale_after_s` defaults to **900** — thirty consecutive failed polls.
+
+The threshold exists almost entirely for the 401. The OAuth token lives about
+five hours, Claude Code refreshes the credential file on its own, and the
+poller re-reads that file on every poll — so a 401 normally heals by itself
+within a poll or two. Shouting on the first one would mean a scary card several
+times a day about nothing, and a card that cries wolf is a card you stop
+reading.
+
+Fifteen minutes gives a refresh thirty chances to land, and still leaves the
+panel honest inside a coffee break rather than the nine hours it was wrong for.
+The clock is anchored to the **last success**, not to the first failure of a
+streak, because the number on the card is *how old this data is*.
+
+A poller that has **never** succeeded runs the same clock from its own start: a
+cold start with a bad credential is exactly as blind as an outage, and you
+should hear about both.
+
+Set `fleet_stale_after_s = 0` to mark the panel stale on the first failure —
+useful for seeing the card:
+
+```bash
+python3 daemon/clawdmeter_fleet.py --once --force --stale-after 0
+```
+
+## Keeping it running
+
+The other half of that nine-hour outage is that the poller **died and nothing
+noticed**. Two mechanisms now cover it, and both are opt-in.
+
+**1. An autostart entry.** A third `HKCU\...\Run` value, `ClawdmeterFleet`,
+beside the tray's `Clawdmeter` and the hook sidecar's `ClawdmeterSessions`.
+Three independent opt-ins, three value names, so turning one off never turns
+another off.
+
+```powershell
+# turn it on (once)
+python -c "import daemon.autostart_windows as a; a.enable_fleet()"
+# ...or tick "Start fleet poller at login" in the tray menu, which also starts
+# one immediately rather than waiting for the next logon.
+
+# off again
+python -c "import daemon.autostart_windows as a; a.disable_fleet()"
+```
+
+**2. A supervisor that notices it is gone.** The poller stamps
+`%LOCALAPPDATA%\Clawdmeter\fleet.heartbeat` on every listing poll; the tray
+checks it every 30 s and, after four missed stamps (120 s), logs, raises one
+toast, and starts a poller again with capped backoff — the same treatment the
+tray already gives its own daemon loop when that crashes.
+
+It watches a **heartbeat**, not a child process, on purpose: the poller may
+have been started by its Run value, by the installer, or by hand from a
+terminal, and a supervisor that only knew about children it spawned itself
+would have been watching nothing at all on the day this was needed. The
+question it asks is "is *a* poller alive", not "is *my* poller alive".
+
+It is armed only when the autostart entry is enabled — that entry is the
+owner's statement that there *should* be a poller running, which is exactly the
+claim a supervisor needs before it acts. With autostart off, the supervisor
+does nothing at all.
+
+A relaunch that races a poller which was merely slow is harmless: the poller
+holds a named single-instance mutex (`Local\Clawdmeter-fleet-singleton`), so
+the second copy exits instead of becoming a second producer of the handoff
+file. `--once` never takes the lock, so you can still diagnose against a
+running poller.
+
+**Logs.** Under `pythonw.exe` started from a Run value there is no console at
+all and `sys.stderr` is `None`, so the poller's `log()` is guarded and mirrored
+into `%LOCALAPPDATA%\Clawdmeter\fleet.log`. This is not a nicety: an
+unguarded `print(file=sys.stderr)` inside the HTTP-error handler would raise
+`AttributeError` out of the except block and kill the poller **on its first
+401** — which is a strong candidate for what actually happened.
 
 ## Messages from other Claude Code sessions
 
@@ -396,6 +615,8 @@ then immediately expired by the 180 s default.
 | `inbox_hangul` | `on` | `off` romanises Korean message bodies instead of sending them as Hangul. Set it when the device is running firmware older than `font_nanum_kr_28`, which draws Hangul as empty boxes. Sender names and session labels are always romanised — their fonts have no Hangul fallback. |
 | `reports` | `on` | `off` reads agent reports as ordinary messages. See [REPORT.md](REPORT.md#config). |
 | `report_expire_s` | `300` | How long an agent report stays on the panel. |
+| `fleet_attention_only` | `on` | `off` restores the full bridge roster. See [Attention, not a roster](#attention-not-a-roster). |
+| `fleet_stale_after_s` | `900` | Seconds of continuous listing failure before the device is told. `0` = at once. See [When the host goes blind](#when-the-host-goes-blind). |
 
 The watcher reads `config_dirs` (shared with the daemons) the same way the hook
 sidecar does, so extra Claude config dirs are watched too.
@@ -419,6 +640,18 @@ that stops reading at index 12 sees a normal row and ignores the tail. Only
 message rows carry index 13 — session rows stay 13 fields long, because a field
 nobody reads is pure byte budget.
 
+The **staleness card** is the same 14-field row again, with state **17**
+(`SESSION_HOST_STALE`), sid `z0`, the fault in `label` and the reason in index
+13. Its sid is disjoint from every other producer's: session and message sids
+are two hex characters, report sids are `[g-y][0-9a-z]`, and `zz` belongs to
+the report overflow marker.
+
+Firmware older than state 17 draws it as a session card labelled
+`FLEET DATA STALE` whose state line reads `busy` — not the intended card, but
+the label still carries the meaning and nothing misbehaves. That is the price
+of an append-only wire, and it is the right way round: the words that matter
+are in the field every vintage reads.
+
 ## Limits
 
 - **Polling, not push.** 30 s, matching the interval the official client uses
@@ -428,4 +661,8 @@ nobody reads is pure byte budget.
   show the name, the state and the elapsed time only.
 - **Token expiry** is the platform daemon's problem; this module re-reads the
   credential file every poll rather than caching a token that goes stale in
-  hours.
+  hours. If nothing refreshes it, the staleness card says so after fifteen
+  minutes.
+- **A quiet tab is the normal tab.** With the attention filter on, most of the
+  time there is nothing to show, and that is the feature. If you want to watch
+  the fleet rather than be interrupted by it, `fleet_attention_only = off`.

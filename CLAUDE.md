@@ -255,6 +255,22 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 
 ## Recent session highlights
 
+- **Sessions tab became an attention surface (2026-09-09).** Three changes, one
+  idea. (1) The remote fleet poller now ships only rows that need a *person* —
+  `requires_action`, messages, agent reports — and drops idle/working remote
+  sessions before they cost a byte (`fleet_attention_only`, on by default; a
+  real payload went from nine rows / 424 B to `{"ss":[]}`). The empty tab is
+  now the normal, healthy screen and says `Nothing needs you`. (2) New wire
+  state **17 `SESSION_HOST_STALE`**: the host mints one dim card when its
+  listing has been failing for `fleet_stale_after_s` (900 s) and drops the rows
+  it can no longer vouch for. The device cannot infer this — the poller writes
+  only on change, so silence is ambiguous — which is how a 9-hour-old list sat
+  on the panel all day after a token expired. (3) The poller got an autostart
+  entry (`ClawdmeterFleet`), a single-instance mutex, a heartbeat, and a tray
+  supervisor that restarts it; its `log()` is now guarded, because
+  `print(file=sys.stderr)` under a bare `pythonw` Run entry raises
+  `AttributeError` — from inside the HTTP-error handler, which would kill the
+  poller on its first 401. See `daemon/FLEET.md`.
 - **AMOLED-1.8 chime verified on hardware + EXIO2 touch-kill fix (2026-07-13).** The 1.8's `amp_enable` hook drove both GPIO 46 and XCA9554 EXIO2 ("the unused one is harmless") — but pulling EXIO2 low takes the FT3168 off the I2C bus (chip stops ACKing; IDF reports it as `ESP_ERR_INVALID_STATE`, which reads like a driver wedge and cost a long I2S red-herring chase). Amp enable is GPIO 46 only; EXIO2 must stay HIGH. Chime, touch, buttons, and BLE bond persistence all verified on a real 1.8.
 - **Device-abstraction refactor (2026-05-18).** All board-conditional code moved out of shared files into `boards/<name>/` and behind a HAL in `hal/`. ~30 `#ifdef BOARD_*` blocks went to zero. UI is responsive via `compute_layout()` driven by `board_caps()`. New ports add a folder + a PlatformIO env — no shared file edits.
 - Added second board port: Waveshare AMOLED-1.8 (368×448 portrait, SH8601, FT3168, XCA9554 IO expander).

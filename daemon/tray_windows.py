@@ -4,8 +4,10 @@
 Provides:
   TrayState   — thread-safe scalar bridge (daemon loop writes, tray reads)
   header_text — pure helper producing the D-05 status-header string
+  FleetSupervisor — notices the remote-fleet poller died and starts it again
   main()      — tray entry: builds per-state icons, runs the daemon loop in a
-                bg thread, and runs pystray.Icon on the main thread
+                bg thread, supervises the fleet poller, and runs pystray.Icon
+                on the main thread
 
 The daemon loop (claude_usage_daemon_windows.main) is UNCHANGED in logic;
 this module injects only additive state-setter calls at existing branch points.
@@ -18,6 +20,7 @@ Run: python -m pytest daemon/tests/test_windows_tray.py -x -q
 """
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -108,8 +111,143 @@ def header_text(ts: TrayState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# FleetSupervisor — the remote-fleet poller, watched across a process boundary
+# ---------------------------------------------------------------------------
+
+# How often to look. The poller stamps its heartbeat once per 30 s listing
+# poll, so checking on the same cadence costs nothing and still catches a death
+# inside a couple of minutes.
+FLEET_CHECK_S = 30
+
+
+class FleetSupervisor:
+    r"""Notice that the remote-fleet poller is gone, say so, and start it again.
+
+    The tray already supervises its own daemon loop (see _run_daemon: catch,
+    log, flip to an actionable error, restart with capped backoff). This is the
+    same treatment for a process the tray does not own — because on the day
+    this was written the fleet poller died mid-afternoon and NOTHING noticed:
+    the device kept showing the list it had captured nine hours earlier, and
+    the only reason anybody found out was that the list looked wrong.
+
+    It watches a HEARTBEAT rather than a child-process handle, and that choice
+    is the whole design. The poller may have been started by its HKCU\Run entry
+    at logon, by the installer, or by hand from a terminal; a supervisor that
+    only knew about children it had spawned itself would have been watching
+    nothing at all in exactly the case that needed it. The question asked here
+    is "is A poller alive", not "is MY poller alive".
+
+    Two things keep it from being a nuisance:
+
+      * it is ARMED ONLY when the owner has enabled the poller's autostart
+        entry (autostart.is_fleet_enabled), so it turns nothing on that is off
+        today and it stops trying the moment the owner turns the feature off;
+      * the poller holds a named single-instance mutex, so a relaunch that
+        races a poller which was merely slow is a no-op — the second copy
+        exits instead of becoming a second producer of the handoff file.
+
+    Every seam is injectable so the whole thing is testable without a registry,
+    a heartbeat file or a process.
+    """
+
+    IDLE_BACKOFF_S = 5      # first retry, and the value reset() returns to
+    MAX_BACKOFF_S = 300     # a poller that will not start must not be a spinner
+
+    def __init__(self, is_enabled=None, is_alive=None, launch=None,
+                 log_fn=None, notify=None, now_fn=time.time):
+        self._is_enabled = is_enabled or _fleet_autostart_enabled
+        self._is_alive = is_alive or _fleet_is_alive
+        self._launch = launch or launch_fleet_poller
+        self._log = log_fn or (lambda msg: None)
+        self._notify = notify
+        self._now = now_fn
+        self.backoff = self.IDLE_BACKOFF_S
+        self.next_try = 0.0
+        self.down = False       # currently believed dead (one notice per outage)
+
+    def _reset(self) -> None:
+        self.backoff = self.IDLE_BACKOFF_S
+        self.next_try = 0.0
+        self.down = False
+
+    def step(self, now=None) -> bool:
+        """One check. True when this call started a poller.
+
+        Total by construction: a supervisor that raises is a supervisor that
+        stops supervising, which is the failure it exists to prevent.
+        """
+        now = self._now() if now is None else now
+        try:
+            if not self._is_enabled():
+                self._reset()
+                return False
+            if self._is_alive(now):
+                if self.down:
+                    self._log("Fleet poller is alive again")
+                self._reset()
+                return False
+            if not self.down:
+                # One notice per outage, on the falling edge — the same rule
+                # the error toast follows (D-04: transitions, not ticks).
+                self.down = True
+                self._log("Fleet poller heartbeat is stale — it is not running")
+                if self._notify is not None:
+                    try:
+                        self._notify("Fleet poller stopped — restarting it",
+                                     "Clawdmeter")
+                    except Exception:
+                        pass
+            if now < self.next_try:
+                return False
+            self.next_try = now + self.backoff
+            self.backoff = min(self.backoff * 2, self.MAX_BACKOFF_S)
+            self._log("Starting the fleet poller")
+            self._launch()
+            return True
+        except Exception as e:          # last-resort guard, as above
+            self._log(f"Fleet supervisor error: {e!r}")
+            return False
+
+
+def _fleet_autostart_enabled() -> bool:
+    """Default arming test: has the owner asked for a poller at logon?"""
+    import daemon.autostart_windows as autostart
+    return autostart.is_fleet_enabled()
+
+
+def _fleet_is_alive(now=None) -> bool:
+    """Default liveness test: did a poller stamp its heartbeat recently?"""
+    import daemon.clawdmeter_fleet as fleet
+    return fleet.is_alive(now=now)
+
+
+def launch_fleet_poller() -> None:
+    r"""Start the poller with the same command its Run value uses.
+
+    Deliberately not a hand-rolled command line: a supervisor that guessed at
+    the interpreter or the script path would drift from the autostart entry the
+    first time either moved, and would then be restarting the wrong thing (or
+    nothing) exactly when it mattered.
+
+    DETACHED_PROCESS because the poller is not really the tray's child — it has
+    its own autostart entry and its own lifetime, and it must outlive a tray
+    restart. That leaves it with no usable stderr, which is why its log() is
+    guarded and mirrored into %LOCALAPPDATA%\Clawdmeter\fleet.log.
+    """
+    import daemon.autostart_windows as autostart
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0)
+    subprocess.Popen(autostart.fleet_command(), close_fds=True, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # single-instance guard (named kernel mutex — no stale-lock problem)
 # ---------------------------------------------------------------------------
+# NOTE: autostart_windows.acquire_single_instance() is the same mechanism,
+# generalised over a name so the fleet poller can take a lock of its own. This
+# copy stays because its unit tests patch THIS module's `sys` and `ctypes`
+# seams; merging them would break a passing suite to save twenty lines.
 
 # Per-session mutex name. "Local\\" scopes it to the interactive logon, which is
 # exactly the granularity we want: one tray per signed-in user. Both the headless
@@ -224,6 +362,17 @@ def main() -> None:
     daemon_thread = threading.Thread(target=_run_daemon, daemon=True)
     daemon_thread.start()
 
+    # --- background thread: the fleet poller, watched across a process
+    # boundary. Idle and harmless until the owner enables the poller's
+    # autostart entry (nothing here turns that on).
+    fleet_sup = FleetSupervisor(log_fn=daemon_log, notify=icon.notify)
+
+    def _run_fleet_supervisor() -> None:
+        while not _quit_requested.wait(timeout=FLEET_CHECK_S):
+            fleet_sup.step()
+
+    threading.Thread(target=_run_fleet_supervisor, daemon=True).start()
+
     # --- menu ---
     def _on_quit(icon_ref, _item) -> None:
         # NEVER call ts.stop_event.set() directly from the tray thread;
@@ -255,11 +404,26 @@ def main() -> None:
             autostart.enable(tray_script=os.path.abspath(__file__))
         icon.update_menu()
 
+    def _on_toggle_fleet(_icon_ref, _item) -> None:
+        # The remote-fleet poller (daemon/FLEET.md) is a separate opt-in with a
+        # separate Run value, so this never touches the tray's own autostart.
+        # Enabling it also arms the supervisor above, which is the point: the
+        # owner is saying "there should be a poller running", and that is
+        # exactly the claim a supervisor needs in order to act on it.
+        if autostart.is_fleet_enabled():
+            autostart.disable_fleet()
+        else:
+            autostart.enable_fleet()
+            fleet_sup.step()      # start one now, not at the next logon
+        icon.update_menu()
+
     icon.menu = Menu(
         # Non-clickable status header; text updates via update_menu() on state change.
         MenuItem(lambda _item: header_text(ts), None, enabled=False),
         # Start-at-login toggle: checked= is a CALLABLE for live query (Pitfall 6).
         MenuItem("Start at login", _on_toggle, checked=lambda _item: autostart.is_enabled()),
+        MenuItem("Start fleet poller at login", _on_toggle_fleet,
+                 checked=lambda _item: autostart.is_fleet_enabled()),
         MenuItem("Quit", _on_quit),
     )
 

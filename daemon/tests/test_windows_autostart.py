@@ -170,3 +170,149 @@ def test_is_enabled_false_when_value_absent():
         result = mod.is_enabled()
 
     assert result is False, "is_enabled() must return False when QueryValueEx raises FileNotFoundError"
+
+
+# ---------------------------------------------------------------------------
+# The remote-fleet poller's own Run value (daemon/FLEET.md)
+# ---------------------------------------------------------------------------
+# It died mid-afternoon and nothing started it again, so the device showed a
+# nine-hour-old list. Autostart covers the reboot; the tray's FleetSupervisor
+# covers the death. A THIRD value name, because the poller, the hook sidecar
+# and the tray are three independent opt-ins and turning one off must never
+# turn another off.
+
+
+def test_enable_fleet_writes_its_own_run_value():
+    winreg, key_handle = _make_winreg_mock()
+
+    with patch("daemon.autostart_windows.winreg", winreg):
+        import daemon.autostart_windows as mod
+        mod.enable_fleet()
+
+    winreg.SetValueEx.assert_called_once()
+    args = winreg.SetValueEx.call_args[0]
+    assert args[1] == "ClawdmeterFleet"
+    assert args[3] == winreg.REG_SZ
+
+
+def test_fleet_command_points_at_the_poller_under_pythonw():
+    import re
+    import daemon.autostart_windows as mod
+    cmd = mod.fleet_command()
+    assert "pythonw.exe" in cmd
+    assert not re.search(r"(?<![a-z])python\.exe", cmd)
+    assert cmd.startswith('"')
+    assert "clawdmeter_fleet.py" in cmd
+
+
+def test_fleet_command_is_what_enable_fleet_writes():
+    """The supervisor relaunches with fleet_command(); if that drifted from the
+    Run value, a restart would start the wrong thing exactly when it mattered."""
+    winreg, key_handle = _make_winreg_mock()
+    captured = []
+    winreg.SetValueEx = MagicMock(
+        side_effect=lambda k, n, r, t, v: captured.append(v))
+
+    with patch("daemon.autostart_windows.winreg", winreg):
+        import daemon.autostart_windows as mod
+        mod.enable_fleet()
+        assert captured == [mod.fleet_command()]
+
+
+def test_disable_fleet_is_idempotent_and_targets_only_its_own_value():
+    winreg, key_handle = _make_winreg_mock()
+    winreg.DeleteValue = MagicMock(side_effect=FileNotFoundError("not found"))
+
+    with patch("daemon.autostart_windows.winreg", winreg):
+        import daemon.autostart_windows as mod
+        mod.disable_fleet()          # must not raise
+
+    assert winreg.DeleteValue.call_args[0][1] == "ClawdmeterFleet"
+
+
+def test_is_fleet_enabled_reads_the_live_registry():
+    winreg, key_handle = _make_winreg_mock(query_raises=True)
+    with patch("daemon.autostart_windows.winreg", winreg):
+        import daemon.autostart_windows as mod
+        assert mod.is_fleet_enabled() is False
+    assert winreg.QueryValueEx.call_args[0][1] == "ClawdmeterFleet"
+
+    winreg, key_handle = _make_winreg_mock(query_raises=False)
+    with patch("daemon.autostart_windows.winreg", winreg):
+        import daemon.autostart_windows as mod
+        assert mod.is_fleet_enabled() is True
+
+
+@pytest.mark.parametrize("fn,name", [
+    ("enable", "Clawdmeter"),
+    ("enable_sessions", "ClawdmeterSessions"),
+    ("enable_fleet", "ClawdmeterFleet"),
+])
+def test_the_three_autostarts_never_share_a_value_name(fn, name):
+    winreg, key_handle = _make_winreg_mock()
+    with patch("daemon.autostart_windows.winreg", winreg):
+        import daemon.autostart_windows as mod
+        getattr(mod, fn)()
+    assert winreg.SetValueEx.call_args[0][1] == name
+
+
+# ---------------------------------------------------------------------------
+# acquire_single_instance — the other half of an autostart entry
+# ---------------------------------------------------------------------------
+# A Run value plus a supervisor that may relaunch means the same program can be
+# asked to start twice, and two fleet pollers would fight over
+# ~/.clawdmeter/sessions.json (FLEET.md: run one producer at a time).
+
+_ERROR_ALREADY_EXISTS = 183
+
+
+def _fake_kernel32(last_error, handle):
+    fake_kernel32 = MagicMock()
+    fake_kernel32.CreateMutexW.return_value = handle
+    fake_ctypes = MagicMock()
+    fake_ctypes.WinDLL.return_value = fake_kernel32
+    fake_ctypes.get_last_error.return_value = last_error
+    return fake_ctypes
+
+
+def test_single_instance_is_a_noop_off_windows():
+    with patch("daemon.autostart_windows.sys") as mock_sys:
+        mock_sys.platform = "linux"
+        import daemon.autostart_windows as mod
+        assert mod.acquire_single_instance("Local\\x") is not None
+
+
+def test_first_instance_gets_the_handle():
+    fake = _fake_kernel32(0, 0xBEEF)
+    with patch("daemon.autostart_windows.sys") as mock_sys, \
+         patch.dict("sys.modules", {"ctypes": fake, "ctypes.wintypes": MagicMock()}):
+        mock_sys.platform = "win32"
+        import daemon.autostart_windows as mod
+        assert mod.acquire_single_instance("Local\\x") == 0xBEEF
+
+
+def test_second_instance_is_told_to_leave():
+    fake = _fake_kernel32(_ERROR_ALREADY_EXISTS, 0xBEEF)
+    with patch("daemon.autostart_windows.sys") as mock_sys, \
+         patch.dict("sys.modules", {"ctypes": fake, "ctypes.wintypes": MagicMock()}):
+        mock_sys.platform = "win32"
+        import daemon.autostart_windows as mod
+        assert mod.acquire_single_instance("Local\\x") is None
+
+
+def test_a_kernel_quirk_fails_open():
+    """Single-instance is hardening, not correctness: never block a start."""
+    fake = _fake_kernel32(_ERROR_ALREADY_EXISTS, 0)
+    with patch("daemon.autostart_windows.sys") as mock_sys, \
+         patch.dict("sys.modules", {"ctypes": fake, "ctypes.wintypes": MagicMock()}):
+        mock_sys.platform = "win32"
+        import daemon.autostart_windows as mod
+        assert mod.acquire_single_instance("Local\\x") is not None
+
+
+def test_the_poller_uses_a_name_of_its_own():
+    """Sharing the tray's mutex would make the tray and the poller exclude
+    each other, which is the opposite of what either lock is for."""
+    import daemon.clawdmeter_fleet as fleet
+    import daemon.tray_windows as tray
+    assert fleet.SINGLETON_MUTEX_NAME != tray._SINGLETON_MUTEX_NAME

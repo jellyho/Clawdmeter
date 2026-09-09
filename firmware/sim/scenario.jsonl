@@ -18,6 +18,14 @@
 #             colour, the sort bucket and the auto-jump from the state.
 #             13/14 are the waiting bucket (terra-cotta + pulse, sorts first);
 #             16 is host-minted and recedes.
+#          17 the host cannot reach the remote listing any more
+#             (daemon/FLEET.md). Host-minted like 16, and the SECOND row of
+#             that kind rather than a new one: label = the fault, index 13 =
+#             why, elapsed = the age of the last good listing. The whole card
+#             is dim and it never joins the notify set - it is a fault
+#             indication, not an alert. The host sends it because only the
+#             host knows when it last succeeded, and it writes the handoff
+#             file only on change, so silence cannot be read as health.
 #          11 message from another Claude Code session — label = sender,
 #             index 13 = the body, head-elided by the host
 #             every session-shaped field sent as not-applicable (-1 / 0)
@@ -59,7 +67,10 @@
 {"name":"report (Korean)","hold_ms":5000,"ss":[["mp","JELLYHO-DESK",13,-1,15,0,0,0,0,0,0,-1,-1,"빌드 끝났어요 머지할까요?"],["uo","ORCHESTRATOR",12,-1,40,0,0,0,0,0,0,-1,-1,"폰트 변환 작업 중입니다"]]}
 {"name":"reports + chats","hold_ms":5000,"ss":[["mp","ORCHESTRATOR",13,-1,11,0,0,0,0,0,0,-1,-1,"rebase done - force-push?"],["oh","WORKER-ALPHA",12,-1,26,0,0,0,0,0,0,-1,-1,"building the C6 firmware"],["b2","raincheck-api",4,52,14,2,1,1,0,1,4,104,-1],["a1","clawdmeter",1,44,360,1,0,0,0,3,6,88,-1]]}
 {"name":"malformed report (falls back to a message)","hold_ms":4000,"ss":[["ba","ORCHESTRATOR",11,-1,9,0,0,0,0,0,0,-1,-1,"CLAWDMETER-REPORT/1 MOSTLY-FINE: rebase done, force-push?"]]}
-{"name":"no chats","hold_ms":3000,"ss":[]}
+{"name":"fleet data stale (host blind for 9h)","hold_ms":5000,"ss":[["z0","FLEET DATA STALE",17,-1,33120,0,0,0,0,0,0,-1,-1,"auth expired - log in to claude"]]}
+{"name":"stale + live mail and a report","hold_ms":5000,"ss":[["79","ORCHESTRATOR",11,-1,42,0,0,0,0,0,0,-1,-1,"can you take a look at the C6 build?"],["mp","WORKER-ALPHA",13,-1,88,0,0,0,0,0,0,-1,-1,"rebase done - force-push to main?"],["z0","FLEET DATA STALE",17,-1,33120,0,0,0,0,0,0,-1,-1,"auth expired - log in to claude"]]}
+{"name":"one remote agent needs you","hold_ms":4000,"ss":[["91","ACRFT-C-WM",6,-1,42,0,1,0,0,0,0,-1,1]]}
+{"name":"nothing needs you","hold_ms":3000,"ss":[]}
 {"name":"steady use","hold_ms":3000,"s":42.0,"sr":180,"w":33.0,"wr":7900,"st":"allowed","ok":true}
 {"name":"warning zone","hold_ms":3000,"s":78.0,"sr":75,"w":55.0,"wr":6400,"st":"allowed","ok":true}
 {"name":"maxed out","hold_ms":4000,"s":98.0,"sr":12,"w":88.0,"wr":5200,"st":"limited","ok":true}

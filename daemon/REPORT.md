@@ -163,6 +163,7 @@ text separate the four from each other.
 | `DONE` | 15 | `done`, green | green | working (full brightness) |
 | `WORKING` | 12 | `working`, dim | white | working |
 | *(overflow)* | 16 | none | dim | idle (recedes) |
+| *(listing stale)* | 17 | none | dim | idle (recedes) |
 | *(a plain message)* | 11 | none | purple | its own |
 
 Nothing here is a new visual vocabulary: terra-cotta + pulse has always meant
@@ -289,9 +290,16 @@ and whatever goes, **the last row says so**:
 ```
 
 A panel that silently showed the first five of ten would be lying about the
-fleet. This row is deliberately the quietest thing on the screen — dim, idle
-bucket, never in the notify set — because the urgent rows are the ones above
-it and this is the footnote that says the list is not the whole story.
+fleet. This row is deliberately the quietest thing on the screen — **the whole
+card** is dim, not just the label: sender, words and dot alike, because it is a
+statement *about* the list rather than a member of it. Idle bucket, never in
+the notify set. The urgent rows are the ones above it, and this is the footnote
+that says the list is not the whole story.
+
+State 17 (`SESSION_HOST_STALE`, [FLEET.md](FLEET.md#when-the-host-goes-blind))
+is the second row minted the same way, for the same reason, and gets the same
+treatment — `session_state_host_minted()` in `firmware/src/data.h` is the one
+predicate both answer yes to.
 
 The fitting happens in `clawdmeter_inbox.fit_round`, **not** in
 `cs.fit_payload` downstream, for a reason worth stating: that one also drops

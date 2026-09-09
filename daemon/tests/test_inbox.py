@@ -827,7 +827,8 @@ def _api(n):
 
 def test_messages_come_first():
     row = ib.message_row(ib.Message("aaaa1111", NOW, "PEER", "look at me"), NOW)
-    out = json.loads(fleet.build_payload(_api(3), 400, inbox_rows=[row]))["ss"]
+    out = json.loads(fleet.build_payload(_api(3), 400, inbox_rows=[row],
+                                         attention_only=False))["ss"]
     assert out[0][2] == ib.STATE_MESSAGE
     assert [r[2] for r in out[1:]] == [cs.STATE_THINKING] * 3
 
@@ -905,7 +906,8 @@ def test_two_messages_never_empty_the_sessions_view(projects):
     w = watcher(projects, max_rows=ib.max_rows_for_budget(cs.DEFAULT_BUDGET_BYTES))
     w.poll()
     rows = json.loads(fleet.build_payload(api, cs.DEFAULT_BUDGET_BYTES,
-                                          inbox_rows=w.rows()))["ss"]
+                                          inbox_rows=w.rows(),
+                                          attention_only=False))["ss"]
     assert sum(1 for r in rows if r[2] == ib.STATE_MESSAGE) == 1
     assert sum(1 for r in rows if r[2] != ib.STATE_MESSAGE) >= 1
     # The newest is the one kept: an older message already had its card.
@@ -1074,7 +1076,8 @@ def test_a_listing_failure_keeps_the_last_good_sessions(projects, tmp_path,
     clock = _Clock()
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=None, tick_s=2,
                    poll_interval_s=30, sessions_file=str(tmp_path / "s.json"),
-                   iterations=40, sleep_fn=clock.sleep, now_fn=clock.now)
+                   iterations=40, sleep_fn=clock.sleep, now_fn=clock.now,
+                   attention_only=False)
     assert writes, "the last good listing should keep being published"
     assert json.loads(writes[-1])["ss"][0][1] == "machine-number-0"
 
@@ -1084,7 +1087,7 @@ def test_poll_once_still_works_without_a_watcher(monkeypatch):
     monkeypatch.setattr(fleet, "read_token", lambda path=None: "tok")
     monkeypatch.setattr(fleet, "fetch_sessions", lambda *a, **k: _api(1))
     monkeypatch.setattr(fleet, "local_bridge_ids", lambda *a, **k: set())
-    payload = fleet.poll_once(cs.DEFAULT_BUDGET_BYTES)
+    payload = fleet.poll_once(cs.DEFAULT_BUDGET_BYTES, attention_only=False)
     assert len(json.loads(payload)["ss"][0]) == 13
 
 

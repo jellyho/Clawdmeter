@@ -90,6 +90,30 @@ enum session_state_t : uint8_t {
     // normal case — this row is what stops it being a silent one. Idle bucket
     // and never in the notify set: it is a footnote, not an alert.
     SESSION_REPORT_MORE        = 16,
+
+    // Host-minted too, and the row that makes the rest of this tab
+    // trustworthy. The remote listing is polled by the HOST, and the host
+    // writes the handoff file only WHEN SOMETHING CHANGES -- so an unchanging
+    // payload is ambiguous between "the fleet is quiet" and "the host has not
+    // reached the listing since last night". The device cannot break that tie
+    // from a timer: a genuinely quiet fleet legitimately sends nothing for
+    // hours, and a firmware that guessed would either cry wolf on a calm desk
+    // or stay silent through a real outage. So the HOST says it, because the
+    // host is the only side that knows when it last succeeded.
+    //
+    // When its listing has been failing for longer than `fleet_stale_after_s`
+    // (900 s by default -- 30 consecutive poll failures), the host DROPS every
+    // row that came from that listing and sends this one in their place:
+    // `label` names the fault, `msg` (index 13) says why in the host's own
+    // words ("auth expired - log in to claude"), and `elapsed_s` is the age of
+    // the last good listing, so the card dates itself. Rows from local disk
+    // (messages, agent reports) are unaffected and keep flowing beside it --
+    // the marker means the LISTING is blind, not that everything is.
+    //
+    // Idle bucket, dim, and never in the notify set, exactly like MORE: this
+    // is a fault indication, not an alert. Nothing is waiting on the owner --
+    // the panel has simply stopped knowing whether anything is.
+    SESSION_HOST_STALE         = 17,
 };
 
 // A report card and a message card share the same widget anatomy (a sender
@@ -97,7 +121,15 @@ enum session_state_t : uint8_t {
 // is the test both of them answer yes to; the state itself still decides the
 // colour and the bucket. Session rows answer no.
 static inline bool session_state_has_words(uint8_t s) {
-    return s >= SESSION_MESSAGE && s <= SESSION_REPORT_MORE;
+    return s >= SESSION_MESSAGE && s <= SESSION_HOST_STALE;
+}
+
+// ...and this is the subset the HOST wrote itself rather than relaying from
+// an agent. Both are footnotes about the list rather than members of it, so
+// neither gets the purple sender colour that means "another Claude is
+// talking to you" -- their label is a count or a fault, not a peer's name.
+static inline bool session_state_host_minted(uint8_t s) {
+    return s == SESSION_REPORT_MORE || s == SESSION_HOST_STALE;
 }
 
 enum session_model_t : uint8_t {

@@ -655,12 +655,13 @@ struct ChatCard {
 
 static lv_obj_t* focus_group = nullptr;   // ONE-CHAT (§1.3)
 static lv_obj_t* chats_group = nullptr;   // SEVERAL-CHATS (§1.4)
-static lv_obj_t* empty_group = nullptr;   // "No active sessions" — the tab is
+static lv_obj_t* empty_group = nullptr;   // "Nothing needs you" — the tab is
                                           // reachable at any time now, so it
-                                          // needs something to say when idle
+                                          // needs something to say when calm
 static lv_obj_t* cards_cont  = nullptr;   // scrolling viewport for the card list
 static lv_obj_t* chat_fade   = nullptr;   // "more below the fold" gradient
 static lv_obj_t* empty_lbl   = nullptr;   // what the empty tab says
+static lv_obj_t* empty_hint  = nullptr;   // …and, when the link is up, why
 static ChatCard  chat_cards[SESSION_MAX_ROWS];
 static ChatCard  focus_card;
 static lv_obj_t* focus_lbl_model = nullptr;
@@ -759,8 +760,12 @@ static int session_bucket(uint8_t state) {
     case SESSION_REPORT_DONE:
         return SESSION_BUCKET_WORKING;
     // The overflow footnote recedes like an idle chat: the rows it is a
-    // footnote to are the ones worth looking at.
+    // footnote to are the ones worth looking at. The staleness marker
+    // recedes for the opposite reason — there is nothing above it to look
+    // at, and shouting would say "an agent needs you" when the truth is the
+    // quieter "the host stopped being able to tell".
     case SESSION_REPORT_MORE:
+    case SESSION_HOST_STALE:
         return SESSION_BUCKET_IDLE;
     default: break;
     }
@@ -806,7 +811,8 @@ static lv_color_t session_words_color(uint8_t state) {
     case SESSION_REPORT_BLOCKED:   return COL_ACCENT;
     case SESSION_REPORT_WORKING:   return COL_TEXT;
     case SESSION_REPORT_DONE:      return COL_GREEN;
-    case SESSION_REPORT_MORE:      return COL_DIM;
+    case SESSION_REPORT_MORE:
+    case SESSION_HOST_STALE:       return COL_DIM;
     default:                       return COL_PURPLE;   // SESSION_MESSAGE
     }
 }
@@ -850,6 +856,9 @@ static void session_state_text(const SessionRow* r, char* buf, size_t n) {
     case SESSION_REPORT_BLOCKED:
     case SESSION_REPORT_DONE:
     case SESSION_REPORT_MORE:
+    // And so does the staleness marker: the host wrote a sentence saying why
+    // its listing is blind, and this is the line that sentence goes on.
+    case SESSION_HOST_STALE:
         snprintf(buf, n, "%s", r->msg[0] ? r->msg : "(no message text)");
         return;
     case SESSION_STARTING:   snprintf(buf, n, "starting");   return;
@@ -1386,11 +1395,12 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
 
         const lv_color_t wcol = session_words_color(r->state);
         // The sender is purple on every card that has one, because every one
-        // of them IS another Claude. The overflow footnote is the exception:
-        // "+5 MORE" is a count this host wrote, not a peer, and giving it the
-        // sender colour would claim a machine of that name reported in.
+        // of them IS another Claude. The host-minted rows are the exception:
+        // "+5 MORE" is a count this host wrote and "FLEET DATA STALE" is a
+        // fault it noticed, not peers, and giving either the sender colour
+        // would claim a machine of that name reported in.
         lv_obj_set_style_text_color(c->lbl_name,
-            r->state == SESSION_REPORT_MORE ? COL_DIM : COL_PURPLE, 0);
+            session_state_host_minted(r->state) ? COL_DIM : COL_PURPLE, 0);
 
         // The report chip: the one thing on the card that says this is a
         // status and not mail. An empty chip (a plain message, or the
@@ -1447,7 +1457,15 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
         int lines = label_set_clamped(c->lbl_state, sbuf, MSG_BODY_FONT(c),
                                       body_w, msg_max_lines(c));
         msg_card_layout(c, lines);
-        lv_obj_set_style_text_color(c->lbl_state, COL_TEXT, 0);   // the words are the point
+        // The words are the point — full brightness, the way a chat's NAME is
+        // bright on a session card. The exception is a HOST-MINTED footnote:
+        // "+5 MORE" and "FLEET DATA STALE" are statements ABOUT the list, not
+        // members of it, and the whole card recedes so the rows it is a
+        // footnote to keep the eye. That is what REPORT.md already promises
+        // of the overflow row ("the quietest thing on the screen") and what
+        // makes the staleness marker calm rather than another alarm.
+        lv_obj_set_style_text_color(c->lbl_state,
+            session_state_host_minted(r->state) ? COL_DIM : COL_TEXT, 0);
         lv_obj_set_style_text_opa(c->lbl_state, LV_OPA_COVER, 0);
         // Purple on a message (another Claude talking to you, as on the
         // subagents badge); the state's own colour on a report, so a card
@@ -1912,16 +1930,40 @@ static void build_session_views(lv_obj_t* parent) {
     lv_obj_clear_flag(chat_fade, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(chat_fade, LV_OBJ_FLAG_HIDDEN);   // chat_fade_update() decides
 
-    // ---- EMPTY: no chats to show ----
+    // ---- EMPTY: nothing needs a human ----
     // New with the tab model. When the chat views were auto-selected the
     // resolver simply never picked them with nothing to show; now the user can
     // swipe here whenever they like, so the tab has to answer for itself.
+    //
+    // Since the host started filtering the roster down to what needs a person
+    // (daemon/FLEET.md § "Attention, not roster"), this is no longer the rare
+    // screen — it is the screen the owner sees most of the time, and it is
+    // GOOD NEWS. So it stays a single dim line rather than borrowing the usage
+    // screen's "Zzz" creature: that treatment dresses up a FAULT (the host
+    // stopped talking) and would make the calm, healthy state the loudest
+    // thing on the tab, competing with the corner mascot the usage screen is
+    // already animating two swipes away.
+    //
+    // The sub-line is the price of the filter. A tab that used to list nine
+    // remote sessions and now lists none has to say that this is the design
+    // and not a broken feed; it is hidden when the link is down, because then
+    // the headline above it is the whole explanation.
     empty_group = make_session_group(parent);
     empty_lbl = lv_label_create(empty_group);
-    lv_label_set_text(empty_lbl, "No active sessions");
+    lv_label_set_text(empty_lbl, "Nothing needs you");
     lv_obj_set_style_text_font(empty_lbl, L.bt_device_font, 0);
     lv_obj_set_style_text_color(empty_lbl, COL_DIM, 0);
-    lv_obj_align(empty_lbl, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(empty_lbl, LV_ALIGN_CENTER, 0, -14);
+
+    empty_hint = lv_label_create(empty_group);
+    lv_label_set_text(empty_hint, "only what needs you shows here");
+    lv_obj_set_style_text_font(empty_hint, L.bt_credit_2_font, 0);
+    lv_obj_set_style_text_color(empty_hint, COL_DIM, 0);
+    lv_obj_set_style_text_opa(empty_hint, LV_OPA_50, 0);
+    lv_obj_set_style_text_align(empty_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(empty_hint, L.scr_w - 2 * L.margin);
+    lv_label_set_long_mode(empty_hint, LV_LABEL_LONG_WRAP);
+    lv_obj_align(empty_hint, LV_ALIGN_CENTER, 0, 24);
 
     // The shared pulse: LV_OPA_COVER ↔ LV_OPA_30, 700 ms each way, forever.
     lv_anim_t a;
@@ -1963,11 +2005,18 @@ static void update_session_view(void) {
         s_chats_linger = false; // linger expired (or never armed)
         v = 0;
     }
-    // Say which kind of nothing this is: an idle desk reads differently from a
-    // host that stopped talking.
+    // Say which kind of nothing this is: a calm desk reads differently from a
+    // host that stopped talking. And note what this screen no longer means —
+    // "nothing needs you" is a claim about the HOST's last word, which is why
+    // the host has to send SESSION_HOST_STALE rather than let this screen
+    // quietly stand in for an outage.
     if (v == 0 && empty_lbl)
-        set_label_if_changed(empty_lbl, s_ble_connected ? "No active sessions"
+        set_label_if_changed(empty_lbl, s_ble_connected ? "Nothing needs you"
                                                         : "Host disconnected");
+    if (v == 0 && empty_hint) {
+        if (s_ble_connected) lv_obj_clear_flag(empty_hint, LV_OBJ_FLAG_HIDDEN);
+        else                 lv_obj_add_flag(empty_hint, LV_OBJ_FLAG_HIDDEN);
+    }
     if (v == session_view) return;
     session_view = v;
     lv_obj_add_flag(focus_group, LV_OBJ_FLAG_HIDDEN);
