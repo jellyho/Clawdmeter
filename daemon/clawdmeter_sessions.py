@@ -1179,10 +1179,20 @@ def _replace_with_retry(tmp, path, attempts=5, delay=0.02):
             time.sleep(delay)
 
 
-def write_sessions_file(path, payload):
+def write_sessions_file(path, payload, index=None):
     """Atomic write (temp + rename). `payload` is the exact wire string; the
-    daemon ships it verbatim, so it is stored as a string, not re-encoded."""
+    daemon ships it verbatim, so it is stored as a string, not re-encoded.
+
+    `index` is the sid lookup that goes with it: {sid: {...}}. It exists
+    because the panel talks back. A tap on a card sends two characters over
+    BLE, and the process that RECEIVES that -- the BLE daemon -- is not the
+    process that minted the sid, so without a written-down mapping it cannot
+    turn "g4" into an agent to message. Optional, and ignored by every reader
+    that predates it: the payload contract is untouched.
+    """
     doc = {"ts": round(time.time(), 3), "payload": payload}
+    if index:
+        doc["index"] = index
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)

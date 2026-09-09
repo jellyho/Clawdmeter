@@ -59,7 +59,8 @@ SS_CHAR_UUID = "4c41555a-4465-7669-6365-000000000005"
 # cross the BLE boundary, so a released code is never renumbered or reused, and
 # a code this daemon does not know is ignored rather than guessed at.
 EVENT_REPORT = 1    # "tell me what the fleet is doing"
-EVENT_GO_AHEAD = 2  # reserved: {"ev":2,"sid":"g4"} -- not built, not handled
+EVENT_GO_AHEAD = 2  # {"ev":2,"sid":"g4"} -- the owner tapped a NEEDS-YOU card
+EVENT_DISMISS = 3   # {"ev":3,"sid":"g4"} -- the owner tapped a card away
 
 # The report dispatcher, run as a child process. Its own --timeout bounds the
 # `claude -p` spawn (120 s) and its follow phase watches for replies for another
@@ -68,6 +69,9 @@ EVENT_GO_AHEAD = 2  # reserved: {"ev":2,"sid":"g4"} -- not built, not handled
 # dispatcher that never exits would block every later press for good.
 REPORT_SCRIPT = Path(__file__).resolve().parent / "clawdmeter_report.py"
 REPORT_ROUND_TIMEOUT = 300.0
+# A courier sends one message and exits; it has no replies to wait for, so it
+# gets a fraction of a round's budget.
+GO_AHEAD_TIMEOUT = 120.0
 
 POLL_INTERVAL = 60
 TICK = 5
@@ -90,6 +94,12 @@ CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Loc
 # the bash daemon and this daemon all agree on without any config. Absent =
 # sidecar not installed = feature off, which is the default and must cost nothing.
 SESSIONS_FILE = Path.home() / ".clawdmeter" / "sessions.json"
+# Written here, read by the fleet poller. One writer, one reader, so there is
+# no lock: this daemon is the only process that learns about a dismissal (it
+# owns the BLE link) and the poller is the only one that renders rows.
+DISMISS_FILE = Path.home() / ".clawdmeter" / "dismissed.json"
+DISMISS_TTL = 3600.0    # matches fleet.DISMISS_TTL_S
+DISMISS_KEEP = 64       # the panel shows six rows; this is generous
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -414,6 +424,60 @@ def discover_bonded_address() -> str | None:
     return None
 
 
+def read_sid_index(path: Path | None = None) -> dict:
+    """The sid -> {state, sender, mid} map the sidecar wrote with the payload.
+
+    The panel talks back in sids, and a sid is two characters minted by the
+    process that renders rows — not by this one. This is the only thing that
+    turns a tap back into an agent to message. Total and quiet like its
+    sibling: no sidecar, no file, an older sidecar that never wrote an index,
+    or a half-written one all come back as {} and the caller says so.
+    """
+    path = path or SESSIONS_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    index = doc.get("index") if isinstance(doc, dict) else None
+    return index if isinstance(index, dict) else {}
+
+
+def record_dismissal(mid: str, path: Path | None = None,
+                     now: float | None = None) -> int:
+    """Add one message id to the dismissed file. Returns how many it now holds.
+
+    Pruned on every write rather than on a timer: entries older than
+    DISMISS_TTL are dropped, and the newest DISMISS_KEEP survive whatever
+    their age. Both bounds matter — a file that only grew would be a slow leak
+    that the poller re-reads every two seconds, and an entry that never
+    expired would be a permanent gag on an agent if a card were ever
+    dismissed by mistake.
+    """
+    path = path or DISMISS_FILE
+    now = time.time() if now is None else now
+    items = []
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(doc, dict) and isinstance(doc.get("dismissed"), list):
+            items = [d for d in doc["dismissed"]
+                     if isinstance(d, dict) and isinstance(d.get("mid"), str)]
+    except (OSError, ValueError):
+        items = []          # absent or malformed: start clean, never raise
+    items = [d for d in items if d.get("mid") != mid
+             and now - float(d.get("ts") or 0) <= DISMISS_TTL]
+    items.append({"mid": mid, "ts": round(now, 3)})
+    items = items[-DISMISS_KEEP:]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"dismissed": items}, separators=(",", ":")),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        log(f"Could not record the dismissal ({e}); the card will come back")
+    return len(items)
+
+
 def read_sessions_payload(path: Path | None = None) -> str | None:
     """Return the wire payload string from the sidecar's sessions.json, or None.
 
@@ -462,7 +526,9 @@ def report_round_in_flight() -> bool:
 
 
 async def run_report_round(script=None, timeout=REPORT_ROUND_TIMEOUT,
-                           exec_fn=None) -> int | None:
+                           exec_fn=None, extra_args=None,
+                           label="REPORT ROUND", done="REPORT: round finished",
+                           child="dispatcher", prefix="report") -> int | None:
     """Run one report round in a child process. Never raises; never blocks.
 
     A round spawns `claude -p`, waits for it, then watches the inbox for
@@ -486,7 +552,7 @@ async def run_report_round(script=None, timeout=REPORT_ROUND_TIMEOUT,
     """
     path = Path(script) if script else REPORT_SCRIPT
     exec_fn = exec_fn or asyncio.create_subprocess_exec
-    argv = [sys.executable, str(path)]
+    argv = [sys.executable, str(path)] + list(extra_args or ())
     kwargs = {
         "stdout": asyncio.subprocess.PIPE,
         "stderr": asyncio.subprocess.STDOUT,
@@ -500,13 +566,13 @@ async def run_report_round(script=None, timeout=REPORT_ROUND_TIMEOUT,
     except (OSError, ValueError, NotImplementedError) as e:
         # NotImplementedError is the honest one: a non-Proactor event loop has
         # no subprocess support on Windows. Say so rather than dying.
-        log(f"REPORT ROUND FAILED to start ({type(e).__name__}: {e})")
+        log(f"{label} FAILED to start ({type(e).__name__}: {e})")
         return None
 
     try:
-        rc, last = await asyncio.wait_for(_pump_round(proc), timeout=timeout)
+        rc, last = await asyncio.wait_for(_pump_round(proc, prefix), timeout=timeout)
     except asyncio.TimeoutError:
-        log(f"REPORT ROUND TIMED OUT after {int(timeout)}s; killing the dispatcher"
+        log(f"{label} TIMED OUT after {int(timeout)}s; killing the {child}"
             f" (anything it had already sent stays sent)")
         try:
             proc.kill()
@@ -514,21 +580,21 @@ async def run_report_round(script=None, timeout=REPORT_ROUND_TIMEOUT,
             pass
         return None
     except (OSError, ValueError) as e:
-        log(f"REPORT ROUND FAILED while running ({type(e).__name__}: {e})")
+        log(f"{label} FAILED while running ({type(e).__name__}: {e})")
         return None
     if rc == 0:
-        log("REPORT: round finished")
+        log(done)
     else:
         # Loud on purpose. The owner pressed a button and is standing in front
         # of the device; a round that refused or failed in silence is worse than
         # one that never started, because nothing on the panel will change and
         # nothing says why.
-        log(f"REPORT ROUND DID NOT RUN (dispatcher exit {rc})"
+        log(f"{label} DID NOT RUN ({child} exit {rc})"
             + (f": {last}" if last else ""))
     return rc
 
 
-async def _pump_round(proc):
+async def _pump_round(proc, prefix="report"):
     """Relay the dispatcher's output into the daemon log as it arrives.
 
     Returns (exit code, last non-empty line) — that last line is what the
@@ -542,7 +608,7 @@ async def _pump_round(proc):
             line = raw.decode("utf-8", "replace").rstrip()
             if not line:
                 continue
-            log(f"report: {line}")
+            log(f"{prefix}: {line}")
             last = line
     return await proc.wait(), last
 
@@ -699,6 +765,63 @@ class Session:
         # "exception was never retrieved" at shutdown.
         _report_round.add_done_callback(_report_round_done)
 
+    async def on_go_ahead_event(self, doc: dict) -> None:
+        """A NEEDS-YOU card was tapped: tell that agent to continue.
+
+        The sid is all the device can send, so this is where it becomes an
+        agent again — via the index the sidecar wrote beside the payload it
+        shipped. Every failure below is LOUD, because somebody is standing at
+        the device having just told an agent to carry on: a go-ahead that
+        quietly went nowhere leaves them waiting on a machine that is waiting
+        on them.
+        """
+        sid = doc.get("sid")
+        if not isinstance(sid, str) or not sid:
+            log("GO AHEAD: event carried no sid; ignoring it")
+            return
+        entry = read_sid_index().get(sid)
+        if not isinstance(entry, dict):
+            log(f"GO AHEAD: no card {sid} in the sidecar's index — either the "
+                f"sidecar is older than this feature, or the row has expired")
+            return
+        sender = entry.get("sender")
+        if not isinstance(sender, str) or not sender:
+            log(f"GO AHEAD: card {sid} is not something an agent sent "
+                f"(state {entry.get('state')}); there is nobody to answer")
+            return
+        log(f"GO AHEAD: {sid} -> {sender}")
+        task = asyncio.ensure_future(
+            run_report_round(extra_args=["--go-ahead", sender],
+                             timeout=GO_AHEAD_TIMEOUT, label="GO AHEAD",
+                             done=f"GO AHEAD: {sender} was told to continue",
+                             child="courier", prefix="go ahead"))
+        _side_tasks.add(task)
+        task.add_done_callback(_side_tasks.discard)
+
+    async def on_dismiss_event(self, doc: dict) -> None:
+        """A card was tapped away. Stop sending that row.
+
+        The DEVICE has already hidden it — that happens under the finger, with
+        no round trip, and it is what makes the gesture feel like anything.
+        This side only stops the row being re-sent, which is what makes the
+        dismissal survive a reboot of the panel.
+        """
+        sid = doc.get("sid")
+        if not isinstance(sid, str) or not sid:
+            log("DISMISS: event carried no sid; ignoring it")
+            return
+        entry = read_sid_index().get(sid)
+        mid = entry.get("mid") if isinstance(entry, dict) else None
+        if not isinstance(mid, str) or not mid:
+            # Not an error worth shouting about: fleet session rows have no
+            # message id, and the device hid the card either way. Say it once
+            # so a genuinely stale index is visible in the log.
+            log(f"DISMISS: {sid} has no message id in the index; the device "
+                f"hid it, but the host cannot make that outlive a reboot")
+            return
+        n = record_dismissal(mid)
+        log(f"DISMISS: {sid} cleared ({n} held)")
+
     def probe_session_support(self) -> None:
         """Decide once per connection whether this device has the SS characteristic.
 
@@ -782,8 +905,15 @@ def _report_round_done(task) -> None:
 
 # One entry per device event code. Adding the "go ahead" button is a new code
 # and a new handler in this table — not a redesign of the channel.
+# Strong references to the fire-and-forget children (a go-ahead, a dismissal
+# that needed one). Without this the event loop is the only holder and the task
+# can be collected mid-flight.
+_side_tasks: set = set()
+
 EVENT_HANDLERS = {
     EVENT_REPORT: Session.on_report_event,
+    EVENT_GO_AHEAD: Session.on_go_ahead_event,
+    EVENT_DISMISS: Session.on_dismiss_event,
 }
 
 

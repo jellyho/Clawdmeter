@@ -25,6 +25,7 @@ from bleak.exc import BleakError
 
 import daemon.claude_usage_daemon_windows as mod
 from daemon.claude_usage_daemon_windows import (
+    EVENT_DISMISS,
     EVENT_GO_AHEAD,
     EVENT_REPORT,
     TX_CHAR_UUID,
@@ -186,19 +187,121 @@ def test_unknown_event_code_is_ignored_and_named(capsys):
     assert "Ignoring unknown device event 99" in logged(capsys)
 
 
-def test_reserved_go_ahead_code_is_not_handled_yet(capsys):
-    """The second button is a code and a handler, not a redesign — and until its
-    handler exists, its code must fall through the same door as any unknown."""
+def test_every_released_event_code_has_a_handler():
+    """The table is the dispatch point, and the codes are append-only: a code
+    the firmware can send with no entry here is a button that does nothing."""
+    assert EVENT_REPORT in mod.EVENT_HANDLERS
+    assert EVENT_GO_AHEAD in mod.EVENT_HANDLERS
+    assert EVENT_DISMISS in mod.EVENT_HANDLERS
+
+
+# ---------------------------------------------------------------------------
+# Go ahead — the sid has to become an agent
+# ---------------------------------------------------------------------------
+
+def _index(tmp_path, monkeypatch, index):
+    """Point the daemon at a sidecar handoff file carrying this sid index."""
+    path = tmp_path / "sessions.json"
+    path.write_text(json.dumps({"ts": 1.0, "payload": "x", "index": index}),
+                    encoding="utf-8")
+    monkeypatch.setattr(mod, "SESSIONS_FILE", path)
+    return path
+
+
+def _run_event(session, doc, spawn):
     async def go():
-        session = Session(fake_client())
-        notify(session, {"ev": EVENT_GO_AHEAD, "sid": "g4"})
-        with patch.object(mod, "run_report_round",
-                          side_effect=AssertionError("must not dispatch")):
+        notify(session, doc)
+        with patch.object(mod, "run_report_round", spawn):
             await session.handle_events()
     asyncio.run(go())
-    assert f"Ignoring unknown device event {EVENT_GO_AHEAD}" in logged(capsys)
-    assert EVENT_REPORT in mod.EVENT_HANDLERS     # the table is the dispatch point
-    assert EVENT_GO_AHEAD not in mod.EVENT_HANDLERS
+
+
+def test_go_ahead_turns_the_sid_into_the_agent_that_sent_the_report(
+        tmp_path, monkeypatch, capsys):
+    """The whole trick: two characters off a panel become a name to message."""
+    _index(tmp_path, monkeypatch,
+           {"g4": {"state": 13, "sender": "ACRFT-N", "mid": "abc12345"}})
+    calls = []
+
+    async def spawn(**kw):
+        calls.append(kw)
+        return 0
+
+    _run_event(Session(fake_client()), {"ev": EVENT_GO_AHEAD, "sid": "g4"}, spawn)
+    assert len(calls) == 1
+    assert calls[0]["extra_args"] == ["--go-ahead", "ACRFT-N"]
+    assert "GO AHEAD: g4 -> ACRFT-N" in logged(capsys)
+
+
+def test_go_ahead_on_a_sid_the_index_does_not_know_sends_nothing_and_says_so(
+        tmp_path, monkeypatch, capsys):
+    """A row that expired, or a sidecar too old to write an index. Loud, because
+    somebody is standing at the device having just answered an agent."""
+    _index(tmp_path, monkeypatch, {"zz": {"state": 13, "sender": "X"}})
+
+    async def spawn(**kw):
+        raise AssertionError("must not spawn")
+
+    _run_event(Session(fake_client()), {"ev": EVENT_GO_AHEAD, "sid": "g4"}, spawn)
+    assert "GO AHEAD: no card g4" in logged(capsys)
+
+
+def test_go_ahead_on_a_row_no_agent_sent_refuses(tmp_path, monkeypatch, capsys):
+    """Fleet session rows carry no sender: there is nobody to answer, and
+    guessing would send the owner's go-ahead to whoever happened to hash near."""
+    _index(tmp_path, monkeypatch, {"g4": {"state": 6}})
+
+    async def spawn(**kw):
+        raise AssertionError("must not spawn")
+
+    _run_event(Session(fake_client()), {"ev": EVENT_GO_AHEAD, "sid": "g4"}, spawn)
+    assert "there is nobody to answer" in logged(capsys)
+
+
+# ---------------------------------------------------------------------------
+# Dismiss — the row must stop being re-sent
+# ---------------------------------------------------------------------------
+
+def test_dismiss_records_the_message_id_not_the_sid(tmp_path, monkeypatch, capsys):
+    """Keyed on the WORDS (the mid is a hash of session+sender+body), so the
+    same agent saying something new comes back. A sid would silence it."""
+    _index(tmp_path, monkeypatch,
+           {"g4": {"state": 11, "sender": "peer", "mid": "deadbeef"}})
+    dismissed = tmp_path / "dismissed.json"
+    monkeypatch.setattr(mod, "DISMISS_FILE", dismissed)
+
+    async def spawn(**kw):
+        raise AssertionError("a dismissal spawns nothing")
+
+    _run_event(Session(fake_client()), {"ev": EVENT_DISMISS, "sid": "g4"}, spawn)
+    held = json.loads(dismissed.read_text(encoding="utf-8"))["dismissed"]
+    assert [d["mid"] for d in held] == ["deadbeef"]
+    assert "DISMISS: g4 cleared" in logged(capsys)
+
+
+def test_the_dismissed_file_is_bounded_and_expires(tmp_path):
+    """Two bounds, and both earn their place: unbounded growth is a file the
+    poller re-reads every tick, and an entry that never expired would be a
+    permanent gag on an agent."""
+    path = tmp_path / "dismissed.json"
+    old = [{"mid": f"old{i}", "ts": 0.0} for i in range(3)]
+    path.write_text(json.dumps({"dismissed": old}), encoding="utf-8")
+    mod.record_dismissal("fresh", path, now=mod.DISMISS_TTL + 10)
+    held = json.loads(path.read_text(encoding="utf-8"))["dismissed"]
+    assert [d["mid"] for d in held] == ["fresh"]        # the stale three are gone
+
+    for i in range(mod.DISMISS_KEEP + 5):
+        mod.record_dismissal(f"m{i}", path, now=mod.DISMISS_TTL + 11)
+    held = json.loads(path.read_text(encoding="utf-8"))["dismissed"]
+    assert len(held) == mod.DISMISS_KEEP
+    assert held[-1]["mid"] == f"m{mod.DISMISS_KEEP + 4}"
+
+
+def test_a_dismissal_survives_an_unreadable_file(tmp_path):
+    """Never raises: a malformed file must not be able to kill the poll loop."""
+    path = tmp_path / "dismissed.json"
+    path.write_text("{ not json", encoding="utf-8")
+    assert mod.record_dismissal("x", path) == 1
 
 
 # ---------------------------------------------------------------------------

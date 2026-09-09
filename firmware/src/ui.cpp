@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "ble.h"
 #include "splash.h"
 #include <lvgl.h>
 #include <time.h>
@@ -700,6 +701,14 @@ struct ChatCard {
     int  dot_sz;
     int  dot_dy;                 // session dot align offset (BOTTOM_LEFT)
     int  text_dy;                // session state-line align offset
+    // What the card is showing, so a TAP knows what it means (card_tap_cb).
+    // The host's row is gone by then -- nothing retains it past the update --
+    // and the state is the whole predicate: NEEDS_YOU is the one card a tap
+    // can ANSWER, everything else is a card a tap can only CLEAR.
+    uint8_t  state;
+    uint32_t sig;                // row_sig() of the row on screen; what a
+                                 // dismissal remembers, so the same words stay
+                                 // gone and new ones come back
 };
 
 static lv_obj_t* focus_group = nullptr;   // ONE-CHAT (§1.3)
@@ -788,6 +797,147 @@ static bool sid_in_set(const char set[][3], const bool kind[], uint8_t n,
         if (kind[i] == is_msg && strcmp(set[i], sid) == 0) return true;
     return false;
 }
+
+// ---- Tap to clear: the dismissal store ----
+// Every card on this tab is now something you TAP, and the tap has to make the
+// card LEAVE. That is a harder promise than it looks, because the device does
+// not own the list: the host re-sends the same rows every few seconds, so a
+// card removed from the screen is back before the finger is off the glass
+// unless something remembers the dismissal. This is that something.
+//
+// KEYED ON THE WORDS, NOT ON THE SID. A report sid is derived from the AGENT,
+// so the same agent's next report reuses it; a fleet sid is derived from the
+// session, so it survives every state that session passes through. Suppressing
+// a sid outright would therefore silence an agent, or a session, for good --
+// exactly the failure a notifier must not have. The key is a hash of what the
+// card SAID (label + words + state), so dismissing "waiting: submit anchor-off
+// arm?" hides that sentence and nothing else. The same agent saying something
+// new is a new card, and it comes back.
+//
+// A RING, NOT A SET. Twelve entries, oldest overwritten. The bound is what
+// makes it safe to keep on a C6: a store that only grew would be a slow leak
+// fed by the host. Overflow costs a card coming back after twelve later
+// dismissals, which is indistinguishable from the host re-sending it.
+//
+// The host is told too (BLE_EVENT_DISMISS), because only the host can make a
+// dismissal outlive a reboot. This side does not wait for it and does not care
+// whether it lands -- see the note in ble.h.
+#define DISMISS_MAX 12
+
+struct DismissedRow {
+    uint32_t sig;
+    bool     used;
+};
+static DismissedRow s_dismissed[DISMISS_MAX];
+static uint8_t      s_dismiss_w = 0;   // next slot to overwrite
+
+// FNV-1a over the fields a human actually reads. `state` is in it so a session
+// that MOVES (waiting -> working -> waiting again) is a new card rather than a
+// permanently silenced one, and `sid` is in it so two agents that happen to
+// say the same sentence are still two cards.
+static uint32_t row_sig(const SessionRow* r) {
+    uint32_t h = 2166136261u;
+    auto mix = [&h](const char* p, size_t cap) {
+        for (size_t i = 0; i < cap && p[i]; i++) {
+            h ^= (uint8_t)p[i];
+            h *= 16777619u;
+        }
+        h ^= 0xffu;              // field terminator: "ab"+"c" != "a"+"bc"
+        h *= 16777619u;
+    };
+    mix(r->sid, sizeof(r->sid));
+    mix(r->label, sizeof(r->label));
+    mix(r->msg, sizeof(r->msg));
+    h ^= r->state;
+    h *= 16777619u;
+    return h;
+}
+
+static bool row_dismissed(const SessionRow* r) {
+    const uint32_t sig = row_sig(r);
+    for (const auto& d : s_dismissed)
+        if (d.used && d.sig == sig) return true;
+    return false;
+}
+
+static void remember_dismissed(uint32_t sig) {
+    for (const auto& d : s_dismissed)
+        if (d.used && d.sig == sig) return;      // already gone; don't burn a slot
+    s_dismissed[s_dismiss_w].sig  = sig;
+    s_dismissed[s_dismiss_w].used = true;
+    s_dismiss_w = (uint8_t)((s_dismiss_w + 1) % DISMISS_MAX);
+}
+
+// The list the tab is actually SHOWING: the host's rows minus the dismissed
+// ones. Kept because a tap has to re-render the list immediately -- waiting for
+// the host's next payload would leave a hole where the card was for up to five
+// seconds, and would not flip the tab to EMPTY (and so would not reveal the
+// town hall button) until then.
+static SessionList s_shown = {};
+
+// Safe to call in place (out == in): the count is snapshotted first, and the
+// write index never runs ahead of the read index.
+static void filter_dismissed(const SessionList* in, SessionList* out) {
+    const int n = in ? in->count : 0;
+    int kept = 0;
+    for (int i = 0; i < n && kept < SESSION_MAX_ROWS; i++) {
+        if (row_dismissed(&in->rows[i])) continue;
+        if (&out->rows[kept] != &in->rows[i]) out->rows[kept] = in->rows[i];
+        kept++;
+    }
+    out->count = (uint8_t)kept;
+}
+
+// ---- The toast ----
+// A tap on a card sends something over a radio to a machine somewhere else, and
+// then the card disappears. Without a word from the device, "it went" and "it
+// went nowhere" look identical -- and the failure case is common and boring
+// (the daemon is not running, the link is down), not exotic. So every tap says
+// what it did, for a second and a half, in a pill at the bottom of the tab.
+//
+// One widget, reused. It is a child of the tab container rather than of either
+// sub-view, so it survives the view flipping to EMPTY underneath it -- which is
+// exactly what happens when the tap clears the LAST card.
+static lv_obj_t* toast_obj = nullptr;
+static lv_obj_t* toast_lbl = nullptr;
+static uint32_t  s_toast_until = 0;
+#define TOAST_MS 1500
+
+static void session_toast(const char* text, lv_color_t col) {
+    if (!toast_obj) return;
+    lv_label_set_text(toast_lbl, text);
+    lv_obj_set_style_text_color(toast_lbl, col, 0);
+    lv_obj_remove_flag(toast_obj, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(toast_obj);
+    s_toast_until = lv_tick_get() + TOAST_MS;
+}
+
+
+// ---- The town hall button ----
+// The tab's empty state stopped being a dead end. When every card is gone --
+// answered, cleared, or never there -- the space they occupied holds the one
+// control that puts cards back: press it and the host asks every reachable
+// agent to report in (daemon/REPORT.md). It is the same round the hardware
+// button fires, moved to where the owner is already looking when they want it.
+//
+// It lives ONLY on the empty view, and that is the design rather than a
+// placement: with cards on screen there is nothing to call a meeting about --
+// the meeting already happened, and its minutes are what you are reading.
+static lv_obj_t* th_ring = nullptr;   // bezel; pulses while a round is out
+static lv_obj_t* th_btn  = nullptr;   // the face
+static lv_obj_t* th_lbl  = nullptr;   // the word on it
+static lv_obj_t* th_cap  = nullptr;   // the line under it
+static uint32_t  s_th_called_ms = 0;  // 0 = idle, else the tick of the press
+
+// A round takes ~20 s end to end and costs real quota. This is not a rate
+// limit -- the host has one of those, anchored on the attempt -- it is the
+// button declining to look pressable while it is already working, which is the
+// only honest thing the device can say about a round it cannot see.
+#define TOWN_HALL_COOLDOWN_MS 30000
+
+static void town_hall_tap_cb(lv_event_t* e);
+
+static void card_tap_cb(lv_event_t* e);
 
 static int session_bucket(uint8_t state) {
     switch (state) {
@@ -1183,6 +1333,18 @@ static void build_chat_card(ChatCard* c, lv_obj_t* parent, int x, int y, bool fo
         lv_obj_set_style_pad_bottom(c->card, CHAT_CARD_PAD_Y, 0);
     }
 
+    // The card is the tap target (card_tap_cb). Bound once, at build, to the
+    // pooled ChatCard rather than to a row: the pool keeps a widget with its
+    // chat across reorders, so this pointer stays right for the widget's life
+    // and the handler reads the CURRENT state off it.
+    //
+    // A pressed tint is the only affordance this tab has room for -- there is
+    // no chevron, no button, nothing that says "touch me" on a card that
+    // otherwise reads as a status line. It is deliberately faint: the cards
+    // are also something you just read.
+    lv_obj_add_event_cb(c->card, card_tap_cb, LV_EVENT_CLICKED, c);
+    lv_obj_set_style_bg_color(c->card, lv_color_hex(0x2e2e2c), LV_STATE_PRESSED);
+
     const int cw = L.scr_w - 2 * CHAT_CARD_PAD_X;
 
     // Name width starts at the full row; every content update re-budgets it
@@ -1480,6 +1642,9 @@ static void layout_badge_cluster(ChatCard* c) {
 static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
     const int bucket = session_bucket(r->state);
     c->waiting = (bucket == SESSION_BUCKET_WAITING);
+    // What a tap on this card will mean, and what a dismissal will remember.
+    c->state = r->state;
+    c->sig   = row_sig(r);
     // The tier is the first thing decided, because it is an input to every
     // colour written below it (card_col) — including the ones inside
     // chat_card_apply_kind.
@@ -1869,6 +2034,124 @@ static void chats_set_content(const SessionList* list) {
     chat_fade_update();
 }
 
+// Draw whatever s_shown currently holds. Two callers: a payload from the host
+// (after filtering) and a tap that just removed a card. Splitting it out is
+// what lets the tap re-render IMMEDIATELY -- deferring to the next payload
+// would leave a hole where the card was for up to five seconds and, worse,
+// would not flip the tab to EMPTY, which is where the town hall button lives.
+static void sessions_render(void) {
+    s_live_count = s_shown.count;
+    if (s_shown.count > 0) focus_set_content(&s_shown.rows[0]);
+    chats_set_content(&s_shown);          // count 0 releases every card
+    update_session_view();
+}
+
+// ---- What a tap on a card means ----
+// One gesture, two meanings, and the state is the whole switch (see the note
+// on SESSION_REPORT_NEEDS_YOU in data.h):
+//
+//   NEEDS_YOU   an agent stopped and is waiting for a word    -> GO AHEAD
+//   everything else                                           -> CLEAR IT
+//
+// GO AHEAD is not offered on the other three report states on purpose, and the
+// reason is not tidiness: BLOCKED is parked on a permission dialog on somebody
+// else's machine, where a message queues BEHIND the dialog and changes nothing,
+// and WORKING/DONE are not waiting for anything. A button that appeared to
+// resume those would be a button that silently did nothing.
+//
+// A FAILED GO AHEAD KEEPS THE CARD. Dismissing on a send that did not land
+// would tell the owner their answer went out when it did not -- the one lie
+// this tab must not tell. A dismissal, by contrast, goes through whatever the
+// link is doing: it is a local decision, and the event to the host is only
+// there to make it outlive a reboot.
+static void card_tap_cb(lv_event_t* e) {
+    // LVGL still delivers CLICKED on the release that ended a swipe. The tab
+    // has already changed underneath the finger by then; the flag the splash
+    // toggle uses for exactly this reason serves here too.
+    if (s_gesture_used) return;
+    ChatCard* c = (ChatCard*)lv_event_get_user_data(e);
+    if (!c || !c->used) return;
+
+    if (c->state == SESSION_REPORT_NEEDS_YOU) {
+        if (!ble_send_event(BLE_EVENT_GO_AHEAD, c->sid)) {
+            session_toast("No host - not sent", COL_AMBER);
+            return;                       // nothing went anywhere; keep the card
+        }
+        session_toast("Go ahead sent", COL_GREEN);
+    } else {
+        ble_send_event(BLE_EVENT_DISMISS, c->sid);   // advisory; see ble.h
+        session_toast("Cleared", COL_DIM);
+    }
+
+    remember_dismissed(c->sig);
+    // The owner cleared these themselves, so the linger -- which exists to stop
+    // the view snapping away when a chat closes on its own -- would be exactly
+    // wrong here: they are waiting for the cards to go.
+    s_chats_linger = false;
+    filter_dismissed(&s_shown, &s_shown);
+    sessions_render();
+}
+
+// Idle face, or the face of a round that is out. The two differ in colour and
+// in one word, and nothing else moves -- the ring keeps its geometry so the
+// change reads as the same control in a different state rather than as a new
+// screen arriving.
+static void town_hall_set_calling(bool calling) {
+    if (!th_btn) return;
+    if (calling) {
+        lv_obj_set_style_bg_color(th_btn, COL_PANEL, 0);
+        lv_obj_set_style_bg_color(th_btn, COL_PANEL, LV_STATE_PRESSED);
+        lv_obj_set_style_text_color(th_lbl, COL_ACCENT, 0);
+        lv_label_set_text(th_lbl, "CALLING");
+        set_label_if_changed(th_cap, "waiting for the fleet");
+    } else {
+        lv_obj_set_style_bg_color(th_btn, COL_ACCENT, 0);
+        lv_obj_set_style_bg_color(th_btn, lv_color_hex(0xa85639), LV_STATE_PRESSED);
+        lv_obj_set_style_text_color(th_lbl, COL_BG, 0);
+        lv_label_set_text(th_lbl, "TOWN\nHALL");
+        set_label_if_changed(th_cap, "call every agent in");
+        lv_obj_set_style_border_opa(th_ring, LV_OPA_40, 0);
+    }
+}
+
+static void town_hall_tap_cb(lv_event_t* e) {
+    (void)e;
+    if (s_gesture_used) return;              // the release that ended a swipe
+    if (s_th_called_ms != 0) return;         // a round is already out
+    // The event is the whole feature and it can simply fail to go: no daemon,
+    // an older daemon that never subscribed to TX, a link that dropped since
+    // the last payload. Saying so is the difference between a button that did
+    // nothing and a button that looks broken.
+    if (!ble_send_report_request()) {
+        session_toast("No host - not sent", COL_AMBER);
+        return;
+    }
+    s_th_called_ms = lv_tick_get();
+    if (s_th_called_ms == 0) s_th_called_ms = 1;   // 0 is the idle sentinel
+    town_hall_set_calling(true);
+    session_toast("Calling the fleet", COL_ACCENT);
+    Serial.println("Town hall: report round requested from the panel");
+}
+
+// Runs from sessions_tick(). Ends the calling state on whichever comes first:
+// the replies (which take the tab off the empty view entirely, so the button
+// is behind them) or the cooldown. Both paths land back on the idle face, so a
+// round that produced nothing leaves a button you can press again rather than
+// a "CALLING" that never resolves.
+static void town_hall_tick(void) {
+    if (s_th_called_ms == 0) return;
+    if (session_view != 0 ||
+        lv_tick_get() - s_th_called_ms > TOWN_HALL_COOLDOWN_MS) {
+        s_th_called_ms = 0;
+        town_hall_set_calling(false);
+        return;
+    }
+    // The bezel breathes while the round is out. It borrows the tab's existing
+    // pulse rather than starting a second animation: one timer, one phase, and
+    // the button is in step with any waiting card that arrives beside it.
+    if (th_ring) lv_obj_set_style_border_opa(th_ring, (lv_opa_t)pulse_val, 0);
+}
+
 // Refresh the chat views' quota widgets from the cached usage payload. Values
 // match the RESTING panels; enterprise accounts map spending → slot 1,
 // period → slot 2.
@@ -2074,21 +2357,96 @@ static void build_session_views(lv_obj_t* parent) {
     // and not a broken feed; it is hidden when the link is down, because then
     // the headline above it is the whole explanation.
     empty_group = make_session_group(parent);
+
+    // Sized off the SHORT side so the portrait boards get a circle rather than
+    // an ellipse's worth of ambition, and clamped at both ends: below ~110 px
+    // the word stops fitting, above ~200 px it stops reading as a control and
+    // starts reading as a plate.
+    const int th_d0 = (L.scr_w < L.scr_h ? L.scr_w : L.scr_h) * 2 / 5;
+    const int th_d  = th_d0 < 110 ? 110 : (th_d0 > 200 ? 200 : th_d0);
+    const int th_dy = 26;     // the stack's optical centre, not its arithmetic one
+
+    // Bezel: a ring with air around the face, the way a control that matters
+    // gets separated from its background. Not a shadow -- LVGL blurs those per
+    // frame, and the pulse below would pay for it sixty times a second.
+    th_ring = lv_obj_create(empty_group);
+    lv_obj_set_size(th_ring, th_d + 22, th_d + 22);
+    lv_obj_set_style_radius(th_ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(th_ring, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(th_ring, COL_ACCENT, 0);
+    lv_obj_set_style_border_width(th_ring, 3, 0);
+    lv_obj_set_style_border_opa(th_ring, LV_OPA_40, 0);
+    lv_obj_set_style_pad_all(th_ring, 0, 0);
+    lv_obj_clear_flag(th_ring, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(th_ring, LV_OBJ_FLAG_CLICKABLE);   // the face takes the tap
+    lv_obj_align(th_ring, LV_ALIGN_CENTER, 0, th_dy);
+
+    // Face: terracotta with the panel's own black on it. Claude's button, not
+    // a red alarm -- this calls a meeting, it does not report a fire.
+    th_btn = lv_obj_create(empty_group);
+    lv_obj_set_size(th_btn, th_d, th_d);
+    lv_obj_set_style_radius(th_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(th_btn, COL_ACCENT, 0);
+    lv_obj_set_style_bg_opa(th_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(th_btn, 0, 0);
+    lv_obj_set_style_pad_all(th_btn, 0, 0);
+    // Pressed: the face darkens. Deliberately not a scale transform -- LVGL
+    // would re-render the circle at a new size every frame of the press, and
+    // this panel has better uses for those milliseconds.
+    lv_obj_set_style_bg_color(th_btn, lv_color_hex(0xa85639), LV_STATE_PRESSED);
+    lv_obj_clear_flag(th_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(th_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(th_btn, town_hall_tap_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(th_btn, LV_ALIGN_CENTER, 0, th_dy);
+
+    th_lbl = lv_label_create(th_btn);
+    lv_label_set_text(th_lbl, "TOWN\nHALL");
+    lv_obj_set_style_text_font(th_lbl, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(th_lbl, COL_BG, 0);
+    lv_obj_set_style_text_align(th_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(th_lbl, 2, 0);
+    lv_obj_center(th_lbl);
+
+    // The headline keeps its job -- say which kind of nothing this is -- and
+    // moves above the button, where it reads as the reason the button is
+    // being offered.
     empty_lbl = lv_label_create(empty_group);
     lv_label_set_text(empty_lbl, "Nothing needs you");
-    lv_obj_set_style_text_font(empty_lbl, L.bt_device_font, 0);
+    lv_obj_set_style_text_font(empty_lbl, L.bt_credit_2_font, 0);
     lv_obj_set_style_text_color(empty_lbl, COL_DIM, 0);
-    lv_obj_align(empty_lbl, LV_ALIGN_CENTER, 0, -14);
+    lv_obj_align(empty_lbl, LV_ALIGN_CENTER, 0, th_dy - th_d / 2 - 44);
 
-    empty_hint = lv_label_create(empty_group);
-    lv_label_set_text(empty_hint, "only what needs you shows here");
-    lv_obj_set_style_text_font(empty_hint, L.bt_credit_2_font, 0);
-    lv_obj_set_style_text_color(empty_hint, COL_DIM, 0);
-    lv_obj_set_style_text_opa(empty_hint, LV_OPA_50, 0);
-    lv_obj_set_style_text_align(empty_hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(empty_hint, L.scr_w - 2 * L.margin);
-    lv_label_set_long_mode(empty_hint, LV_LABEL_LONG_WRAP);
-    lv_obj_align(empty_hint, LV_ALIGN_CENTER, 0, 24);
+    // What the button does, in the words of somebody deciding whether to press
+    // it. It replaces the old "only what needs you shows here" note: that line
+    // existed to explain an empty list, and an empty list with a control in
+    // the middle of it no longer reads as a broken feed.
+    th_cap = lv_label_create(empty_group);
+    lv_label_set_text(th_cap, "call every agent in");
+    lv_obj_set_style_text_font(th_cap, L.bt_credit_2_font, 0);
+    lv_obj_set_style_text_color(th_cap, COL_DIM, 0);
+    lv_obj_set_style_text_opa(th_cap, LV_OPA_50, 0);
+    lv_obj_set_style_text_align(th_cap, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(th_cap, LV_ALIGN_CENTER, 0, th_dy + th_d / 2 + 34);
+    empty_hint = th_cap;   // the resolver still hides this line when the link is down
+
+    // The toast. Parented on the TAB, above both sub-views, so a tap that
+    // clears the last card can still be acknowledged by a screen that has just
+    // become the empty one.
+    toast_obj = lv_obj_create(parent);
+    lv_obj_set_style_bg_color(toast_obj, COL_PANEL, 0);
+    lv_obj_set_style_bg_opa(toast_obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(toast_obj, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(toast_obj, 0, 0);
+    lv_obj_set_style_pad_hor(toast_obj, 18, 0);
+    lv_obj_set_style_pad_ver(toast_obj, 8, 0);
+    lv_obj_clear_flag(toast_obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(toast_obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(toast_obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    toast_lbl = lv_label_create(toast_obj);
+    lv_obj_set_style_text_font(toast_lbl, L.bt_credit_2_font, 0);
+    lv_obj_center(toast_lbl);
+    lv_obj_align(toast_obj, LV_ALIGN_BOTTOM_MID, 0, -L.margin);
+    lv_obj_add_flag(toast_obj, LV_OBJ_FLAG_HIDDEN);
 
     // The shared pulse: LV_OPA_COVER ↔ LV_OPA_30, 700 ms each way, forever.
     lv_anim_t a;
@@ -2141,6 +2499,18 @@ static void update_session_view(void) {
     if (v == 0 && empty_hint) {
         if (s_ble_connected) lv_obj_clear_flag(empty_hint, LV_OBJ_FLAG_HIDDEN);
         else                 lv_obj_add_flag(empty_hint, LV_OBJ_FLAG_HIDDEN);
+    }
+    // A round is dispatched by the HOST. With the link down there is nobody to
+    // ask, so the button goes rather than sitting there inviting a press that
+    // can only produce an apology.
+    if (th_btn && th_ring) {
+        if (v == 0 && s_ble_connected) {
+            lv_obj_remove_flag(th_btn,  LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(th_ring, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(th_btn,  LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(th_ring, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     if (v == session_view) return;
     session_view = v;
@@ -2287,6 +2657,11 @@ static void maybe_auto_jump(void) {
 // Runs every UI tick, not only when a payload lands, so the dwell is measured
 // against the clock rather than against the daemon's cadence.
 static void sessions_tick(void) {
+    town_hall_tick();
+    if (toast_obj && s_toast_until && lv_tick_get() > s_toast_until) {
+        s_toast_until = 0;
+        lv_obj_add_flag(toast_obj, LV_OBJ_FLAG_HIDDEN);
+    }
     if (!s_auto_return_due) return;
     if (!s_auto_jumped || current_screen != SCREEN_SESSIONS) {
         s_auto_return_due = false;   // they touched it, or navigated away
@@ -3064,10 +3439,15 @@ void ui_update_sessions(const SessionList* list) {
     if (!list || !focus_group || !board_caps().has_session_views) return;
 
     const uint8_t prev_count = s_live_count;
-    s_live_count = list->count;
-    note_notify_set(list);
+    // Rows the owner has already tapped away never reach the rest of this
+    // function -- not the notify set (a cleared card must not yank the panel
+    // back to this tab on the next payload), not the card pool, not the
+    // resolver. From here down, s_shown IS the list.
+    filter_dismissed(list, &s_shown);
+    s_live_count = s_shown.count;
+    note_notify_set(&s_shown);
 
-    if (list->count == 0) {
+    if (s_shown.count == 0) {
         if (prev_count > 0 && (session_view == 1 || session_view == 2)) {
             // The last live chat disappeared → hold the current view for
             // CHAT_LINGER_MS (§2.1). Cards keep their final content, but the
@@ -3095,9 +3475,7 @@ void ui_update_sessions(const SessionList* list) {
     }
 
     s_chats_linger = false;
-    focus_set_content(&list->rows[0]);
-    chats_set_content(list);
-    update_session_view();
+    sessions_render();
     // Last, so the cards are already rendered and the sub-view already
     // resolved when the tab switches — the user arrives at a finished screen,
     // and chats_set_content's "am I visible?" animate test saw the truth.

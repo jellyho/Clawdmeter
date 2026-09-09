@@ -584,6 +584,20 @@ def report_sid(sender):
     return _SID_HEAD[h % len(_SID_HEAD)] + _SID_TAIL[(h // len(_SID_HEAD)) % len(_SID_TAIL)]
 
 
+def row_sid(msg, translit=True):
+    """The sid the DEVICE will see for this message.
+
+    The panel knows a card by two characters and nothing else, so when a tap
+    comes back over BLE ("go ahead on g4", "drop g4") this is the only thing
+    that can turn it into a message again. It has to be computed exactly the
+    way the wire row computes it -- so it is computed HERE, and message_row /
+    report_row call it, rather than each end having its own copy of the rule.
+    """
+    if msg.is_report:
+        return report_sid(panel_sender(msg.sender, translit))
+    return msg.mid[:2]
+
+
 def _epoch(value):
     """ISO-8601 (or numeric) timestamp -> epoch seconds; 0 when unreadable."""
     if isinstance(value, (int, float)):
@@ -773,6 +787,9 @@ class InboxWatcher(object):
         # and what bounds it is the device's row cap and the byte budget.
         self._reports = {}     # panel sender -> Message
         self._seen = {}        # mid -> ts, for de-duplication across re-reads
+        # Message ids the owner tapped away on the device; refreshed each tick
+        # by the poller from the daemon's file (see set_dismissed).
+        self._dismissed = set()
 
     # -- discovery ---------------------------------------------------------
 
@@ -889,6 +906,52 @@ class InboxWatcher(object):
 
     # -- the pass ----------------------------------------------------------
 
+    # ---- Dismissal: cards the owner tapped away on the device ----
+    # The device suppresses a dismissed card locally the moment it is tapped --
+    # that is what makes it leave under the finger, with no round trip. This
+    # side is the other half of the promise: the panel is redrawn from what the
+    # HOST sends every few seconds, so without a record here the card comes
+    # back, which reads as the dismissal having failed rather than as the host
+    # being the source of truth.
+    #
+    # Keyed on the MESSAGE ID, which is a hash of (session, sender, body): the
+    # same words stay gone, and new words from the same agent come back. That
+    # is the same rule the firmware applies, reached from the same direction,
+    # and it is the one that matters -- suppressing an agent by NAME would
+    # silence it for good, which is the failure a notifier must not have.
+    #
+    # The set is pushed in rather than accumulated, because the process that
+    # LEARNS about a dismissal is the BLE daemon and the process that renders
+    # rows is this one. The daemon owns the file; this is where it lands.
+
+    def set_dismissed(self, mids):
+        """Replace the dismissed-id set, and drop anything already live."""
+        self._dismissed = set(mids or ())
+        if not self._dismissed:
+            return
+        self._messages = [m for m in self._messages
+                          if m.mid not in self._dismissed]
+        self._reports = {k: m for k, m in self._reports.items()
+                         if m.mid not in self._dismissed}
+
+    def find_by_sid(self, sid):
+        """The live message the device means by this sid, or None.
+
+        Reports are searched first. Sids are two characters from two
+        independent hashes, so a message and a report CAN collide -- and when
+        they do the report is the one a tap is far more likely to have meant,
+        because it is the only kind of card that carries an action.
+        """
+        if not sid:
+            return None
+        for msg in self.reports_live():
+            if row_sid(msg, self.translit) == sid:
+                return msg
+        for msg in reversed(self._messages):
+            if row_sid(msg, self.translit) == sid:
+                return msg
+        return None
+
     def poll(self):
         """One scan. Returns the live message list, newest last."""
         now = self._now()
@@ -934,6 +997,8 @@ class InboxWatcher(object):
                 # right here, so the panel never shows backlog.
                 if now - msg.ts > self.freshness_s:
                     continue
+                if msg.mid in self._dismissed:
+                    continue      # the owner cleared this one on the device
                 if msg.is_report:
                     # One card per agent. A newer report replaces the older
                     # one outright -- keeping both would show a machine in two
@@ -1053,7 +1118,7 @@ def message_row(msg, now, text_max=MSG_TEXT_MAX, translit=True,
     text = elide_message(to_panel_text(msg.body, translit, keep_hangul),
                          text_max)
     return [
-        msg.mid[:2],                     # 0  sid: stable, keys the card
+        row_sid(msg, translit),          # 0  sid: stable, keys the card
         panel_sender(msg.sender, translit),  # 1  label: who sent it, in the
                                          #    panel's font (see panel_sender)
         STATE_MESSAGE,                   # 2  state
@@ -1091,7 +1156,7 @@ def report_row(msg, now, text_max=REPORT_TEXT_MAX, translit=True,
     text = elide_message(to_panel_text(msg.summary or "", translit, keep_hangul),
                          text_max)
     return [
-        report_sid(sender),              # 0  sid: stable per AGENT
+        row_sid(msg, translit),          # 0  sid: stable per AGENT
         sender,                          # 1  label: which agent reported
         msg.report_state,                # 2  state: the whole trick
         -1,                              # 3  ctx: not applicable

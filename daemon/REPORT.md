@@ -201,7 +201,8 @@ One JSON object, and one key does all the work:
 
 ```
 {"ev":1}                report round — "tell me what the fleet is doing"
-{"ev":2,"sid":"g4"}     go ahead, to the agent on that card   (reserved)
+{"ev":2,"sid":"g4"}     go ahead, to the agent on that card
+{"ev":3,"sid":"g4"}     dismiss that card — stop sending me this row
 ```
 
 `ev` is the **discriminator**. The ack traffic does not carry it, so a
@@ -212,8 +213,100 @@ not recognise is ignored rather than guessed at. Guessing is the expensive
 failure here — an unknown code quietly falling through to the report handler
 would spend the fleet's quota on a button nobody pressed.
 
-`sid` is optional and only the second button needs it. It is sanitised in the
+`sid` is optional and only the card events need it. It is sanitised in the
 firmware (`[0-9A-Za-z]`, 8 characters) before it is spliced into the JSON.
+
+### The sid has to become an agent again
+
+A card is two characters on a panel. The process that receives a tap — the BLE
+daemon — is **not** the process that minted that sid (the fleet poller is), so
+there has to be something written down between them. There is: the sidecar's
+handoff file gained an `index` beside its `payload`.
+
+```json
+{"ts": …, "payload": "{\"ss\":[…]}",
+ "index": {"g4": {"state": 13, "sender": "ACRFT-N", "mid": "9c1f…"}}}
+```
+
+`sender` is the **raw** name, not the panel's transliterated and middle-elided
+label — that one is shaped to fit 32 characters in a bitmap font and cannot be
+used to address anybody. `state` is there so the daemon can refuse a go-ahead
+on a card that never had one, and `mid` is what a dismissal remembers.
+
+Older readers ignore the key, so the payload contract is untouched.
+
+### Go ahead
+
+`{"ev":2}` is the answer to a `NEEDS-YOU` card, and only to that one. The other
+three report states do not get it, for a reason sharper than tidiness:
+`BLOCKED` is parked on a permission dialog on somebody else's machine, where a
+message queues *behind* the dialog and changes nothing, and `WORKING` / `DONE`
+are not waiting for anything. A button that appeared to resume those would be a
+button that silently did nothing.
+
+The daemon resolves the sid through the index and spawns
+`clawdmeter_report.py --go-ahead <agent>`. That is **not a round**: no listing
+filter, no mail drop, no rate limit anchored on the fleet — it is a reply to
+something the owner is looking at, addressed to the one agent whose sentence
+they read. What it does share is the machinery that matters: the same spawn,
+the same two-tool sandbox (`ListAgents` + `SendMessage` and nothing else), the
+same throwaway cwd, the same peer-env gates without which a one-shot cannot see
+a remote agent at all.
+
+The listing is still fetched, to correct a name that has drifted — a session
+has two names and only the listing's `title` is what a remote peer resolves —
+but a listing that cannot be read is a **warning here, not a refusal**. The
+courier prompt names one agent and refuses to message any other, so the
+addressing is a nicety rather than the safety property.
+
+What it sends is deliberately short:
+
+> Go ahead. This is the owner, answering from the Clawdmeter panel: continue
+> with what you reported you were waiting on. If you need a decision rather
+> than permission, say so in one line and stop.
+
+The owner pressed a button on a 480-pixel panel. The device has no idea what
+they are approving and must not invent one; an agent that needs a decision
+rather than a nudge will ask again, and that answer belongs on a keyboard.
+
+### Dismiss
+
+`{"ev":3}` is what a tap on any other card sends. **The device has already
+hidden it** — that happens under the finger, with no round trip, and it is what
+makes the gesture feel like anything. The event exists so the *host* stops
+re-sending the row, which is what makes the dismissal outlive a reboot of the
+panel.
+
+Both ends key the dismissal on the **words**, not on the sid: the firmware on a
+hash of (sid, label, body, state), the host on the message id, which is already
+a hash of (session, sender, body). Same rule, reached from both directions, and
+it is the one that matters — suppressing an agent by *name* would silence it
+for good, which is the failure a notifier must not have. The same agent saying
+something new comes back.
+
+The daemon writes `~/.clawdmeter/dismissed.json`; the fleet poller reads it
+every tick and feeds it to the inbox watcher. One writer, one reader, no lock.
+Entries expire after an hour and the file holds at most 64, so neither a lost
+write nor a mistaken tap can become a permanent gag.
+
+### The town hall button
+
+The hardware button still fires a round, but it is no longer the way in. When
+the sessions tab has nothing on it — every card answered, cleared, or never
+there — the space the cards occupied holds the control that puts cards back: a
+terracotta circle that says TOWN HALL, and under it, *call every agent in*.
+
+It exists **only** on the empty view, and that is the design rather than a
+placement: with cards on screen there is nothing to call a meeting about — the
+meeting already happened, and its minutes are what you are reading.
+
+Pressing it enters a CALLING state for 30 seconds, or until replies arrive and
+take the tab off the empty view. That is not a rate limit (the dispatcher has
+one of those, anchored on the attempt); it is the button declining to look
+pressable while it is already working, which is the only honest thing the
+device can say about a round it cannot see. With the link down the button is
+hidden outright: a round is dispatched by the host, so with nobody to ask there
+is nothing to offer.
 
 ### Owner-only, in both directions
 

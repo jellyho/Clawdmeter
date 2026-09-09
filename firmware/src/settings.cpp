@@ -17,7 +17,23 @@ static const char* const VOLUME_CHOICES[] = { "Low", "Med", "High" };
 
 // ES8311 output-register levels behind those three labels. Med is the value
 // every board's ChimeConfig used to hard-code, so an upgrade sounds the same.
-static const uint8_t VOLUME_LEVELS[] = { 40, 65, 90 };
+// The three steps, as ES8311 volume percentages -- and they are NOT the evenly
+// spaced 40/65/90 they look like they should be, because that scale is not a
+// loudness. es8311_voice_volume_set turns a percentage into DAC register 0x32
+// as `reg = pct * 256 / 100 - 1`, and the register is HALF A DECIBEL per step
+// with 0 dB at 0xBF (191). So the old 40/65/90 was -45 dB, -13 dB and +19 dB:
+// two settings barely audible, one of them a 32 dB jump into digital gain the
+// bell has no headroom for -- its peak sits at -7.0 dBFS, so +19 dB clipped it
+// by twelve.
+//
+//   pct -> reg -> dB          70 -> 179 -> -6.5
+//                             75 -> 191 ->  0.0   (unity: what the file holds)
+//                             80 -> 203 -> +6.0   (peak lands at -1 dBFS)
+//
+// Even 6 dB steps, and the loudest one still does not clip. Louder than this
+// is an amplifier question, not a number question: every dB past +7 is one the
+// bell does not have.
+static const uint8_t VOLUME_LEVELS[] = { 70, 75, 80 };
 
 // The single source of truth for the settings surface. One row per entry, in
 // screen order; adding a setting is a line here plus a member in setting_id_t.

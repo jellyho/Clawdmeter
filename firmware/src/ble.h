@@ -34,13 +34,30 @@ void ble_request_refresh(void);
 // so a subscriber dispatches on its presence and ignores everything else.
 //
 //   {"ev":1}                report round - "tell me what the fleet is doing"
-//   {"ev":2,"sid":"g4"}     (reserved) go ahead, to the agent on that card
+//   {"ev":2,"sid":"g4"}     go ahead, to the agent on that card
+//   {"ev":3,"sid":"g4"}     dismiss that card - stop sending me this row
 //
 // Codes are APPEND-ONLY. They cross the BLE boundary exactly like the session
 // state codes in data.h, so a released code is never renumbered or reused.
+//
+// GO_AHEAD and DISMISS are the two halves of the same gesture: every card on
+// the sessions tab is now a thing you TAP, and what the tap means depends on
+// whether the card is waiting for a word from you (go ahead) or merely telling
+// you something (dismiss). Both carry the sid of the card that was tapped,
+// which is the only handle the device has on the row - the host minted it and
+// the host is the only side that can turn it back into an agent to talk to.
+//
+// A DISMISS is advisory, not a delete. The device also suppresses the row
+// locally the moment it is tapped, because the card has to leave under the
+// finger and the round trip is a second away at best; the event exists so the
+// host stops RE-SENDING it, which is what makes the dismissal outlive a
+// reboot. If it never arrives, the local suppression still holds for as long
+// as the device is up, and the row comes back on the next boot - annoying,
+// not wrong.
 enum ble_event_t {
-    BLE_EVENT_REPORT   = 1,   // report button
-    BLE_EVENT_GO_AHEAD = 2,   // reserved - carries a sid; nothing sends it yet
+    BLE_EVENT_REPORT   = 1,   // town hall button
+    BLE_EVENT_GO_AHEAD = 2,   // carries a sid - "continue, you have my answer"
+    BLE_EVENT_DISMISS  = 3,   // carries a sid - "I have read this, drop it"
 };
 
 // Notify one button event to the BONDED OWNER only, on its encrypted link.

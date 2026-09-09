@@ -73,7 +73,7 @@ void settings_init(void);
 
 // ---- Typed accessors: what the rest of the firmware calls ----
 bool         settings_sound_enabled(void);      // default true
-uint8_t      settings_volume(void);             // codec level 0..100, default 65
+uint8_t      settings_volume(void);             // codec level 0..100, default 75 (0 dB)
 bool         settings_auto_jump_enabled(void);  // default true
 bool         settings_splash_boot(void);        // default true
 clock_pref_t settings_clock_pref(void);         // default CLOCK_PREF_AUTO

@@ -810,7 +810,7 @@ def run_loop(budget, show_offline=False, watcher=None, tick_s=TICK_S,
              poll_interval_s=POLL_INTERVAL_S, sessions_file=None,
              iterations=None, sleep_fn=time.sleep, now_fn=time.time,
              attention_only=True, stale_after_s=STALE_AFTER_S,
-             heartbeat=None, health=None):
+             heartbeat=None, health=None, dismiss_file=None):
     """The service loop: poll the listing slowly, the inbox quickly.
 
     Publishes only when something actually changed (see _significant), with a
@@ -820,6 +820,7 @@ def run_loop(budget, show_offline=False, watcher=None, tick_s=TICK_S,
     other producer filled.
     """
     sessions_file = sessions_file or cs.DEFAULT_SESSIONS_FILE
+    dismiss_file = dismiss_file or DISMISS_FILE
     api_rows = []
     exclude = set()
     have_listing = False
@@ -859,6 +860,10 @@ def run_loop(budget, show_offline=False, watcher=None, tick_s=TICK_S,
         # than up to 30 s later.
         stale = health.stale_row(now)
         if watcher is not None:
+            # What the owner has cleared on the device, re-read every tick. The
+            # BLE daemon owns that file; this process only ever reads it, so
+            # there is one writer and one reader and no locking to get wrong.
+            watcher.set_dismissed(read_dismissed(dismiss_file, now))
             watcher.poll()
         inbox_rows = inbox_rows_for(watcher, now, budget, stale)
         rows = merge_rows(api_rows, exclude, show_offline, inbox_rows,
@@ -885,11 +890,76 @@ def run_loop(budget, show_offline=False, watcher=None, tick_s=TICK_S,
         # meaningful changed.
         refresh_due = (now - last_write) >= poll_interval_s
         if payload != last_payload and (sig != last_sig or refresh_due):
-            cs.write_sessions_file(sessions_file, payload)
+            cs.write_sessions_file(sessions_file, payload,
+                                   build_index(rows, watcher))
             last_payload, last_sig, last_write = payload, sig, now
 
         sleep_fn(tick_s)
     return last_payload
+
+
+DISMISS_FILE = os.path.join(os.path.dirname(cs.DEFAULT_SESSIONS_FILE),
+                            "dismissed.json")
+
+# How long a dismissal is honoured. Long enough to outlive the card -- a report
+# expires in three minutes, a message in three -- and short enough that the
+# file cannot become a permanent gag on an agent if a write is ever lost.
+DISMISS_TTL_S = 3600
+
+
+def read_dismissed(path=None, now=None):
+    """Message ids the owner cleared on the device, as a set.
+
+    Total and quiet, like every other read on this path: a missing file is the
+    normal case (nothing has been dismissed), and a malformed one must not be
+    able to stop the panel updating. Entries older than DISMISS_TTL_S are
+    ignored here rather than deleted -- the daemon owns the file and prunes it
+    on its next write; this side never touches it.
+    """
+    path = path or DISMISS_FILE
+    now = time.time() if now is None else now
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(doc, dict):
+        return set()
+    out = set()
+    for item in doc.get("dismissed") or ():
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("mid")
+        ts = item.get("ts")
+        if not isinstance(mid, str) or not mid:
+            continue
+        if isinstance(ts, (int, float)) and now - ts > DISMISS_TTL_S:
+            continue
+        out.add(mid)
+    return out
+
+
+def build_index(rows, watcher):
+    """{sid: {...}} for the rows about to ship -- the panel's reply address.
+
+    Only the fields a tap needs: the STATE (so the daemon can refuse a go-ahead
+    on a card that never had one) and, for anything the inbox minted, the RAW
+    sender and the message id. Raw, not the panel's transliterated and elided
+    label -- that one is shaped for a 32-character font and cannot be used to
+    address anybody.
+    """
+    index = {}
+    for row in rows or ():
+        if not row:
+            continue
+        sid = row[0]
+        entry = {"state": row[2] if len(row) > 2 else 0}
+        msg = watcher.find_by_sid(sid) if watcher is not None else None
+        if msg is not None:
+            entry["sender"] = msg.sender
+            entry["mid"] = msg.mid
+        index[sid] = entry
+    return index
 
 
 def _enabled(config_path=None):

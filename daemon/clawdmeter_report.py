@@ -595,9 +595,10 @@ def start_maildrop(name=DEFAULT_MAILDROP_NAME, model=MAILDROP_MODEL,
     except OSError:
         pass
     runner = subprocess.run if runner is None else runner
+    noconsole = _no_console_kwargs()
     try:
         proc = runner(argv, capture_output=True, text=True, timeout=timeout_s,
-                      cwd=cwd, encoding="utf-8", errors="replace")
+                      cwd=cwd, encoding="utf-8", errors="replace", **noconsole)
     except subprocess.TimeoutExpired:
         return SpawnResult(False, error="timeout", duration_s=time.time() - started)
     except (OSError, ValueError) as exc:
@@ -838,6 +839,117 @@ When every message has been sent, reply with one short line: how many of the
 """
 
 
+# ---------------------------------------------------------------------------
+# Go ahead -- the other direction
+# ---------------------------------------------------------------------------
+#
+# A report round ends with cards on the panel, and one of the states a card can
+# be in is NEEDS-YOU: the agent stopped and is waiting for a word. This is that
+# word. The owner taps the card, the device notifies the sid, and one message
+# goes to that one agent.
+#
+# It is deliberately NOT a round. No listing filter, no mail drop, no rate
+# limit anchored on the fleet: this is a reply to something the owner is
+# looking at, addressed to exactly the agent whose sentence they read. The
+# machinery it does share is the machinery that matters -- the same spawn, the
+# same two-tool sandbox, the same throwaway cwd, the same peer-env gates
+# without which the one-shot cannot see a remote agent at all.
+#
+# WHAT IT DOES NOT SAY is as considered as what it does. "Go ahead" and
+# nothing else: the owner pressed a button on a 480-pixel panel, so the device
+# has no idea what they are approving and must not invent one. An agent that
+# needs a decision rather than a nudge will ask again, and that answer belongs
+# on a keyboard.
+GO_AHEAD_BODY = ("Go ahead. This is the owner, answering from the Clawdmeter "
+                 "panel: continue with what you reported you were waiting on. "
+                 "If you need a decision rather than permission, say so in one "
+                 "line and stop.")
+
+GO_AHEAD_TEMPLATE = """\
+You are a courier. Do exactly what is listed below, then stop.
+
+1. Call ListAgents, to see what the peer is addressable as. It prints a
+   reference handle in square brackets beside each name. If the name in step 2
+   does not appear, or it says the Remote Control session list did not
+   complete, call ListAgents ONE more time before concluding anything.
+
+2. Send ONE message with SendMessage to this agent and to nobody else:
+     - {name}
+   Match the name against what ListAgents printed, and if it shows a reference
+   handle (a [ref] token) address it by that handle. If the name is not in the
+   listing at all, send nothing and say so.
+
+3. The body is EXACTLY the text between the two marker lines below, with the
+   marker lines themselves left out. Do not summarise it, do not translate it,
+   do not add a greeting, do not add anything of your own.
+
+----- BEGIN MESSAGE BODY -----
+{body}
+----- END MESSAGE BODY -----
+
+Do not wait for an answer. Use no tool other than ListAgents and SendMessage.
+
+Reply with one short line: whether it was sent, and to what name.
+"""
+
+
+def resolve_agent(name, api_rows):
+    """The listing title to address, or None.
+
+    A session has two names -- the roster's local `name` and the listing's
+    `title` -- and only the second is what a remote peer resolves. The sender
+    recorded on an incoming report is whatever that agent called itself, so it
+    is checked AGAINST the listing rather than trusted: exact, then
+    case-folded, then a unique prefix. Ambiguity returns None, because
+    delivering the owner's "go ahead" to the wrong agent is worse than not
+    delivering it.
+    """
+    if not name:
+        return None
+    titles = [t for t in (_title_of(r) for r in api_rows or ()) if t]
+    if name in titles:
+        return name
+    folded = [t for t in titles if t.casefold() == name.casefold()]
+    if len(folded) == 1:
+        return folded[0]
+    pref = [t for t in titles if t.casefold().startswith(name.casefold())]
+    if len(pref) == 1:
+        return pref[0]
+    return None
+
+
+def build_go_ahead_prompt(name):
+    return GO_AHEAD_TEMPLATE.format(name=name, body=GO_AHEAD_BODY)
+
+
+def go_ahead(name, api_rows=None, model=DEFAULT_MODEL,
+             timeout_s=DEFAULT_TIMEOUT_S, runner=None, binary=None,
+             peer_env=True, dry_run=False):
+    """Send one go-ahead. Returns (ok, detail) -- never raises.
+
+    `api_rows` is optional: without a listing the name is used as given, which
+    is the right fallback rather than a refusal. The listing is a nicety here
+    (it fixes a name that drifted), not a safety property -- the courier
+    prompt already refuses to message anybody but the one agent named.
+    """
+    address = resolve_agent(name, api_rows) or name
+    prompt = build_go_ahead_prompt(address)
+    if dry_run:
+        return True, f"dry run: would send go ahead to {address}"
+    result = spawn(prompt, model=model, timeout_s=timeout_s, runner=runner,
+                   binary=binary, peer_env=peer_env)
+    if not result.ok:
+        why = {"timeout": f"courier did not finish in {int(timeout_s)}s",
+               "not-found": "could not start the Claude Code CLI",
+               }.get(result.error, "courier exited with an error")
+        return False, f"{why} (to {address})"
+    said = ""
+    if isinstance(result.result, dict):
+        said = str(result.result.get("result") or "").strip().splitlines()[:1]
+        said = said[0] if said else ""
+    return True, f"go ahead sent to {address}" + (f": {said}" if said else "")
+
+
 def build_prompt(targets, reply_to):
     """The whole prompt handed to `claude -p`."""
     names = [t.name if isinstance(t, Target) else str(t) for t in targets]
@@ -865,6 +977,19 @@ def claude_bin():
         if os.path.exists(cand):
             return cand
     return "claude"
+
+
+def _no_console_kwargs():
+    """subprocess kwargs that keep a child from opening a console window.
+
+    The daemon runs under pythonw.exe, which has no console of its own, so
+    spawning `claude` -- a console program -- makes Windows create a NEW window
+    that flashes up on the user's screen every time they press the report
+    button. CREATE_NO_WINDOW suppresses it. getattr because the flag is
+    Windows-only; on other platforms this is an empty dict and changes nothing.
+    """
+    flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return {"creationflags": flag} if flag else {}
 
 
 def build_argv(prompt, model=DEFAULT_MODEL, binary=None):
@@ -949,6 +1074,7 @@ def spawn(prompt, model=DEFAULT_MODEL, timeout_s=DEFAULT_TIMEOUT_S,
     if peer_env:
         env.update(PEER_ENV)
     runner = subprocess.run if runner is None else runner
+    noconsole = _no_console_kwargs()
     started = time.time()
     tmpdir = None
     if cwd is None:
@@ -959,7 +1085,7 @@ def spawn(prompt, model=DEFAULT_MODEL, timeout_s=DEFAULT_TIMEOUT_S,
         cwd = tmpdir
     try:
         proc = runner(argv, capture_output=True, text=True, timeout=timeout_s,
-                      cwd=cwd, env=env, encoding="utf-8", errors="replace")
+                      cwd=cwd, env=env, encoding="utf-8", errors="replace", **noconsole)
     except subprocess.TimeoutExpired as exc:
         return SpawnResult(False, error="timeout", duration_s=time.time() - started,
                            stdout=_as_text(getattr(exc, "stdout", "")),
@@ -1386,6 +1512,10 @@ def main(argv=None):
                              "(0 = do not wait)")
     parser.add_argument("--json", action="store_true",
                         help="print the round as JSON instead of prose")
+    parser.add_argument("--go-ahead", default=None, metavar="AGENT",
+                        help="do not run a round: send one 'go ahead' to this "
+                             "agent and exit. This is what the panel calls "
+                             "when a NEEDS-YOU card is tapped")
     args = parser.parse_args(argv)
 
     force_utf8_stdio()
@@ -1411,6 +1541,24 @@ def main(argv=None):
         log(f"it outlives this terminal. Stop it with: claude stop "
             f"{str(rec.get('sessionId') or '')[:8]}")
         return 0
+
+    if args.go_ahead:
+        # One message to one agent -- not a round, and not gated like one. The
+        # listing is fetched only to correct a name that has drifted, so a
+        # listing that cannot be read is a warning here rather than a refusal:
+        # the owner tapped a card that exists and the courier prompt names one
+        # agent and no other.
+        token = fleet.read_token()
+        rows = fleet.fetch_sessions(token) if token else None
+        if rows is None:
+            log("go ahead: no fleet listing; addressing the agent by the name "
+                "the report came from")
+        ok, detail = go_ahead(args.go_ahead, rows, model=model,
+                              timeout_s=args.timeout,
+                              peer_env=not args.no_peer_env,
+                              dry_run=args.dry_run)
+        log(detail)
+        return 0 if ok else 2
 
     token = fleet.read_token()
     if not token:

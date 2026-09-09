@@ -936,7 +936,7 @@ def _loop(monkeypatch, tmp_path, w, api=(), iterations=3):
     writes = []
     real = cs.write_sessions_file
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload: (writes.append(payload), real(p, payload))[0])
+                        lambda p, payload, index=None: (writes.append(payload), real(p, payload))[0])
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=w, tick_s=2,
                    poll_interval_s=30, sessions_file=str(out),
                    iterations=iterations, sleep_fn=clock.sleep, now_fn=clock.now)
@@ -956,7 +956,7 @@ def test_a_message_does_not_wait_for_the_next_listing_poll(projects, tmp_path,
     monkeypatch.setattr(fleet, "local_bridge_ids", lambda *a, **k: set())
     writes = []
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload: writes.append((clock.t, payload)))
+                        lambda p, payload, index=None: writes.append((clock.t, payload)))
 
     # tick 0: nothing. Then a message lands, and the very next tick ships it.
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=w, tick_s=2, poll_interval_s=30,
@@ -999,7 +999,7 @@ def test_nothing_is_published_when_there_is_nothing_to_say(projects, tmp_path,
     monkeypatch.setattr(fleet, "local_bridge_ids", lambda *a, **k: set())
     writes = []
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload: writes.append(payload))
+                        lambda p, payload, index=None: writes.append(payload))
     clock = _Clock()
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=watcher(projects, now_fn=clock.now),
                    tick_s=2, poll_interval_s=30, sessions_file=str(tmp_path / "s.json"),
@@ -1015,7 +1015,7 @@ def test_messages_publish_even_without_a_token(projects, tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, "local_bridge_ids", lambda *a, **k: set())
     writes = []
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload: writes.append(payload))
+                        lambda p, payload, index=None: writes.append(payload))
     clock = _Clock()
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=watcher(projects, now_fn=clock.now),
                    tick_s=2, poll_interval_s=30, sessions_file=str(tmp_path / "s.json"),
@@ -1044,7 +1044,7 @@ def test_an_expired_message_is_retracted_even_with_no_listing(projects, tmp_path
     out = tmp_path / "s.json"
     real = cs.write_sessions_file
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload: (writes.append(payload), real(p, payload))[0])
+                        lambda p, payload, index=None: (writes.append(payload), real(p, payload))[0])
     clock = _Clock()
     w = watcher(projects, now_fn=clock.now, expire_s=180)
     # 150 ticks x 2 s = 300 simulated seconds, well past expire_s.
@@ -1072,7 +1072,7 @@ def test_a_listing_failure_keeps_the_last_good_sessions(projects, tmp_path,
     monkeypatch.setattr(fleet, "local_bridge_ids", lambda *a, **k: set())
     writes = []
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload: writes.append(payload))
+                        lambda p, payload, index=None: writes.append(payload))
     clock = _Clock()
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=None, tick_s=2,
                    poll_interval_s=30, sessions_file=str(tmp_path / "s.json"),
