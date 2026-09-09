@@ -32,6 +32,7 @@ enum setting_id_t : uint8_t {
     SETTING_SPLASH_BOOT,   // boot to the splash instead of the usage screen
     SETTING_CLOCK,         // title clock: follow the host, or force 24h / 12h
     SETTING_BRIGHTNESS,    // delegates to brightness.{h,cpp} — not stored here
+    SETTING_BROADCAST,     // one-shot: tell the fleet the standing rules
     SETTING_COUNT,
 };
 
@@ -39,7 +40,18 @@ enum setting_kind_t : uint8_t {
     SETTING_KIND_BOOL,     // on/off: render "On"/"Off", activate = toggle
     SETTING_KIND_CHOICE,   // small named enum: render the choice, activate = next
     SETTING_KIND_STEP,     // externally-owned stepped value (brightness)
+    // A row that DOES something instead of holding something. It stores no
+    // value, so there is nothing to render on the right except the verb — and
+    // for a couple of seconds after it fires, an acknowledgement, because a
+    // row that looks identical before and after a tap is a row you press
+    // twice. The doing itself belongs to whoever owns the action (ui.cpp
+    // sends it over BLE); this module only knows that it happened and when.
+    SETTING_KIND_ACTION,
 };
+
+// Stamp an action row as just-fired, so it can say so. Called by whatever
+// actually performed the action, and only when it succeeded.
+void settings_note_action(setting_id_t id);
 
 // Clock format preference. AUTO defers to the daemon's hint (UsageData.clock_fmt)
 // exactly as the firmware did before there was a setting, so nobody's clock

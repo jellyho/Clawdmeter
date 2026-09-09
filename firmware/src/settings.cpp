@@ -67,6 +67,11 @@ static const SettingSpec SPECS[] = {
       "Auto follows the host's format" },
     { SETTING_KIND_STEP,   NULL,      1, 2, NULL, "Brightness",
       "Step through the backlight levels" },
+    // Last, and an ACTION rather than a value: it is the one row that reaches
+    // off the device. Bottom of the list because it is housekeeping you do
+    // once, not a preference you come back to.
+    { SETTING_KIND_ACTION, NULL,      0, 1, NULL, "Teach agents",
+      "Send the Clawdmeter rules to every agent" },
 };
 
 static_assert(sizeof(SPECS) / sizeof(SPECS[0]) == SETTING_COUNT,
@@ -76,6 +81,15 @@ static_assert(sizeof(SPECS) / sizeof(SPECS[0]) == SETTING_COUNT,
 // straight from brightness_get() so there is never a second copy to drift.
 static uint8_t vals[SETTING_COUNT];
 static bool    defaults_applied = false;
+// millis() of the last successful fire, per action row. 0 = never.
+static uint32_t action_ms[SETTING_COUNT];
+#define ACTION_ACK_MS 2500u
+
+void settings_note_action(setting_id_t id) {
+    if (id >= SETTING_COUNT) return;
+    uint32_t t = millis();
+    action_ms[id] = t ? t : 1;   // 0 is the never sentinel
+}
 
 static void apply_defaults(void) {
     for (uint8_t i = 0; i < SETTING_COUNT; i++) vals[i] = SPECS[i].def;
@@ -182,6 +196,9 @@ void settings_set_bool(setting_id_t id, bool on) {
 
 void settings_activate(setting_id_t id) {
     if (id >= SETTING_COUNT) return;
+    // An action row holds nothing to advance. The action itself is performed
+    // by the caller, which is the only side that knows whether it worked.
+    if (SPECS[id].kind == SETTING_KIND_ACTION) return;
     if (is_stored(id)) {
         // BOOL and CHOICE both just advance to the next value and wrap.
         set_raw(id, (uint8_t)((get_raw(id) + 1) % SPECS[id].nvals));
@@ -218,6 +235,18 @@ bool settings_get_row(uint8_t index, SettingRow* out) {
         out->value_min = 0;
         out->value_max = (int16_t)(spec.nvals - 1);
         snprintf(out->value_text, sizeof(out->value_text), "%s", spec.choices[v]);
+    } else if (spec.kind == SETTING_KIND_ACTION) {
+        // The verb, or an acknowledgement for a couple of seconds after it
+        // fired. `on` drives the accent colour, so the row lights up exactly
+        // while it is saying "Sent" and settles back to a quiet "Send".
+        const uint32_t at = action_ms[index];
+        const bool recent = at && (millis() - at) < ACTION_ACK_MS;
+        out->on        = recent;
+        out->value     = 0;
+        out->value_min = 0;
+        out->value_max = 0;
+        snprintf(out->value_text, sizeof(out->value_text), "%s",
+                 recent ? "Sent" : "Send");
     } else {
         // Brightness: the PWM level brightness.cpp is currently applying.
         const int level = (int)brightness_get();

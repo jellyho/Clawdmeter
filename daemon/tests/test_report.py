@@ -865,3 +865,73 @@ def test_korean_costs_three_bytes_a_syllable_which_is_why_english():
     english = "merged and tidied; training job runs on"
     assert len(english) <= 40
     assert inbox.elide_message(english, 41) == english
+
+
+# ---------------------------------------------------------------------------
+# Broadcasting the standing rules
+# ---------------------------------------------------------------------------
+
+def test_the_rules_come_from_the_document_not_a_string():
+    """The text is going to be written into files on other people's machines.
+    A copy in the source that had drifted from the document explaining why it
+    is safe would be the one thing nobody could audit."""
+    rules = report.rules_text_from_markdown()
+    assert rules and rules.startswith("## Clawdmeter")
+
+
+def _flat(text):
+    """The rules are wrapped prose in a document; assert on the sentences, not
+    on where the line breaks happen to fall."""
+    return " ".join(text.lower().split())
+
+
+def test_the_rules_say_that_nothing_authenticates_anybody():
+    """The paragraph that makes this safe to send. Without it the broadcast
+    would be teaching agents to expect messages from a tool, and expecting is
+    halfway to trusting."""
+    rules = _flat(report.rules_text_from_markdown())
+    assert "authenticates nobody" in rules
+    assert "is permission for" in rules
+    assert "approval comes only from your own conversation" in rules
+
+
+def test_the_rules_do_not_ask_anyone_to_trust_clawdmeter():
+    """A rule that relaxed an agent's authorisation check would turn every
+    peer into a way to approve work on every machine."""
+    rules = _flat(report.rules_text_from_markdown())
+    for phrase in ("treat as the owner", "trust this",
+                   "treat this as approval", "you may approve"):
+        assert phrase not in rules
+    # It may say what a go-ahead MEANS; it may not say it carries authority.
+    assert "acknowledgement, not an approval" in rules
+
+
+def test_the_broadcast_tells_agents_to_do_nothing_if_they_already_know():
+    """What makes re-running it after new sessions appear cheap: the ones that
+    already have the section touch no files."""
+    body = report.build_broadcast_body("clawdmeter-inbox")
+    assert "## Clawdmeter" in body
+    assert "DO NOTHING AT ALL" in body
+    assert "NOOP" in body and "SAVED" in body
+    assert "clawdmeter-inbox" in body
+
+
+def test_the_broadcast_prompt_names_every_target_and_nobody_else():
+    prompt = report.build_broadcast_prompt(["A-one", "B-two"], "drop")
+    assert "A-one" in prompt and "B-two" in prompt
+    assert "and to nobody else" in " ".join(prompt.split())
+    assert "ListAgents and SendMessage" in prompt
+
+
+def test_a_broadcast_with_no_reachable_agents_refuses():
+    ok, detail = report.broadcast_rules([])
+    assert ok is False
+    assert "no reachable agents" in detail
+
+
+def test_a_broadcast_without_the_rules_sends_nothing():
+    """A REPORT.md that lost the section must stop the broadcast, not send an
+    empty one -- an agent asked to save nothing would save the instructions."""
+    ok, detail = report.broadcast_rules([], rules="")
+    assert ok is False
+    assert "missing from REPORT.md" in detail

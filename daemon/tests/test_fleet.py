@@ -746,3 +746,60 @@ def test_the_loop_stamps_the_heartbeat(tmp_path, monkeypatch):
     _run(monkeypatch, tmp_path, lambda *a, **k: _waiting(), iterations=4)
     assert path.exists()
     assert fleet.read_heartbeat(str(path))["pid"] == os.getpid()
+
+
+# ---------------------------------------------------------------------------
+# A card the owner answered by hand, on the machine itself
+# ---------------------------------------------------------------------------
+
+class _Rep(object):
+    """Stand-in for an inbox Message: the three fields the check reads."""
+    def __init__(self, sender, state, ts):
+        self.sender, self.report_state, self.ts = sender, state, ts
+
+
+def _row(title, status, last):
+    return {"title": title, "worker_status": status, "last_event_at": last}
+
+
+def test_a_waiting_card_is_retracted_when_its_agent_goes_back_to_work():
+    """Nothing tells the panel the owner walked over and answered the session
+    -- no button, no report. The listing is the only witness."""
+    reports = {"ACRFT-N": _Rep("ACRFT-N", inbox.STATE_REPORT_NEEDS_YOU, 1000.0)}
+    rows = [_row("ACRFT-N", "running", 1100.0)]
+    out = fleet.answered_elsewhere(reports, rows, now=1200.0)
+    assert list(out) == ["ACRFT-N"]
+
+
+def test_the_turn_the_report_was_sent_in_does_not_count():
+    """The agent is still mid-turn while it sends the report -- the
+    SendMessage IS that turn -- so the listing says `running` for a moment
+    afterwards. A zero margin would clear every card seconds after it landed,
+    which is exactly what was seen on the device."""
+    reports = {"A": _Rep("A", inbox.STATE_REPORT_NEEDS_YOU, 1000.0)}
+    rows = [_row("A", "running", 1000.0 + fleet.ANSWERED_MARGIN_S - 1)]
+    assert fleet.answered_elsewhere(reports, rows, now=1100.0) == {}
+
+
+def test_an_idle_agent_keeps_its_card():
+    """Waiting for a person looks exactly like this. Retracting here would
+    delete the card the moment it became true."""
+    reports = {"A": _Rep("A", inbox.STATE_REPORT_NEEDS_YOU, 1000.0)}
+    rows = [_row("A", "idle", 1200.0)]
+    assert fleet.answered_elsewhere(reports, rows, now=1300.0) == {}
+
+
+def test_only_the_waiting_states_are_eligible():
+    """A WORKING card already says the agent is busy; retracting it because
+    the agent is busy would be circular."""
+    reports = {"A": _Rep("A", inbox.STATE_REPORT_WORKING, 1000.0)}
+    rows = [_row("A", "running", 1200.0)]
+    assert fleet.answered_elsewhere(reports, rows, now=1300.0) == {}
+
+
+def test_an_agent_missing_from_the_listing_keeps_its_card():
+    """No evidence is not evidence of resolution."""
+    reports = {"A": _Rep("A", inbox.STATE_REPORT_NEEDS_YOU, 1000.0)}
+    assert fleet.answered_elsewhere(reports, [_row("B", "running", 1200.0)],
+                                    now=1300.0) == {}
+    assert fleet.answered_elsewhere(reports, [], now=1300.0) == {}

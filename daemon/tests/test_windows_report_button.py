@@ -25,6 +25,7 @@ from bleak.exc import BleakError
 
 import daemon.claude_usage_daemon_windows as mod
 from daemon.claude_usage_daemon_windows import (
+    EVENT_BROADCAST,
     EVENT_DISMISS,
     EVENT_GO_AHEAD,
     EVENT_REPORT,
@@ -193,6 +194,7 @@ def test_every_released_event_code_has_a_handler():
     assert EVENT_REPORT in mod.EVENT_HANDLERS
     assert EVENT_GO_AHEAD in mod.EVENT_HANDLERS
     assert EVENT_DISMISS in mod.EVENT_HANDLERS
+    assert EVENT_BROADCAST in mod.EVENT_HANDLERS
 
 
 # ---------------------------------------------------------------------------

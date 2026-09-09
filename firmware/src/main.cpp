@@ -462,19 +462,24 @@ void loop() {
             primary_was = primary_now;
         }
 
-        // The report button. One edge, one event, no release half — so the
-        // "did I swallow this press?" latch the HID path needed has nothing
-        // left to do and went with it.
+        // The secondary button WAKES THE PANEL AND NOTHING ELSE.
+        //
+        // It briefly fired a report round, which was a bad place to put one. A
+        // round spends quota on other people's machines, and a side button is
+        // pressed by a sleeve, by a desk, by picking the thing up — none of
+        // which is a decision to call a meeting. The panel's own TOWN HALL
+        // button asks for a deliberate look at a deliberate control, and it is
+        // now the only way in. (Before that the button sent HID Shift+Tab,
+        // which typed into whatever window had focus; that went for the same
+        // reason.)
+        //
+        // The press is still consumed, so it counts as activity and lifts the
+        // idle fade like any other input.
         if (board_caps().button_count >= 2) {
             static bool secondary_was = false;
             bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
             if (secondary_now != secondary_was) {
-                if (secondary_now && !idle_consume_wake_press()) {
-                    // Same action as the panel's town hall button, so the same
-                    // acknowledgement: a round shows nothing for ~20 s.
-                    if (ble_send_report_request() && settings_sound_enabled())
-                        sound_hal_play_short();
-                }
+                if (secondary_now) (void)idle_consume_wake_press();
                 secondary_was = secondary_now;
             }
         }

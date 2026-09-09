@@ -3026,6 +3026,8 @@ static bool setting_row_visible(setting_id_t id) {
     case SETTING_SOUND:     return board_caps().has_sound;
     case SETTING_VOLUME:    return board_caps().has_sound;
     case SETTING_AUTO_JUMP: return board_caps().has_session_views;
+    // Nothing to teach if this board cannot show what the agents say.
+    case SETTING_BROADCAST: return board_caps().has_session_views;
     default:                return true;
     }
 }
@@ -3056,6 +3058,18 @@ static void settings_row_click_cb(lv_event_t* e) {
     if (s_gesture_used) return;   // the press was a swipe, not a tap
     SettingsRowUi* r = (SettingsRowUi*)lv_event_get_user_data(e);
     if (!r) return;
+    // The one row that reaches off the device. settings.cpp owns what a row
+    // LOOKS like and what it remembers; it does not own the radio, so the
+    // action itself is performed here and only stamped there — and only when
+    // it actually went, so a row that says "Sent" always means it was.
+    if (r->id == SETTING_BROADCAST) {
+        if (ble_send_event(BLE_EVENT_BROADCAST, nullptr)) {
+            settings_note_action(r->id);
+            if (settings_sound_enabled()) sound_hal_play_short();
+        }
+        settings_row_paint(r);
+        return;
+    }
     settings_activate(r->id);
     settings_row_paint(r);
 }

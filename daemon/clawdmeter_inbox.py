@@ -163,12 +163,18 @@ DEVICE_MAX_ROWS = 6
 # lose a message that landed seconds ago.
 DEFAULT_FRESHNESS_S = 120
 
-# How long a message stays on the panel. A message row costs roughly half the
-# default 180-byte budget, so while it is up it evicts session cards -- the
-# window has to be short or the sessions view is permanently hostage to one
-# message. Three minutes covers a glance cycle on a desk device; a message you
-# have not noticed in three minutes is one you will read on the computer.
-DEFAULT_EXPIRE_S = 180
+# How long a message stays on the panel. Ten minutes, raised from three after
+# using the device: cards were going away before they had been read. The
+# original three minutes was reasoned from the BYTE BUDGET -- a message row
+# costs roughly half of 180 bytes, so while it is up it evicts session cards --
+# but that pressure is gone. The host now filters to what needs a person, so on
+# a normal desk there are no session cards being evicted, and report rounds run
+# at a 500-byte budget anyway.
+#
+# It is also no longer the only way a card leaves. The owner can dismiss one,
+# and an agent going back to work retracts its own; expiry is the floor under
+# those, not the mechanism. So the floor should be long enough to read.
+DEFAULT_EXPIRE_S = 600
 
 # Hard cap on concurrent message rows. One message is the normal case; two is
 # a burst worth showing. Beyond that the panel stops being glanceable and the
@@ -210,12 +216,22 @@ LABEL_MAX = 32
 REPORT_TEXT_MAX = 64
 REPORT_TEXT_MIN = 24
 
-# How long a report stays on the panel. Longer than a message's 180 s because
-# a report is a SNAPSHOT the owner asked for, not something that arrived
-# unbidden -- but bounded, because the host cannot see the agent change its
-# mind: the card goes away by expiry, never by resolution. The age on the card
-# is what keeps it honest in the meantime.
-DEFAULT_REPORT_EXPIRE_S = 300
+# How long a report stays on the panel: ten minutes, raised from five for the
+# same reason as the message window -- on the device, cards were leaving before
+# they had been read.
+#
+# The old comment said the card "goes away by expiry, never by resolution", and
+# that stopped being true: an agent that goes back to work retracts its own
+# card (see _is_resume), and the owner can dismiss one. Expiry is now the FLOOR
+# under a card nothing has resolved, which is exactly the case that wants to be
+# generous -- nobody has acted on it, so nobody has finished with it. The age
+# printed on the card is what keeps it honest in the meantime.
+#
+# Note what this deliberately does NOT slow down: a card whose agent has
+# resumed still leaves within seconds. "Stay long enough to read" and "leave
+# the moment it stops being true" are not in tension, because they are answers
+# to different questions.
+DEFAULT_REPORT_EXPIRE_S = 600
 
 # Two message rows cost ~146 bytes whatever the text cap, so below this budget
 # a pair of them evicts EVERY session card (measured against cs.fit_payload
@@ -1065,6 +1081,19 @@ class InboxWatcher(object):
                 self._messages.append(msg)
         self._expire(now)
         return list(self._messages) + list(self._reports.values())
+
+    def reports_by_key(self):
+        """Live reports keyed the way they are stored: one per panel sender.
+
+        A copy, and public, because the fleet poller has to be able to retract
+        one on evidence this module cannot see -- the listing saying that
+        agent is working again (see answered_elsewhere).
+        """
+        return dict(self._reports)
+
+    def retract_report(self, key):
+        """Drop one agent's card. True if there was one."""
+        return self._reports.pop(key, None) is not None
 
     def reports_live(self):
         """Live reports, newest first. Read-only view for callers and tests."""

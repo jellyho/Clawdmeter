@@ -61,6 +61,7 @@ SS_CHAR_UUID = "4c41555a-4465-7669-6365-000000000005"
 EVENT_REPORT = 1    # "tell me what the fleet is doing"
 EVENT_GO_AHEAD = 2  # {"ev":2,"sid":"g4"} -- the owner tapped a NEEDS-YOU card
 EVENT_DISMISS = 3   # {"ev":3,"sid":"g4"} -- the owner tapped a card away
+EVENT_BROADCAST = 4 # {"ev":4} -- Settings > Teach agents
 
 # The report dispatcher, run as a child process. Its own --timeout bounds the
 # `claude -p` spawn (120 s) and its follow phase watches for replies for another
@@ -72,6 +73,10 @@ REPORT_ROUND_TIMEOUT = 300.0
 # A courier sends one message and exits; it has no replies to wait for, so it
 # gets a fraction of a round's budget.
 GO_AHEAD_TIMEOUT = 120.0
+# A broadcast talks to every reachable agent rather than the five a round is
+# capped at, and each of them has to open a file and answer. Generous, and
+# still bounded.
+BROADCAST_TIMEOUT = 300.0
 
 POLL_INTERVAL = 60
 TICK = 5
@@ -822,6 +827,23 @@ class Session:
         n = record_dismissal(mid)
         log(f"DISMISS: {sid} cleared ({n} held)")
 
+    async def on_broadcast_event(self, _doc: dict) -> None:
+        """Settings > Teach agents: tell the fleet how Clawdmeter works.
+
+        Housekeeping rather than an alert, so unlike a round there is no rate
+        limit and no five-agent cap — it produces no cards, and the agent left
+        out would be exactly the one that goes on meeting Clawdmeter cold. The
+        agents that already know answer NOOP and change nothing.
+        """
+        log("BROADCAST: teaching the fleet the standing rules")
+        task = asyncio.ensure_future(
+            run_report_round(extra_args=["--broadcast-rules"],
+                             timeout=BROADCAST_TIMEOUT, label="BROADCAST",
+                             done="BROADCAST: the fleet has been told",
+                             child="courier", prefix="broadcast"))
+        _side_tasks.add(task)
+        task.add_done_callback(_side_tasks.discard)
+
     def probe_session_support(self) -> None:
         """Decide once per connection whether this device has the SS characteristic.
 
@@ -914,6 +936,7 @@ EVENT_HANDLERS = {
     EVENT_REPORT: Session.on_report_event,
     EVENT_GO_AHEAD: Session.on_go_ahead_event,
     EVENT_DISMISS: Session.on_dismiss_event,
+    EVENT_BROADCAST: Session.on_broadcast_event,
 }
 
 

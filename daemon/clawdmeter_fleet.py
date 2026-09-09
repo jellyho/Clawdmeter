@@ -865,6 +865,14 @@ def run_loop(budget, show_offline=False, watcher=None, tick_s=TICK_S,
             # there is one writer and one reader and no locking to get wrong.
             watcher.set_dismissed(read_dismissed(dismiss_file, now))
             watcher.poll()
+        # A report card the owner answered by hand, on the machine itself, is
+        # no longer true — and only the listing can tell us. Dropped before the
+        # rows are built so it never reaches the panel at all.
+        if watcher is not None and api_rows:
+            cards = watcher.reports_by_key()
+            for key, why in answered_elsewhere(cards, api_rows, now).items():
+                log(f"retracting {key}: {why}")
+                watcher.retract_report(key)
         inbox_rows = inbox_rows_for(watcher, now, budget, stale)
         rows = merge_rows(api_rows, exclude, show_offline, inbox_rows,
                           attention_only, stale)
@@ -936,6 +944,60 @@ def read_dismissed(path=None, now=None):
         if isinstance(ts, (int, float)) and now - ts > DISMISS_TTL_S:
             continue
         out.add(mid)
+    return out
+
+
+# How far after a report an agent's own activity has to land before it counts
+# as "somebody answered this". The agent is still MID-TURN when it sends the
+# report -- the SendMessage is part of that turn -- so the listing legitimately
+# says `running` for a moment afterwards, and a zero margin would retract every
+# card seconds after it appeared.
+ANSWERED_MARGIN_S = 20
+
+
+def answered_elsewhere(reports, api_rows, now=None):
+    """Reports whose agent has gone back to work: {panel sender -> why}.
+
+    The case this exists for is the owner walking over to the machine and
+    ANSWERING THE SESSION THEMSELVES. Nothing tells the panel that happened --
+    no button was pressed, no report was sent -- but the listing shows it,
+    because a session somebody has just typed into is `running` and its
+    `last_event_at` moves.
+
+    Only the WAITING states are eligible: a card that says an agent needs a
+    person is the only kind this can make untrue. A WORKING or DONE card is
+    already saying the agent is busy, and retracting it on the evidence that
+    the agent is busy would be circular.
+    """
+    now = time.time() if now is None else now
+    if not reports or not api_rows:
+        return {}
+    # title -> (worker_status, last activity). Titles are what a report's
+    # sender is: the same name the go-ahead courier addresses.
+    live = {}
+    for row in api_rows:
+        if not isinstance(row, dict):
+            continue
+        title = row.get("title")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        live[title.strip()] = (row.get("worker_status"),
+                               _epoch(row.get("last_event_at")
+                                      or row.get("updated_at")
+                                      or row.get("created_at")))
+    out = {}
+    for key, msg in reports.items():
+        if msg.report_state not in inbox.REPORT_WAITING_STATES:
+            continue
+        entry = live.get(msg.sender) or live.get(key)
+        if entry is None:
+            continue
+        status, last = entry
+        if status != "running":
+            continue
+        if not last or last <= (msg.ts or 0) + ANSWERED_MARGIN_S:
+            continue   # still finishing the turn it reported in
+        out[key] = f"answered on its own machine ({int(now - last)}s ago)"
     return out
 
 

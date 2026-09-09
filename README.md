@@ -236,9 +236,11 @@ The board has three side buttons.
 | ---------------- | ------------ | ------------------------------------------------------------ |
 | **Left**         | GPIO 0       | Hold to send Space (Claude Code voice-mode push-to-talk)     |
 | **Middle** (PWR) | AXP2101 PKEY | On splash: cycle animations. Hold 3s + release: pairing mode |
-| **Right**        | GPIO 18      | Call a report round — the same thing the town hall button does |
+| **Right**        | GPIO 18      | Wakes the panel; no other action                             |
 
-Space goes out as a standard BLE HID keyboard report, so it triggers in whatever window has focus on the paired host — not just Claude Code. The right button used to send Shift+Tab the same way and no longer sends HID at all: a round costs quota on other people's machines, and a button that also typed into whatever happened to have focus was the wrong thing to put that behind. Its first press on a dark panel only wakes the screen.
+Space goes out as a standard BLE HID keyboard report, so it triggers in whatever window has focus on the paired host — not just Claude Code.
+
+The right button used to send Shift+Tab the same way, then briefly called a report round, and now does neither. Both were the wrong thing to put behind a side button: Shift+Tab typed into whatever window happened to have focus, and a round spends quota on other people's machines for a press a sleeve can make. Calling the fleet in is the **town hall button on the Sessions tab** — a deliberate control you have to look at.
 
 ## BLE protocol
 
