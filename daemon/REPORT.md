@@ -185,13 +185,19 @@ that notices is the one behaving well.
 
 So: **a `DECLINED` is not a defect to be fixed.** Do not make the request more
 insistent, do not re-send it to an agent that refused, and do not look for
-another route to the same file. An agent that declined has surfaced it to its
-own user, which is where a change to that user's configuration belongs. If they
-want the section they will add it themselves.
+another route to the same file.
 
-Of the nine, one declined, and the other eight sent no reply at all — neither
-`NOOP` nor `SAVED` — so what they did with it is unknown. The one that pushed
-back is the only one whose behaviour is known to be sound.
+**And it is not a dead end either**, which is the part worth knowing. That same
+agent surfaced the request to its own user, its user said yes, and it then sent
+`CLAWDMETER-RULES/1 SAVED` — the whole exchange took about twenty minutes. The
+refusal was not obstruction; it was routing a change to somebody's persistent
+configuration through the only party entitled to approve it. Left alone, the
+correct path resolves itself.
+
+Of the nine, that one declined and then saved with its user's say-so, and the
+other eight sent no reply at all — neither `NOOP` nor `SAVED` — so what they
+did with it is unknown. The one that pushed back is the only one whose
+behaviour is known to be sound.
 
 The feature is kept anyway, with the owner's decision on the record: the
 messages themselves are self-describing (the request carries its own contract,
