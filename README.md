@@ -17,7 +17,7 @@ Screens are tabs. **Swipe horizontally to move between them** — left for the n
 
 |              Splash               |              Usage              |
 | :-------------------------------: | :-----------------------------: |
-| ![Splash](screenshots/splash.gif) | ![Usage](screenshots/usage.png) |
+| ![Splash](screenshots/colony.png) | ![Usage](screenshots/usage.png) |
 |   One Clawd per live agent — see **The colony** below     | Session and weekly utilization  |
 
 |                Sessions                 |                Settings                 |
@@ -63,8 +63,12 @@ fleet rather than as a screen that stopped updating. Which pose a creature gets
 comes from its *name*, so an agent keeps its character as the grid re-sorts.
 
 Nine fit comfortably and sixteen still read; past that the last slot says
-`+N more`. With no fleet — no host, or a board with no session feed — the
-splash is the single Clawd it has always been.
+`+N more`.
+
+With no fleet — no host, or a board with no session feed — the splash is the
+single Clawd it has always been, playing the full pixel-art animations:
+
+<p align="center"><img src="screenshots/splash.gif" width="240" alt="The single-Clawd splash"></p>
 
 The colony is fed by its own small payload (`{"fl":[[name,state],…]}`, about
 150 bytes for nine agents), **not** by the cards. The two answer different
