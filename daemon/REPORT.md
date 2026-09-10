@@ -455,6 +455,34 @@ every tick and feeds it to the inbox watcher. One writer, one reader, no lock.
 Entries expire after an hour and the file holds at most 64, so neither a lost
 write nor a mistaken tap can become a permanent gag.
 
+### The mail drop's name is minted, not chosen
+
+Every drop is started as `<base>-<8 hex>` (`mint_maildrop_name`), and
+everything else — the supervisor, the dispatcher, `report_maildrop` — asks for
+the **base**, which `find_maildrop` matches as a prefix. An exact name still
+wins, so `--reply-to` and a pinned config name a session on purpose.
+
+**What that prevents, measured rather than imagined.** A drop died one morning
+and a fresh one was started under the same name. Locally that was
+unambiguous — one live session, one roster entry — but the ACCOUNT LISTING
+still carried the dead one as `status: active`, and `claude stop` does not take
+that entry away. Agents resolve the reply address by NAME in their own
+`ListAgents`, so five of them answered into a session that had been dead for
+nine hours. The dispatcher reported `Sent 5 of 5` and then `answered 0`, which
+is as much as it could see.
+
+Refusing on ambiguity cannot fix that: the ambiguity is in somebody else's name
+space and is only discovered when the replies do not arrive. A unique name
+makes the collision impossible instead — a lingering corpse keeps *its* name,
+and nothing resolves to it.
+
+Two smaller guards came out of the same failure. `connection_status:
+disconnected` now excludes a row from the ambiguity count (a disconnected
+bridge is not in the name space an agent resolves in, and `select_targets`
+already dropped those), and the tray keeps a drop alive at all — 30-second
+checks, capped backoff, with the local roster as its heartbeat, which is the
+same question `ensure_maildrop` asks before every round.
+
 ### The town hall button
 
 A round is called from the panel, and only from the panel — the side button
@@ -468,11 +496,16 @@ It exists **only** on the empty view, and that is the design rather than a
 placement: with cards on screen there is nothing to call a meeting about — the
 meeting already happened, and its minutes are what you are reading.
 
-Pressing it enters a CALLING state for 30 seconds, or until replies arrive and
-take the tab off the empty view. That is not a rate limit (the dispatcher has
-one of those, anchored on the attempt); it is the button declining to look
-pressable while it is already working, which is the only honest thing the
-device can say about a round it cannot see. With the link down the button is
+Pressing it enters a CALLING state, then a countdown. Both numbers are
+measured rather than guessed: on a real nine-agent fleet the first replies
+landed 32 s after the press and the dispatcher finished at 2 m 02 s, so
+CALLING runs 150 s or until replies arrive. After that the button stays locked,
+showing `again in 2:41`, until the **dispatcher's own rate limit**
+(`DEFAULT_MIN_INTERVAL_S`, 300 s) lifts — a press inside that window is refused
+by the host, and a button that invites a press it knows will be refused is a
+button that lies. The first cut used one 30-second timer cleared the moment
+cards arrived, so dismissing them left a button that looked pressable for four
+more minutes than it was. With the link down the button is
 hidden outright: a round is dispatched by the host, so with nobody to ask there
 is nothing to offer.
 

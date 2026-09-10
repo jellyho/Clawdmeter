@@ -18,7 +18,7 @@ Screens are tabs. **Swipe horizontally to move between them** — left for the n
 |              Splash               |              Usage              |
 | :-------------------------------: | :-----------------------------: |
 | ![Splash](screenshots/splash.gif) | ![Usage](screenshots/usage.png) |
-|   Pixel-art Clawd, reacting to how hard you're working    | Session and weekly utilization  |
+|   One Clawd per live agent — see **The colony** below     | Session and weekly utilization  |
 
 |                Sessions                 |                Settings                 |
 | :-------------------------------------: | :-------------------------------------: |
@@ -43,6 +43,38 @@ Everything idle or busy is dropped on the host before it costs a byte of the pay
 **When there is nothing waiting, the empty space holds the town hall button.** Press it and the host asks every reachable agent to report in; a few seconds later their answers arrive as cards. It exists only on the empty view, and that is deliberate: with cards on screen the meeting has already happened and its minutes are what you are reading. See [`daemon/REPORT.md`](daemon/REPORT.md) for the reply contract and what a round costs.
 
 This tab needs a session source on the host. Two exist: the **hook sidecar** for sessions on this machine ([`daemon/SESSIONS.md`](daemon/SESSIONS.md)) and the **fleet poller** for remote-control sessions, cross-session mail and agent reports ([`daemon/FLEET.md`](daemon/FLEET.md)). Without either, the tab is still in the swipe ring but has nothing to list; boards too small to host chat cards never have it in their swipe order at all. More cards than fit will scroll: drag the list vertically — the swipe ring only listens to horizontal drags, so the two never fight.
+
+### The colony
+
+**The splash screen is the fleet.** One Clawd per live Claude Code agent, laid
+out on a grid, each doing what its state says:
+
+| The creature | What it means |
+| --- | --- |
+| typing at a laptop | working |
+| waving | stopped, and waiting for you (its name turns terracotta) |
+| pointing | it sent you a message |
+| jumping | finished |
+| **holding still** — on a skateboard, with a basketball, mid-dance | idle |
+
+**Motion is the signal**: if a creature is moving, something is happening.
+Idle ones freeze, each in a different pose, so a quiet fleet reads as a quiet
+fleet rather than as a screen that stopped updating. Which pose a creature gets
+comes from its *name*, so an agent keeps its character as the grid re-sorts.
+
+Nine fit comfortably and sixteen still read; past that the last slot says
+`+N more`. With no fleet — no host, or a board with no session feed — the
+splash is the single Clawd it has always been.
+
+The colony is fed by its own small payload (`{"fl":[[name,state],…]}`, about
+150 bytes for nine agents), **not** by the cards. The two answer different
+questions: cards are what needs a person, the colony is who is there. So
+dismissing a card does not remove a creature — that agent is still working.
+
+**The panel also moves itself.** With no input for 90 seconds it hands the
+screen to the fleet, and a usage percentage that actually changes takes it
+back. Neither happens while you are on the Settings tab, or while the Sessions
+tab still has cards on it.
 
 The **Settings** tab holds the preferences that used to require a reflash: the reset chime and its volume, auto-jump, whether the device boots to the splash, the clock format, and screen brightness. Each one is written to flash the moment you change it, so they survive a power cut. Rows that a board cannot honour are not shown at all, so a port with no speaker has no chime rows.
 
@@ -263,7 +295,7 @@ JSON payload format (written to RX):
 
 Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
 
-Session rows go to **SS** as a positional array — see [`daemon/SESSIONS.md`](daemon/SESSIONS.md) for the field order, which is append-only so an older device and a newer host still understand each other.
+Session rows go to **SS** as a positional array — see [`daemon/SESSIONS.md`](daemon/SESSIONS.md) for the field order, which is append-only so an older device and a newer host still understand each other. The same characteristic also carries the **roster** (`{"fl":[…]}`) that draws the colony, as a separate write: five report cards already fill one write's byte budget, so sharing would mean an arriving round truncating the fleet or the fleet truncating the round.
 
 **TX carries device → host events**, which is how the buttons and the card taps reach the daemon:
 
@@ -271,6 +303,7 @@ Session rows go to **SS** as a positional array — see [`daemon/SESSIONS.md`](d
 {"ev":1}                 run a report round
 {"ev":2,"sid":"g4"}      go ahead, to the agent on that card
 {"ev":3,"sid":"g4"}      dismiss that card
+{"ev":4}                 teach the fleet the standing rules
 ```
 
 `ev` is the discriminator — the ack traffic TX has always carried does not have it, so a subscriber that sees no `ev` knows it is looking at an ack. Every TX notification goes to the **bonded owner only**, on an encrypted link, per connection handle: the channel now carries presses, and NimBLE's plain `notify()` would fan them out to anyone who subscribed.

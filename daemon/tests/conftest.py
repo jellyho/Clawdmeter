@@ -55,3 +55,38 @@ def _isolate_fleet_heartbeat(tmp_path, monkeypatch):
         beat = tmp_path / "fleet.heartbeat"
         monkeypatch.setattr(fleet_mod, "heartbeat_path",
                             lambda base=None: str(base or beat))
+
+
+try:
+    import daemon.clawdmeter_sessions as cs_mod
+except Exception:  # pragma: no cover - defensive, same reason as above
+    cs_mod = None
+
+
+@pytest.fixture(autouse=True)
+def _no_real_log_files(monkeypatch):
+    r"""Keep the suite out of the owner's real logs.
+
+    The Windows daemon builds its rotating file handler AT IMPORT
+    (`_FILE_LOGGER = _build_file_logger()`), so merely importing it in a test
+    attaches a writer to %LOCALAPPDATA%\Clawdmeter\daemon.log — and every
+    log() a test provokes lands there, timestamped, indistinguishable from the
+    real thing.
+
+    That is not a tidiness problem. Diagnosing a live failure during this
+    project meant reading that file, and three times the trail ran into test
+    output: connection attempts to AA:BB:CC:DD:EE:FF, rounds that never
+    happened, "Device not found" from a daemon that was connected. A log you
+    have to second-guess is worse than no log.
+
+    log() still prints, so capsys assertions are untouched; only the file
+    handler goes away.
+    """
+    if win_mod is not None:
+        monkeypatch.setattr(win_mod, "_FILE_LOGGER", None, raising=False)
+    if cs_mod is not None:
+        # enable_file_log() is NOT stubbed: it is called only from main(), it
+        # honours LOCALAPPDATA, and one test legitimately exercises it against
+        # a tmp path. Nulling the handler is enough -- that is where the
+        # pollution came from.
+        monkeypatch.setattr(cs_mod, "_FILE_LOGGER", None, raising=False)

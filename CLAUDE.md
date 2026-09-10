@@ -106,6 +106,13 @@ firmware/src/
   settings.{h,cpp}          — NVS-backed user settings behind the settings tab. One generic row
                               table (SPECS[]) the screen loops over, so adding a setting is one line.
   splash.{h,cpp}            — 20×20 pixel-art engine. CELL = min(W,H)/20, centered.
+                              ALSO THE COLONY: one Clawd per live agent, fed by ui.cpp from
+                              the roster (not the cards). Working types at a laptop, waiting
+                              waves, idle HOLDS STILL in a leisure pose — motion means
+                              something is happening. Pose is keyed on the agent's NAME
+                              (slot-keyed gave one pose per column). Each actor draws into
+                              its own rect with its own palette, so compose_stage()'s single
+                              60×60 / single-palette model is not in the way.
   ble.{h,cpp}               — NimBLE peripheral: custom data service + HID keyboard
   data.h                    — UsageData struct
   icons.h                   — icon arrays. Battery (5×) are RGB565A8 with alpha; rest are raw RGB565.
@@ -259,6 +266,31 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 
 ## Recent session highlights
 
+- **The splash became the fleet, and the mail drop got a name nothing can
+  steal (2026-09-10).** One Clawd per live agent instead of one big one; the
+  official art at half scale (a core Clawd is 24×18 art cells, so nine fit at
+  4 px/cell, sixteen at three, and the grid widens 3→4 columns rather than
+  shrinking creatures). Three passes on what they do, each fixing the last:
+  frozen at frame 0 → nine identical statues, because **frame 0 of every
+  animation IS the shared idle pose** (that is what makes switching seamless);
+  all animated → sameness fixed, signal destroyed; what ships → **motion means
+  something is happening**, so workers type and idlers freeze at a frame from
+  inside their own loop, chosen by NAME. Two overdraw bugs behind "the names
+  vanish and a big Clawd looms": the full-surface wipe took the LVGL labels
+  with it (nothing told LVGL to repaint them), and
+  `splash_pick_for_current_rate()` / `splash_next()` — called on a usage
+  rate-group change and from PWR — drew a full-stage creature over the colony.
+  Both now no-op while a fleet is up.
+  Also: **every mail drop is minted as `<base>-<8 hex>`.** A drop that died in
+  the morning still carried `status: active` in the ACCOUNT listing, agents
+  resolved the shared name to the corpse, and five replies landed in a session
+  nobody was reading ("sent 5 of 5", then "answered 0"). Refusing on ambiguity
+  cannot catch that — the ambiguity is in somebody else's name space. The tray
+  supervisor was generalised (only its noun was hardcoded) and keeps the drop
+  up; `daemon/tests/conftest.py` now nulls the daemon's import-time file
+  logger, because test output in the real `daemon.log` had already sent three
+  live diagnoses down blind alleys.
+
 - **The sessions tab became something you act on (2026-09-09).** A tap
   **selects** a card and raises an action bar: `GO AHEAD` on a
   `SESSION_REPORT_NEEDS_YOU` report, `DISMISS` on anything else, and `WAIT`
@@ -381,4 +413,10 @@ its sort bucket and the auto-jump. Report rounds want
   sidecar's handoff file carries an `index` (`sid` → state / raw sender /
   message id) — without it a tap cannot be turned back into an agent to
   message.
+- `...0005` SS — session rows AND, as a separate write, the **roster**
+  (`{"fl":[[name,state],…]}`) that draws the splash colony. Two payload kinds
+  on one characteristic: five report cards already fill one write's budget, so
+  sharing would mean a round truncating the fleet or the fleet truncating the
+  round. The roster deliberately ignores `fleet_attention_only` — cards are
+  what needs a person, the colony is who is there.
 - `...0004` REQ — firmware fires `0x01` notify in `onSubscribe` if `has_received_data` is false. Daemon subscribes via `setsid bash -c "stdbuf -oL dbus-monitor … | awk …"`; awk drops a flag file the inner loop picks up. See the `feedback_dbus_monitor_pipe` memory for the three subtle gotchas (pipe buffering, busctl-exits race, `wait` blocking on pipeline jobs).

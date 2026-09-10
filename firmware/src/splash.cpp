@@ -845,7 +845,15 @@ static uint32_t fleet_seed(const char* label) {
 }
 
 static const char* fleet_anim_name(uint8_t state, uint32_t seed) {
-    static const char* WORK[] = { "walking", "laptop", "crab walking" };
+    // Working is ALWAYS the laptop, and the uniformity is the point: it is
+    // the one pose that unmistakably means "doing computer work". The three-
+    // way mix it replaced read worse, not better -- a walking Clawd says
+    // "going somewhere" at least as loudly as it says "busy", and mixing it
+    // with a typing one meant motion had two meanings.
+    //
+    // These still do not look like clones: they animate, and each starts at a
+    // different frame of the loop (see the seed below), so a row of workers is
+    // a row of people typing rather than one sprite stamped six times.
     // Idle is not "doing nothing", it is "doing nothing FOR YOU" -- so the
     // creature is off playing. These read as leisure at a glance and, more
     // to the point, they look nothing like the walking one next to them.
@@ -873,7 +881,7 @@ static const char* fleet_anim_name(uint8_t state, uint32_t seed) {
     case SPLASH_FLEET_IDLE:    return IDLE[seed % 3];
     case SPLASH_FLEET_DONE:    return "jumping happy";
     case SPLASH_FLEET_MESSAGE: return "pointing";     // telling you something
-    default:                   return WORK[seed % 3];
+    default:                   return "laptop";
     }
 }
 
