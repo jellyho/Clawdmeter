@@ -120,8 +120,14 @@ def header_text(ts: TrayState) -> str:
 FLEET_CHECK_S = 30
 
 
-class FleetSupervisor:
-    r"""Notice that the remote-fleet poller is gone, say so, and start it again.
+class Supervisor:
+    r"""Notice that a background piece is gone, say so, and start it again.
+
+    Written for the remote-fleet poller and now also carrying the report mail
+    drop, which is why every seam -- armed, alive, launch, and the NOUN in the
+    messages -- is injected. Two things that die the same way and are noticed
+    the same way should not be two mechanisms; the second one would be the one
+    nobody maintains.
 
     The tray already supervises its own daemon loop (see _run_daemon: catch,
     log, flip to an actionable error, restart with capped backoff). This is the
@@ -154,10 +160,12 @@ class FleetSupervisor:
     MAX_BACKOFF_S = 300     # a poller that will not start must not be a spinner
 
     def __init__(self, is_enabled=None, is_alive=None, launch=None,
-                 log_fn=None, notify=None, now_fn=time.time):
+                 log_fn=None, notify=None, now_fn=time.time,
+                 label="Fleet poller"):
         self._is_enabled = is_enabled or _fleet_autostart_enabled
         self._is_alive = is_alive or _fleet_is_alive
         self._launch = launch or launch_fleet_poller
+        self._label = label
         self._log = log_fn or (lambda msg: None)
         self._notify = notify
         self._now = now_fn
@@ -183,17 +191,17 @@ class FleetSupervisor:
                 return False
             if self._is_alive(now):
                 if self.down:
-                    self._log("Fleet poller is alive again")
+                    self._log(f"{self._label} is alive again")
                 self._reset()
                 return False
             if not self.down:
                 # One notice per outage, on the falling edge — the same rule
                 # the error toast follows (D-04: transitions, not ticks).
                 self.down = True
-                self._log("Fleet poller heartbeat is stale — it is not running")
+                self._log(f"{self._label} is not running")
                 if self._notify is not None:
                     try:
-                        self._notify("Fleet poller stopped — restarting it",
+                        self._notify(f"{self._label} stopped — restarting it",
                                      "Clawdmeter")
                     except Exception:
                         pass
@@ -201,11 +209,11 @@ class FleetSupervisor:
                 return False
             self.next_try = now + self.backoff
             self.backoff = min(self.backoff * 2, self.MAX_BACKOFF_S)
-            self._log("Starting the fleet poller")
+            self._log(f"Starting the {self._label.lower()}")
             self._launch()
             return True
         except Exception as e:          # last-resort guard, as above
-            self._log(f"Fleet supervisor error: {e!r}")
+            self._log(f"{self._label} supervisor error: {e!r}")
             return False
 
 
@@ -219,6 +227,46 @@ def _fleet_is_alive(now=None) -> bool:
     """Default liveness test: did a poller stamp its heartbeat recently?"""
     import daemon.clawdmeter_fleet as fleet
     return fleet.is_alive(now=now)
+
+
+def _maildrop_autostart_enabled() -> bool:
+    """Armed only when the owner asked for a mail drop to be kept up.
+
+    Same rule as the poller's: a supervisor must not turn on a feature that is
+    off today. `report_maildrop_autostart = on` is the switch, and it is what
+    --create-maildrop already consults.
+    """
+    import daemon.clawdmeter_report as report
+    return report.maildrop_autostart_from_config()
+
+
+def _maildrop_is_alive(now=None) -> bool:
+    """Is a session with the mail drop's name running on this machine?
+
+    Not a heartbeat: the mail drop is a Claude Code session, not a process this
+    project writes, so the roster it registers itself in IS the heartbeat. This
+    is the same question ensure_maildrop() asks before every round, which is
+    what makes a green answer here mean a round will actually dispatch.
+    """
+    del now
+    import daemon.clawdmeter_report as report
+    name = report.maildrop_from_config()
+    return report.find_maildrop(name, report.live_local_sessions()) is not None
+
+
+def launch_maildrop() -> None:
+    """Start the mail drop, the same way --create-maildrop does.
+
+    Blocking, and that is fine: it runs on the supervisor thread, which has
+    nothing else to do for the next 30 seconds. It is also why the launch is
+    behind the backoff -- a mail drop that cannot start must not be attempted
+    every half minute forever.
+    """
+    import daemon.clawdmeter_report as report
+    name = report.maildrop_from_config()
+    rec, action, why = report.ensure_maildrop(name, create=True)
+    if rec is None:
+        raise RuntimeError(why or "could not start the mail drop")
 
 
 def launch_fleet_poller() -> None:
@@ -365,11 +413,21 @@ def main() -> None:
     # --- background thread: the fleet poller, watched across a process
     # boundary. Idle and harmless until the owner enables the poller's
     # autostart entry (nothing here turns that on).
-    fleet_sup = FleetSupervisor(log_fn=daemon_log, notify=icon.notify)
+    fleet_sup = Supervisor(log_fn=daemon_log, notify=icon.notify)
+    # The mail drop dies the same way and was noticed the same way: not at
+    # all, until a press produced 'no live local session named
+    # clawdmeter-inbox' and the round refused. Same supervisor, different
+    # seams.
+    drop_sup = Supervisor(log_fn=daemon_log, notify=icon.notify,
+                          label="Mail drop",
+                          is_enabled=_maildrop_autostart_enabled,
+                          is_alive=_maildrop_is_alive,
+                          launch=launch_maildrop)
 
     def _run_fleet_supervisor() -> None:
         while not _quit_requested.wait(timeout=FLEET_CHECK_S):
             fleet_sup.step()
+            drop_sup.step()
 
     threading.Thread(target=_run_fleet_supervisor, daemon=True).start()
 

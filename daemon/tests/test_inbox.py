@@ -936,7 +936,7 @@ def _loop(monkeypatch, tmp_path, w, api=(), iterations=3):
     writes = []
     real = cs.write_sessions_file
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload, index=None: (writes.append(payload), real(p, payload))[0])
+                        lambda p, payload, index=None, roster=None: (writes.append(payload), real(p, payload))[0])
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=w, tick_s=2,
                    poll_interval_s=30, sessions_file=str(out),
                    iterations=iterations, sleep_fn=clock.sleep, now_fn=clock.now)
@@ -956,7 +956,7 @@ def test_a_message_does_not_wait_for_the_next_listing_poll(projects, tmp_path,
     monkeypatch.setattr(fleet, "local_bridge_ids", lambda *a, **k: set())
     writes = []
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload, index=None: writes.append((clock.t, payload)))
+                        lambda p, payload, index=None, roster=None: writes.append((clock.t, payload)))
 
     # tick 0: nothing. Then a message lands, and the very next tick ships it.
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=w, tick_s=2, poll_interval_s=30,
@@ -999,7 +999,7 @@ def test_nothing_is_published_when_there_is_nothing_to_say(projects, tmp_path,
     monkeypatch.setattr(fleet, "local_bridge_ids", lambda *a, **k: set())
     writes = []
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload, index=None: writes.append(payload))
+                        lambda p, payload, index=None, roster=None: writes.append(payload))
     clock = _Clock()
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=watcher(projects, now_fn=clock.now),
                    tick_s=2, poll_interval_s=30, sessions_file=str(tmp_path / "s.json"),
@@ -1015,7 +1015,7 @@ def test_messages_publish_even_without_a_token(projects, tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, "local_bridge_ids", lambda *a, **k: set())
     writes = []
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload, index=None: writes.append(payload))
+                        lambda p, payload, index=None, roster=None: writes.append(payload))
     clock = _Clock()
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=watcher(projects, now_fn=clock.now),
                    tick_s=2, poll_interval_s=30, sessions_file=str(tmp_path / "s.json"),
@@ -1044,7 +1044,7 @@ def test_an_expired_message_is_retracted_even_with_no_listing(projects, tmp_path
     out = tmp_path / "s.json"
     real = cs.write_sessions_file
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload, index=None: (writes.append(payload), real(p, payload))[0])
+                        lambda p, payload, index=None, roster=None: (writes.append(payload), real(p, payload))[0])
     clock = _Clock()
     w = watcher(projects, now_fn=clock.now, expire_s=180)
     # 150 ticks x 2 s = 300 simulated seconds, well past expire_s.
@@ -1072,7 +1072,7 @@ def test_a_listing_failure_keeps_the_last_good_sessions(projects, tmp_path,
     monkeypatch.setattr(fleet, "local_bridge_ids", lambda *a, **k: set())
     writes = []
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload, index=None: writes.append(payload))
+                        lambda p, payload, index=None, roster=None: writes.append(payload))
     clock = _Clock()
     fleet.run_loop(cs.DEFAULT_BUDGET_BYTES, watcher=None, tick_s=2,
                    poll_interval_s=30, sessions_file=str(tmp_path / "s.json"),
@@ -1677,3 +1677,25 @@ def test_an_agent_can_report_the_same_state_twice(projects):
     assert len(rows) == 1
     assert rows[0][2] == ib.STATE_REPORT_WORKING
     assert rows[0][4] == 5                     # dated from the NEW record
+
+
+def test_the_watcher_reads_the_budget_from_the_config(tmp_path):
+    """It is named for the config, so it has to read the config. The budget was
+    a bare default, and a caller that did not pass one got 180 bytes however
+    loudly sessions_budget_bytes asked for more -- which silently squeezed the
+    report rows this watcher exists to read."""
+    cfg = tmp_path / "config"
+    cfg.write_text("sessions_budget_bytes = 500\n", encoding="utf-8")
+    w = ib.watcher_from_config(config_path=str(cfg), roots=[])
+    assert w.budget == 500
+
+    # An explicit budget still wins: the poller computes one and passes it.
+    w2 = ib.watcher_from_config(budget=180, config_path=str(cfg), roots=[])
+    assert w2.budget == 180
+
+
+def test_the_watcher_falls_back_when_the_config_says_nothing(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.write_text("# nothing here\n", encoding="utf-8")
+    w = ib.watcher_from_config(config_path=str(cfg), roots=[])
+    assert w.budget == cs.DEFAULT_BUDGET_BYTES

@@ -210,6 +210,37 @@ struct SessionRow {
                                      // than the inbox.
 };
 
+// ---- The roster (wire key "fl") ----
+// The colony on the splash screen shows WHO IS ALIVE, which is a different
+// question from the one the cards answer. Cards are filtered to what needs a
+// person -- deliberately, so the tab stays worth reading -- and an agent that
+// is quietly working never reaches the device as a row at all. Drawing the
+// colony from the cards therefore drew the wrong fleet: creatures appeared
+// only when something was wrong and vanished when a card was dismissed,
+// though the agent was still there.
+//
+// So the roster travels separately, and it is deliberately CHEAP: a name and a
+// state, nothing else. It is also written as its OWN payload rather than
+// riding beside the rows, because five report cards already fill the byte
+// budget -- sharing one write would mean an arriving round silently truncating
+// the roster, or the roster truncating the round. Two writes, each small, each
+// sent only when it changes.
+#define ROSTER_MAX        16   // more than this owner will ever run; past it
+                               // the last slot says how many did not fit
+#define ROSTER_LABEL_MAX  16   // host-elided; the colony draws it under a
+                               // creature, so it has to be short anyway
+
+struct RosterMember {
+    char    label[ROSTER_LABEL_MAX];
+    uint8_t state;             // session_state_t, same codes as a row
+};
+
+struct Roster {
+    uint8_t      count;
+    uint8_t      dropped;      // live sessions past ROSTER_MAX, 0 when none
+    RosterMember rows[ROSTER_MAX];
+};
+
 struct SessionList {
     uint8_t    count;                // rows in use — host pre-sorted, render in order
     SessionRow rows[SESSION_MAX_ROWS];

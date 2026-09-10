@@ -342,7 +342,7 @@ def test_main_runs_in_background_thread_without_signal_error():
 # does not own, watching a heartbeat because the poller may equally have been
 # started by its Run value, by the installer, or by hand.
 
-from daemon.tray_windows import FleetSupervisor
+from daemon.tray_windows import Supervisor as FleetSupervisor
 
 
 def _sup(enabled=True, alive=False, **kw):
@@ -465,3 +465,55 @@ def test_the_supervisor_defaults_to_the_real_seams():
     assert sup._launch is launch_fleet_poller
     assert callable(autostart.is_fleet_enabled)
     assert callable(fleet.is_alive)
+
+
+# ---------------------------------------------------------------------------
+# The same supervisor, carrying the mail drop
+# ---------------------------------------------------------------------------
+
+def test_the_supervisor_names_what_it_is_watching():
+    """It carries two things now, and a message saying "Fleet poller" while it
+    restarts the mail drop would send somebody to the wrong log."""
+    said = []
+    sup = FleetSupervisor(is_enabled=lambda: True,
+                          is_alive=lambda now=None: False,
+                          launch=lambda: None,
+                          log_fn=said.append, label="Mail drop",
+                          now_fn=lambda: 1000.0)
+    sup.step()
+    assert any("Mail drop is not running" in m for m in said)
+    assert any("Starting the mail drop" in m for m in said)
+    assert not any("Fleet" in m for m in said)
+
+
+def test_a_mail_drop_that_will_not_start_backs_off_instead_of_spinning():
+    """ensure_maildrop spawns a real session; retrying that every 30 s forever
+    because something upstream is broken is how a supervisor becomes the
+    problem."""
+    now = [1000.0]
+    tries = []
+    sup = FleetSupervisor(is_enabled=lambda: True,
+                          is_alive=lambda now=None: False,
+                          launch=lambda: tries.append(now[0]),
+                          label="Mail drop", now_fn=lambda: now[0])
+    for _ in range(40):
+        sup.step()
+        now[0] += 30.0
+    gaps = [b - a for a, b in zip(tries, tries[1:])]
+    assert gaps and max(gaps) <= FleetSupervisor.MAX_BACKOFF_S
+    assert len(tries) < 40          # not once per check
+
+
+def test_a_launch_that_raises_does_not_stop_the_supervisor():
+    """launch_maildrop raises when the drop cannot be created, and that must
+    not take the watcher down with it -- a supervisor that stops supervising is
+    the failure it exists to prevent."""
+    def boom():
+        raise RuntimeError("no login")
+    said = []
+    sup = FleetSupervisor(is_enabled=lambda: True,
+                          is_alive=lambda now=None: False,
+                          launch=boom, log_fn=said.append,
+                          label="Mail drop", now_fn=lambda: 1000.0)
+    assert sup.step() is False
+    assert any("supervisor error" in m for m in said)

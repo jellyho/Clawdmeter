@@ -1368,7 +1368,19 @@ def enabled(config_path=None):
     return _config_flag("inbox", True, config_path)
 
 
-def watcher_from_config(budget=cs.DEFAULT_BUDGET_BYTES, config_path=None, roots=None):
+def watcher_from_config(budget=None, config_path=None, roots=None):
+    """A watcher built from the config file. `budget` overrides the config.
+
+    The budget used to be a plain default, so a caller that did not pass one
+    got 180 bytes no matter what `sessions_budget_bytes` said -- which is how
+    a config asking for 500 still squeezed the report rows this function is
+    mostly used to read. The poller never hit it (it reads the key itself and
+    passes the value); the report CLI did. A function named for the config now
+    reads the config.
+    """
+    if budget is None:
+        budget = _config_int("sessions_budget_bytes", cs.DEFAULT_BUDGET_BYTES,
+                             config_path)
     wanted = _config_int("inbox_max_rows", DEFAULT_MAX_ROWS, config_path)
     rows = max_rows_for_budget(budget, wanted)
     if rows < wanted:

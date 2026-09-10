@@ -60,7 +60,11 @@ static void add_state(const char* line) {
     s->hold_ms = 3000;
     // Fallback classification if the line doesn't parse — main.cpp will
     // reject it either way, but it still routes to a plausible channel.
-    s->session = strstr(s->json, "\"ss\"") != NULL;
+    // "fl" is the roster -- the colony's feed -- and rides the SAME
+    // characteristic as the session rows, two payload kinds on one channel,
+    // exactly as on hardware. A scenario line carrying either belongs there.
+    s->session = strstr(s->json, "\"ss\"") != NULL ||
+                 strstr(s->json, "\"fl\"") != NULL;
     snprintf(s->name, sizeof(s->name), "state %d", n_states + 1);
     // "name" and "hold_ms" ride along in the payload; main's parse_json /
     // parse_sessions ignore unknown keys so the line is delivered as-is.
@@ -69,7 +73,7 @@ static void add_state(const char* line) {
         s->hold_ms = doc["hold_ms"] | 3000;
         const char* nm = doc["name"] | (const char*)NULL;
         if (nm) snprintf(s->name, sizeof(s->name), "%s", nm);
-        s->session = !doc["ss"].isNull();
+        s->session = !doc["ss"].isNull() || !doc["fl"].isNull();
     }
     n_states++;
 }

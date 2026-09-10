@@ -43,6 +43,10 @@ void idle_set_awake_brightness(uint8_t level) {
     if (state == STATE_AWAKE) apply_brightness(level);
 }
 
+uint32_t idle_ms_since_activity(void) {
+    return millis() - last_activity_ms;
+}
+
 void idle_note_activity(void) {
     last_activity_ms = millis();
     if (state == STATE_FADING_IN) return;

@@ -26,6 +26,11 @@ void ui_update(const UsageData* data);
 // edge only, and only when the user's auto-jump setting is on).
 // No-op on boards without BOARD_HAS_SESSION_VIEWS.
 void ui_update_sessions(const SessionList* list);
+
+// The live fleet, for the colony on the splash (see data.h, "The roster").
+// Independent of the card list: an agent that needs nothing still has a
+// creature, and dismissing a card does not remove one.
+void ui_update_roster(const Roster* roster);
 void ui_tick_anim(void);
 void ui_show_screen(screen_t screen);
 // Step through the tab ring: +1 = next (swipe left), -1 = previous.

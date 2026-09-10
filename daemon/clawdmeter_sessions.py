@@ -1179,7 +1179,7 @@ def _replace_with_retry(tmp, path, attempts=5, delay=0.02):
             time.sleep(delay)
 
 
-def write_sessions_file(path, payload, index=None):
+def write_sessions_file(path, payload, index=None, roster=None):
     """Atomic write (temp + rename). `payload` is the exact wire string; the
     daemon ships it verbatim, so it is stored as a string, not re-encoded.
 
@@ -1193,6 +1193,11 @@ def write_sessions_file(path, payload, index=None):
     doc = {"ts": round(time.time(), 3), "payload": payload}
     if index:
         doc["index"] = index
+    # The colony's feed. A SECOND payload, not a key inside the first: the BLE
+    # daemon writes each one on its own, so a busy round and a full fleet
+    # cannot squeeze each other out of a single write's budget.
+    if roster:
+        doc["roster"] = roster
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)

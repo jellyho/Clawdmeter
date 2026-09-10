@@ -9,6 +9,7 @@
 #include "settings.h"
 #include "hal/board_caps.h"
 #include "hal/sound_hal.h"
+#include "idle.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
@@ -411,6 +412,35 @@ static void global_click_cb(lv_event_t* e);
 // The one place that shows/hides containers. `manual` distinguishes a user
 // navigation (swipe / tap / button) from a firmware-initiated one (auto-jump).
 static void show_screen(screen_t screen, bool manual);
+
+// ---- Attract: what the panel does when nobody is using it ----
+// Two rules, and they are the same rule from opposite ends: the screen should
+// be showing whatever is most worth looking at from across the room.
+//
+//   nobody has touched it for a while      -> the fleet (the splash)
+//   the usage numbers moved                -> the usage screen
+//
+// The fleet is the resting state because it is the one screen that is worth
+// looking at when you are not doing anything -- creatures moving around is
+// information AND it is the product's face. The usage screen wins temporarily
+// because a number that just changed is news; when the news goes stale (no
+// input, no further change) the fleet takes it back.
+#define ATTRACT_IDLE_MS   90000u   // "a while" before the fleet takes over
+
+// The usage jump counts as a reason to be off the fleet, exactly like a touch
+// does -- otherwise a payload that arrives 89 seconds into the idle window
+// would put the usage screen up and have it yanked away one second later.
+static uint32_t s_attract_ms = 0;
+static int      s_last_s_pct = -1;   // integer percents, so the jump fires on
+static int      s_last_w_pct = -1;   // a CHANGE and not on every payload
+
+static void note_attract_activity(void) { s_attract_ms = lv_tick_get(); }
+
+// "Is the sessions tab showing anything?" -- asked by code that compiles on
+// every board, including the ones where the tab does not exist. s_live_count
+// is inside BOARD_HAS_SESSION_VIEWS; this is the seam that keeps the callers
+// from having to be.
+static bool sessions_have_cards(void);
 
 // ---- Overscroll: a short rubber band, not a long one ----
 // LVGL's elastic overscroll has no depth limit. It divides a drag past either
@@ -923,13 +953,26 @@ static lv_obj_t* th_ring = nullptr;   // bezel; pulses while a round is out
 static lv_obj_t* th_btn  = nullptr;   // the face
 static lv_obj_t* th_lbl  = nullptr;   // the word on it
 static lv_obj_t* th_cap  = nullptr;   // the line under it
-static uint32_t  s_th_called_ms = 0;  // 0 = idle, else the tick of the press
+// TWO timers, because "is a round out?" and "may I start one?" are different
+// questions with different answers, and one timer answering both got them both
+// wrong. The first cut cleared its single timer the moment replies arrived --
+// so the owner could dismiss the cards a minute later and find a button that
+// looked pressable while the host would refuse it for another four minutes.
+static uint32_t  s_th_pressed_ms = 0;  // last press; survives the replies
+static bool      s_th_calling    = false;
 
-// A round takes ~20 s end to end and costs real quota. This is not a rate
-// limit -- the host has one of those, anchored on the attempt -- it is the
-// button declining to look pressable while it is already working, which is the
-// only honest thing the device can say about a round it cannot see.
-#define TOWN_HALL_COOLDOWN_MS 30000
+// How long a round plausibly takes, measured rather than guessed: on a real
+// nine-agent fleet the first replies landed 32 s after the press and the
+// dispatcher reported finished at 2 m 02 s. Thirty seconds -- the first
+// value here -- put the button back before a single answer had arrived.
+#define TOWN_HALL_CALLING_MS 150000u
+
+// How long until another round could actually run. This one is not a guess
+// either: it is the dispatcher's own rate limit (DEFAULT_MIN_INTERVAL_S = 300
+// in clawdmeter_report.py), and a press inside it is refused by the host. A
+// button that invites a press it knows will be refused is a button that lies,
+// so it stays locked for exactly as long as the refusal would last.
+#define TOWN_HALL_LOCK_MS 300000u
 
 static void town_hall_tap_cb(lv_event_t* e);
 
@@ -2048,6 +2091,42 @@ static void chats_set_content(const SessionList* list) {
     chat_fade_update();
 }
 
+// ---- Feeding the colony ----
+// The splash draws one creature per LIVE AGENT (splash.h, "The colony"), and
+// the roster is where that list comes from -- not the card list. The two
+// answer different questions: cards are what needs a person, the colony is who
+// is there. Driving the colony from the cards made creatures appear only when
+// something was wrong and vanish when a card was dismissed, though the agent
+// was still working away.
+//
+// This is also the seam where the WIRE's vocabulary stops: session_state_t is
+// mapped to the splash's own small enum here, so the art module never learns a
+// wire code and a new one cannot break it. A state this does not know lands on
+// WORKING, the reading that asks nothing of the owner -- an unknown code must
+// never invent an alarm.
+static uint8_t splash_state_for(uint8_t state) {
+    switch (session_bucket(state)) {
+    case SESSION_BUCKET_WAITING: return SPLASH_FLEET_WAITING;
+    case SESSION_BUCKET_MESSAGE: return SPLASH_FLEET_MESSAGE;
+    case SESSION_BUCKET_IDLE:    return SPLASH_FLEET_IDLE;
+    default: break;
+    }
+    return state == SESSION_REPORT_DONE ? SPLASH_FLEET_DONE : SPLASH_FLEET_WORKING;
+}
+
+void ui_update_roster(const Roster* roster) {
+    if (!roster) return;
+    SplashFleetMember members[SPLASH_FLEET_MAX];
+    uint8_t n = 0;
+    for (int i = 0; i < roster->count && n < SPLASH_FLEET_MAX; i++) {
+        snprintf(members[n].label, sizeof(members[n].label), "%s",
+                 roster->rows[i].label);
+        members[n].state = splash_state_for(roster->rows[i].state);
+        n++;
+    }
+    splash_set_fleet(members, n, roster->dropped);
+}
+
 // Draw whatever s_shown currently holds. Two callers: a payload from the host
 // (after filtering) and a tap that just removed a card. Splitting it out is
 // what lets the tap re-render IMMEDIATELY -- deferring to the next payload
@@ -2227,14 +2306,32 @@ static void act_clear_cb(lv_event_t* e) {
 // in one word, and nothing else moves -- the ring keeps its geometry so the
 // change reads as the same control in a different state rather than as a new
 // screen arriving.
-static void town_hall_set_calling(bool calling) {
+// Three faces: calling, locked, ready. The middle one is the addition -- it is
+// what the button looks like between "the answers arrived" and "you could ask
+// again", a window the first version simply did not represent.
+enum th_face_t { TH_READY = 0, TH_CALLING, TH_LOCKED };
+
+static void town_hall_set_face(th_face_t face, uint32_t left_ms) {
     if (!th_btn) return;
-    if (calling) {
+    if (face == TH_CALLING) {
         lv_obj_set_style_bg_color(th_btn, COL_PANEL, 0);
         lv_obj_set_style_bg_color(th_btn, COL_PANEL, LV_STATE_PRESSED);
         lv_obj_set_style_text_color(th_lbl, COL_ACCENT, 0);
         lv_label_set_text(th_lbl, "CALLING");
-        set_label_if_changed(th_cap, "waiting for the fleet");
+        set_label_if_changed(th_cap, "replies take a minute or two");
+    } else if (face == TH_LOCKED) {
+        // Quiet, and it says WHEN rather than just "no". A countdown is the
+        // one thing that turns a dead control into a wait.
+        lv_obj_set_style_bg_color(th_btn, COL_PANEL, 0);
+        lv_obj_set_style_bg_color(th_btn, COL_PANEL, LV_STATE_PRESSED);
+        lv_obj_set_style_text_color(th_lbl, COL_DIM, 0);
+        lv_label_set_text(th_lbl, "TOWN\nHALL");
+        lv_obj_set_style_border_opa(th_ring, LV_OPA_20, 0);
+        char buf[24];
+        const uint32_t left_s = (left_ms + 999) / 1000;
+        snprintf(buf, sizeof(buf), "again in %u:%02u",
+                 (unsigned)(left_s / 60), (unsigned)(left_s % 60));
+        set_label_if_changed(th_cap, buf);
     } else {
         lv_obj_set_style_bg_color(th_btn, COL_ACCENT, 0);
         lv_obj_set_style_bg_color(th_btn, lv_color_hex(0xa85639), LV_STATE_PRESSED);
@@ -2248,7 +2345,11 @@ static void town_hall_set_calling(bool calling) {
 static void town_hall_tap_cb(lv_event_t* e) {
     (void)e;
     if (s_gesture_used) return;              // the release that ended a swipe
-    if (s_th_called_ms != 0) return;         // a round is already out
+    // Locked: a round is out, or one ran recently enough that the host would
+    // refuse this one. Either way the press cannot do what it looks like it
+    // does, so it does nothing at all.
+    if (s_th_pressed_ms != 0 &&
+        lv_tick_get() - s_th_pressed_ms < TOWN_HALL_LOCK_MS) return;
     // The event is the whole feature and it can simply fail to go: no daemon,
     // an older daemon that never subscribed to TX, a link that dropped since
     // the last payload. Saying so is the difference between a button that did
@@ -2257,9 +2358,10 @@ static void town_hall_tap_cb(lv_event_t* e) {
         session_toast("No host - not sent", COL_AMBER);
         return;
     }
-    s_th_called_ms = lv_tick_get();
-    if (s_th_called_ms == 0) s_th_called_ms = 1;   // 0 is the idle sentinel
-    town_hall_set_calling(true);
+    s_th_pressed_ms = lv_tick_get();
+    if (s_th_pressed_ms == 0) s_th_pressed_ms = 1;   // 0 is the never sentinel
+    s_th_calling = true;
+    town_hall_set_face(TH_CALLING, 0);
     session_toast("Calling the fleet", COL_ACCENT);
     // A round shows nothing for ~20 s. The note is the only immediate proof
     // the press was taken at all.
@@ -2273,11 +2375,21 @@ static void town_hall_tap_cb(lv_event_t* e) {
 // round that produced nothing leaves a button you can press again rather than
 // a "CALLING" that never resolves.
 static void town_hall_tick(void) {
-    if (s_th_called_ms == 0) return;
-    if (session_view != 0 ||
-        lv_tick_get() - s_th_called_ms > TOWN_HALL_COOLDOWN_MS) {
-        s_th_called_ms = 0;
-        town_hall_set_calling(false);
+    if (s_th_pressed_ms == 0) return;
+    const uint32_t since = lv_tick_get() - s_th_pressed_ms;
+
+    // The round is no longer OUT once its answers are on screen (the tab left
+    // the empty view) or once it has had longer than a round takes.
+    if (s_th_calling && (session_view != 0 || since > TOWN_HALL_CALLING_MS))
+        s_th_calling = false;
+
+    if (since >= TOWN_HALL_LOCK_MS) {       // the host would allow another
+        s_th_pressed_ms = 0;
+        town_hall_set_face(TH_READY, 0);
+        return;
+    }
+    if (!s_th_calling) {
+        town_hall_set_face(TH_LOCKED, TOWN_HALL_LOCK_MS - since);
         return;
     }
     // The bezel breathes while the round is out. It borrows the tab's existing
@@ -2830,8 +2942,14 @@ static void sessions_tick(void) {
 // pulsing, and emptying the notify set re-arms the edge so a session
 // that is STILL waiting when the host comes back notifies again instead of
 // being swallowed as "no rising edge".
+static bool sessions_have_cards(void) { return s_live_count > 0; }
+
 static void sessions_link_lost(void) {
     card_deselect();      // the bar offers actions the link cannot carry
+    // Everything the colony was drawing arrived over that link, so the splash
+    // goes back to its single creature rather than showing a frozen fleet.
+    s_shown.count = 0;
+    splash_set_fleet(NULL, 0, 0);
     s_live_count      = 0;
     s_any_notify      = false;
     s_notify_n        = 0;     // re-arms the edge for every sid still in the set
@@ -2851,6 +2969,7 @@ static void update_session_view(void) {}
 static void sessions_tick(void) {}
 static void sessions_link_lost(void) {}
 static void card_deselect(void) {}
+static bool sessions_have_cards(void) { return false; }
 
 #endif  // BOARD_HAS_SESSION_VIEWS
 
@@ -3214,6 +3333,7 @@ void ui_next_tab(int dir) {
 // claim on the screen the moment a finger lands on the panel.
 static void screen_press_cb(lv_event_t* e) {
     (void)e;
+    note_attract_activity();
     s_gesture_used = false;
     s_auto_jumped  = false;
     // Somebody is using the panel. The auto-return is a courtesy for a screen
@@ -3330,6 +3450,31 @@ void ui_update(const UsageData* data) {
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
+    // A number that just moved is news, so the panel goes and shows it. On a
+    // CHANGE, never on a payload: the daemon sends one a minute whether or not
+    // anything happened, and a screen that jumped on every one of those would
+    // be a screen you could never leave anywhere.
+    //
+    // Held back in the two places a jump would take something away: the
+    // settings tab (every row is a tap target, and the panel must not move
+    // under a descending finger) and a sessions tab with cards on it (those
+    // are the things asking for a person; usage is not).
+    {
+        const int w_now = data->enterprise ? data->time_pct
+                                           : (int)(data->weekly_pct + 0.5f);
+        const bool moved = (s_last_s_pct >= 0) &&
+                           (s_pct != s_last_s_pct || w_now != s_last_w_pct);
+        s_last_s_pct = s_pct;
+        s_last_w_pct = w_now;
+        if (moved && current_screen != SCREEN_USAGE &&
+            current_screen != SCREEN_SETTINGS &&
+            !(current_screen == SCREEN_SESSIONS && sessions_have_cards())) {
+            note_attract_activity();      // this jump is itself a reason to stay
+            show_screen(SCREEN_USAGE, false);
+            Serial.println("Usage moved — showing the usage screen");
+        }
+    }
+
     if (data->enterprise) {
         // Spending box: big number-only label + small "%" symbol + desc + pace
         lv_obj_set_style_text_font(lbl_session_pct, L.ent_pct_font, 0);
@@ -3431,6 +3576,30 @@ static void update_view_state(void) {
                       LV_OBJ_FLAG_HIDDEN);
 }
 
+// Nobody has touched the panel and nothing has moved for a while: hand the
+// screen to the fleet. It is the resting state because creatures moving around
+// are worth looking at from across a room in a way a static number is not.
+//
+// Deliberately NOT armed on the settings tab (somebody is mid-edit) or on a
+// sessions tab that still has cards (those are the things asking for a person;
+// walking away from them is the one thing this must not do). The splash is
+// where it goes, and on a board with a fleet the splash IS the fleet.
+static void attract_tick(void) {
+    if (current_screen == SCREEN_SPLASH) { note_attract_activity(); return; }
+    if (current_screen == SCREEN_SETTINGS) { note_attract_activity(); return; }
+    if (current_screen == SCREEN_SESSIONS && sessions_have_cards()) {
+        note_attract_activity();
+        return;
+    }
+    if (lv_tick_get() - s_attract_ms < ATTRACT_IDLE_MS) return;
+    // The idle module owns "has anybody touched this", so ask it rather than
+    // keeping a second answer that could disagree with the backlight's.
+    if (idle_ms_since_activity() < ATTRACT_IDLE_MS) return;
+    note_attract_activity();
+    show_screen(SCREEN_SPLASH, false);
+    Serial.println("Idle — handing the screen to the fleet");
+}
+
 void ui_tick_anim(void) {
     // Both scroll regions get their rubber band capped here rather than in
     // their own scroll events — see clamp_overscroll for why that matters.
@@ -3448,6 +3617,7 @@ void ui_tick_anim(void) {
     update_view_state();
     update_session_view();
     sessions_tick();
+    attract_tick();
 
     // Brightness is also reachable from the PWR button, so the settings rows
     // are repainted from the module rather than only where they were tapped.

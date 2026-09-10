@@ -606,7 +606,7 @@ def _run(monkeypatch, tmp_path, fetch, iterations, token="tok", **kw):
     monkeypatch.setattr(fleet, "fetch_sessions", fetch)
     monkeypatch.setattr(fleet, "local_bridge_ids", lambda *a, **k: set())
     monkeypatch.setattr(cs, "write_sessions_file",
-                        lambda p, payload, index=None: writes.append(payload))
+                        lambda p, payload, index=None, roster=None: writes.append(payload))
     clock = _Clock()
     fleet.run_loop(500, watcher=None, tick_s=2, poll_interval_s=30,
                    sessions_file=str(tmp_path / "s.json"),

@@ -576,21 +576,57 @@ def maildrop_setup_command(name=DEFAULT_MAILDROP_NAME):
             f'   (or: python daemon/clawdmeter_report.py --create-maildrop)')
 
 
+def mint_maildrop_name(base=None, suffix=None):
+    """A name no other session can be holding: `<base>-<8 hex>`.
+
+    THE FAILURE THIS PREVENTS, and it ate a real round on 2026-09-10. A mail
+    drop had died in the morning; a fresh one was started under the same name.
+    Locally that was unambiguous -- one live session, one roster entry -- but
+    the ACCOUNT LISTING still carried the dead one as `status: active`, and
+    `claude stop` does not take that entry away. Agents resolve the reply
+    address by NAME in their own ListAgents, so five of them answered into a
+    session that had been dead for nine hours. The dispatcher reported "sent 5
+    of 5" and then "answered 0", which is exactly as much as it could see.
+
+    Refusing on ambiguity cannot fix that: the ambiguity is in somebody else's
+    name space, discovered only when the replies do not arrive. A unique name
+    makes the collision impossible instead -- a lingering corpse keeps ITS
+    name, and nothing resolves to it.
+    """
+    import uuid
+    base = (base or DEFAULT_MAILDROP_NAME).strip() or DEFAULT_MAILDROP_NAME
+    return f"{base}-{suffix or uuid.uuid4().hex[:8]}"
+
+
 def find_maildrop(name, sessions):
     """`(record, reason)` -- the live local session serving as the mail drop.
 
-    Exactly one, matched case-insensitively on the name. Two is a refusal and
-    not a choice: `SendMessage` resolves by name, so an ambiguous address means
-    a round lands on a coin toss.
+    `name` is a PREFIX as well as a name: instances are minted as
+    `<base>-<8 hex>` (see mint_maildrop_name), so what is asked for here is
+    "the current drop under this base" rather than one exact string. An exact
+    match still wins, so an owner who pins a name with `report_maildrop` or
+    `--reply-to` gets exactly that session.
+
+    Two candidates is still a refusal rather than a choice: `SendMessage`
+    resolves by name, so an ambiguous address means a round lands on a coin
+    toss. With minted names that should now be unreachable -- if it fires,
+    something is wrong that guessing would only hide.
     """
     want = str(name).strip().casefold()
-    hits = [r for r in sessions or ()
-            if (r.get("name") or "").strip().casefold() == want]
+    live = list(sessions or ())
+    exact = [r for r in live
+             if (r.get("name") or "").strip().casefold() == want]
+    hits = exact or [r for r in live
+                     if (r.get("name") or "").strip().casefold()
+                     .startswith(want + "-")]
     if not hits:
         return None, f"no live local session named {name!r}"
     if len(hits) > 1:
-        return None, (f"{len(hits)} live local sessions are named {name!r} - "
-                      f"ambiguous, so a round could land on either")
+        # Newest first, so the message names the one a human would expect.
+        hits.sort(key=lambda r: r.get("startedAt") or 0, reverse=True)
+        names = ", ".join(sorted((r.get("name") or "?") for r in hits))
+        return None, (f"{len(hits)} live local mail drops match {name!r} "
+                      f"({names}) - ambiguous, so a round could land on either")
     return hits[0], None
 
 
@@ -647,7 +683,10 @@ def ensure_maildrop(name=DEFAULT_MAILDROP_NAME, sessions=None, create=False,
     if not create:
         return None, "missing", f"{why}. Start it once with: {maildrop_setup_command(name)}"
 
-    res = start_maildrop(name, runner=runner, binary=binary)
+    # Minted, not reused: see mint_maildrop_name. `name` is the base, and what
+    # actually gets started carries a suffix nothing else can be holding.
+    started_as = mint_maildrop_name(name)
+    res = start_maildrop(started_as, runner=runner, binary=binary)
     if not res.ok:
         detail = (res.stderr or res.stdout or res.error or "").strip()
         return None, "failed", f"could not start the mail drop: {detail[:300]}"
@@ -655,7 +694,7 @@ def ensure_maildrop(name=DEFAULT_MAILDROP_NAME, sessions=None, create=False,
     # test everything else here uses, so wait for it rather than assume.
     deadline = now_fn() + appear_s
     while True:
-        rec, why = find_maildrop(name, list_fn())
+        rec, why = find_maildrop(started_as, list_fn())
         if rec is not None:
             return rec, "started", None
         if now_fn() >= deadline:
@@ -739,8 +778,20 @@ def reply_candidates(sessions, api_rows):
     # Ambiguity is judged against the WHOLE listing, because that is the name
     # space the answering agent resolves in -- not against this machine's two
     # sessions.
+    #
+    # DISCONNECTED ROWS ARE NOT IN THAT NAME SPACE, and leaving them in cost a
+    # real round: a mail drop that had been replaced hours earlier still had
+    # `status = active` with `connection_status = disconnected`, so the fresh
+    # one it was replaced by was refused as "the fleet shows 2 live sessions
+    # called 'clawdmeter-inbox' - ambiguous". There was no ambiguity. A
+    # disconnected bridge does not appear in an agent's ListAgents, so it can
+    # never be what a name resolves to, and select_targets already drops those
+    # for exactly this reason -- this is the same rule applied to the reply
+    # address instead of to the recipients.
     titles = {}
     for row in live_rows:
+        if row.get("connection_status") == "disconnected":
+            continue
         key = _title_of(row).casefold()
         if key:
             titles[key] = titles.get(key, 0) + 1

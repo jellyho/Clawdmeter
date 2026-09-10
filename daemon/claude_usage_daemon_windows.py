@@ -429,6 +429,25 @@ def discover_bonded_address() -> str | None:
     return None
 
 
+def read_roster_payload(path: Path | None = None) -> str | None:
+    """The colony's payload from the sidecar's handoff file, or None.
+
+    A SECOND wire payload beside the session rows, not a key inside them: the
+    device draws one creature per live agent on the splash, and five report
+    cards already fill a single write's byte budget. Sharing one write would
+    mean an arriving round truncating the fleet, or the fleet truncating the
+    round. Total and quiet, like its sibling -- a sidecar too old to write one
+    simply leaves the splash on its single creature.
+    """
+    path = path or SESSIONS_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    roster = doc.get("roster") if isinstance(doc, dict) else None
+    return roster if isinstance(roster, str) and roster else None
+
+
 def read_sid_index(path: Path | None = None) -> dict:
     """The sid -> {state, sender, mid} map the sidecar wrote with the payload.
 
@@ -648,6 +667,8 @@ class Session:
         # and needs the current payload resent even though the file never changed.
         self.ss_supported = True            # until this device says otherwise
         self.last_sessions_payload: str | None = None
+        # The colony's payload, remembered per link like its sibling.
+        self.last_roster_payload: str | None = None
         self._ss_write_logged = False       # at most one write-failure log per link
         # Button events arrive on a notification callback and are handled on the
         # poll tick, exactly like refresh_requested above: the callback stays a
@@ -844,6 +865,29 @@ class Session:
         _side_tasks.add(task)
         task.add_done_callback(_side_tasks.discard)
 
+    async def _send_roster(self) -> None:
+        """Ship the colony's payload when it has changed.
+
+        Rides the same tick and the same characteristic as the session rows,
+        but as its own write — see read_roster_payload. Failures are swallowed
+        the way the session write's are: the fleet on the splash is a secondary
+        feed and must never be the thing that forces a reconnect.
+        """
+        roster = read_roster_payload()
+        if roster is None or roster == self.last_roster_payload:
+            return
+        log(f"Sending roster: {roster}")
+        try:
+            await self.client.write_gatt_char(
+                SS_CHAR_UUID, roster.encode("utf-8"), response=False
+            )
+        except BleakCharacteristicNotFoundError:
+            self.ss_supported = False
+            return
+        except (BleakError, OSError, ValueError):
+            return          # next tick retries; last_roster_payload untouched
+        self.last_roster_payload = roster
+
     def probe_session_support(self) -> None:
         """Decide once per connection whether this device has the SS characteristic.
 
@@ -871,6 +915,7 @@ class Session:
         went over the air."""
         if not self.ss_supported:
             return
+        await self._send_roster()
         payload = read_sessions_payload()
         if payload is None or payload == self.last_sessions_payload:
             return

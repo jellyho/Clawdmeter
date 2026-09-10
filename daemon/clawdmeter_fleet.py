@@ -826,6 +826,7 @@ def run_loop(budget, show_offline=False, watcher=None, tick_s=TICK_S,
     have_listing = False
     next_poll = 0.0
     last_payload = last_sig = None
+    last_roster = None
     last_write = 0.0
     count = 0
     if health is None:
@@ -897,10 +898,19 @@ def run_loop(budget, show_offline=False, watcher=None, tick_s=TICK_S,
         # interval so the ages on the panel do not freeze, even when nothing
         # meaningful changed.
         refresh_due = (now - last_write) >= poll_interval_s
-        if payload != last_payload and (sig != last_sig or refresh_due):
+        # The roster rides in the same handoff file but as its OWN payload:
+        # the BLE daemon writes it separately, because five report cards
+        # already fill one write's budget and a shared one would mean an
+        # arriving round truncating the roster or the roster truncating the
+        # round.
+        roster = json.dumps(roster_payload(api_rows, exclude),
+                            separators=(",", ":"), ensure_ascii=False)
+        if ((payload != last_payload and (sig != last_sig or refresh_due))
+                or roster != last_roster):
             cs.write_sessions_file(sessions_file, payload,
-                                   build_index(rows, watcher))
+                                   build_index(rows, watcher), roster)
             last_payload, last_sig, last_write = payload, sig, now
+            last_roster = roster
 
         sleep_fn(tick_s)
     return last_payload
@@ -999,6 +1009,55 @@ def answered_elsewhere(reports, api_rows, now=None):
             continue   # still finishing the turn it reported in
         out[key] = f"answered on its own machine ({int(now - last)}s ago)"
     return out
+
+
+# The colony on the splash screen draws WHO IS ALIVE, which is not the question
+# the cards answer. `attention_only` exists so a card means "a person is
+# needed"; it also means a quietly working agent never reaches the device at
+# all. So the roster is built from the SAME listing with that filter OFF, and
+# shipped as its own small payload.
+ROSTER_MAX = 16          # matches ROSTER_MAX in firmware/src/data.h
+ROSTER_LABEL_MAX = 15    # 15 + NUL fits ROSTER_LABEL_MAX there
+
+
+def roster_payload(api_rows, exclude_ids=None, max_members=ROSTER_MAX):
+    """{"fl":[[name,state],...],"more":N} for the live fleet, or None.
+
+    Cheap on purpose -- a name and a state and nothing else. It is sorted the
+    way the cards are (attention first, then most recently active), so when
+    there are more agents than the panel can draw, what gets dropped is what
+    needed a person least, and the count of them still goes on the wire.
+    """
+    exclude = exclude_ids if exclude_ids is not None else set()
+    keep = []
+    for row in api_rows or ():
+        if not isinstance(row, dict):
+            continue
+        if row.get("environment_kind") != BRIDGE_KIND:
+            continue
+        if row.get("status") in DEAD_STATUSES:
+            continue
+        if strip_id_prefix(row.get("id") or "") in exclude:
+            continue
+        # A disconnected bridge is a machine that is asleep. Drawing a creature
+        # for it would say "this agent is here" about one that is not.
+        if row.get("connection_status") == "disconnected":
+            continue
+        keep.append(row)
+
+    keep.sort(key=lambda r: (
+        cs.state_bucket(row_state(r)),
+        -_epoch(r.get("last_event_at") or r.get("updated_at") or r.get("created_at")),
+    ))
+    members = []
+    for row in keep[:max_members]:
+        label = cs.elide_label(_label_of(row) or "?", ROSTER_LABEL_MAX)
+        members.append([label, int(row_state(row))])
+    doc = {"fl": members}
+    dropped = len(keep) - len(members)
+    if dropped > 0:
+        doc["more"] = dropped
+    return doc
 
 
 def build_index(rows, watcher):

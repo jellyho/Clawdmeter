@@ -743,9 +743,444 @@ void splash_init(lv_obj_t *parent) {
     lv_obj_add_flag(splash_container, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ===========================================================================
+// The colony
+// ===========================================================================
+//
+// One creature per agent instead of one big one. Everything here is additive:
+// the single-Clawd path above is untouched and still runs whenever the fleet
+// is empty, which is a board with no host, a quiet desk, or any port that
+// never calls splash_set_fleet().
+//
+// WHY IT DOES NOT REUSE compose_stage(). That composites ONE animation into a
+// 60x60 grid of palette indices and hands render_frame() a single palette --
+// and the whole point here is nine creatures from nine different animations,
+// each with its own <=16-colour palette. Rather than merge palettes (which
+// costs a second buffer and loses the exact authored colours), each actor is
+// drawn INTO ITS OWN RECT with its own palette. Nothing overlaps, so nothing
+// needs compositing.
+//
+// The rect is fixed for an actor's lifetime and the sprite is drawn with its
+// background cells included, so redrawing a frame erases the previous one
+// exactly. No clear pass, no dirty-rect arithmetic, and an actor whose frame
+// has not advanced costs nothing at all.
+
+LV_FONT_DECLARE(font_styrene_14);
+
+#define FLEET_LABEL_H   20     // the name strip under each creature
+#define FLEET_NAME_GAP  6      // air between the feet and the name
+#define FLEET_TOP       18
+#define FLEET_BOTTOM    6
+
+struct FleetActor {
+    uint8_t  anim;         // index into splash_anims
+    uint16_t frame;
+    uint32_t started;
+    int      px, py;       // sprite top-left, in surface pixels
+    int      w, h;         // sprite size, in surface pixels
+    int      cell;         // surface px per art cell (shared by the fleet)
+    bool     frozen;       // holds frame 0 -- the idle pose
+};
+
+// Wipe the whole surface. Needed exactly when the colony takes over from the
+// single creature: that one is drawn from a 60x60 stage covering the screen,
+// the colony only ever paints its own small rects, and without this the old
+// creature stays underneath -- which on the first run left a full-size Clawd
+// in a fedora standing behind the fleet.
+static void fleet_repaint_labels(void);
+
+static void fleet_clear_surface(void) {
+#if SPLASH_DIRECT_DRAW
+    if (!strip_buf) return;
+    const BoardCaps& c = board_caps();
+    const int band = scr_cell > 0 ? scr_cell : 8;
+    for (int i = 0; i < c.width * band; i++) strip_buf[i] = COL_EMPTY;
+    for (int y = 0; y < c.height; y += band) {
+        int hh = (y + band <= c.height) ? band : (c.height - y);
+        display_hal_draw_bitmap(0, y, c.width, hh, strip_buf);
+    }
+#else
+    if (canvas_buf) memset(canvas_buf, 0, (size_t)canvas_w * canvas_h * 2);
+#endif
+    fleet_repaint_labels();
+}
+
+static SplashFleetMember fleet[SPLASH_FLEET_MAX];
+static FleetActor        fleet_actor[SPLASH_FLEET_MAX];
+static lv_obj_t*         fleet_label[SPLASH_FLEET_MAX];
+static uint8_t           fleet_n = 0;
+static uint8_t           fleet_dropped = 0;   // live sessions that did not fit
+
+// The names are LVGL labels; the creatures are pixels pushed straight at the
+// panel. That works because the two never share a rectangle -- except here,
+// where the wipe covers the WHOLE surface and takes the labels with it. LVGL
+// has no idea that happened (nothing it drew has changed), so it never
+// repaints them and the fleet is left anonymous. Swiping back onto the splash
+// was the reliable way to see it.
+static void fleet_repaint_labels(void) {
+    for (uint8_t i = 0; i < SPLASH_FLEET_MAX; i++)
+        if (fleet_label[i] && !lv_obj_has_flag(fleet_label[i], LV_OBJ_FLAG_HIDDEN))
+            lv_obj_invalidate(fleet_label[i]);
+}
+
+static bool              fleet_relayout = false;   // geometry/labels are stale
+static bool              fleet_repaint  = false;   // creatures need a full draw
+
+// Which creature plays which part. Varied by slot so nine working agents do
+// not march in lockstep -- the fleet should look like a room, not a chorus
+// line. Names are matched against the catalogue at layout time; anything the
+// build does not carry falls back to the first animation.
+// A creature's character comes from its NAME, not from where it happens to
+// stand. Keying on the slot produced vertical stripes -- with three columns
+// and three poses, `slot % 3` gave every column one pose -- and it also meant
+// an agent changed character whenever the sort moved it. This is stable per
+// agent and has nothing to do with the grid.
+static uint32_t fleet_seed(const char* label) {
+    uint32_t h = 2166136261u;
+    for (const char* p = label; p && *p; p++) {
+        h ^= (uint8_t)*p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static const char* fleet_anim_name(uint8_t state, uint32_t seed) {
+    static const char* WORK[] = { "walking", "laptop", "crab walking" };
+    // Idle is not "doing nothing", it is "doing nothing FOR YOU" -- so the
+    // creature is off playing. These read as leisure at a glance and, more
+    // to the point, they look nothing like the walking one next to them.
+    static const char* IDLE[] = { "dancing", "basketball", "skateboard" };
+    switch (state) {
+    case SPLASH_FLEET_WAITING: return "waving";       // calling you over
+    // IDLE CREATURES HOLD STILL, and that is the whole signal: motion on this
+    // screen means something is happening. Making them animate (the second
+    // cut, which fixed a different complaint) took that away -- nine creatures
+    // all moving, and no way to tell who was working.
+    //
+    // But they must not hold the SAME pose, which is what the first cut did by
+    // freezing frame 0. That was not bad luck: frame 0 of every animation is
+    // the one shared idle position they all pass through, which is exactly
+    // what makes switching between them seamless (see CLAUDE.md). Different
+    // animation, identical first frame.
+    //
+    // So an idle creature freezes at a frame from INSIDE its loop, picked from
+    // its name -- a Clawd holding a basketball, one standing on a skateboard,
+    // one caught mid-dance. Still, distinct, and obviously not working.
+    //
+    // Not "lurking" (authored as a half-sprite that hangs off the screen edge,
+    // so a slot enlarges it into a blob) and not "cloud" (41 cells wide -- it
+    // dragged the fleet's shared cell size down and shrank everybody).
+    case SPLASH_FLEET_IDLE:    return IDLE[seed % 3];
+    case SPLASH_FLEET_DONE:    return "jumping happy";
+    case SPLASH_FLEET_MESSAGE: return "pointing";     // telling you something
+    default:                   return WORK[seed % 3];
+    }
+}
+
+static uint8_t fleet_anim_index(const char* name) {
+    for (uint16_t i = 0; i < SPLASH_ANIM_COUNT; i++)
+        if (strcmp(splash_anims[i].name, name) == 0) return (uint8_t)i;
+    return 0;
+}
+
+static lv_color_t fleet_label_color(uint8_t state) {
+    switch (state) {
+    case SPLASH_FLEET_WAITING: return THEME_ACCENT;
+    case SPLASH_FLEET_DONE:    return THEME_GREEN;
+    case SPLASH_FLEET_MESSAGE: return THEME_PURPLE;
+    default:                   return THEME_DIM;
+    }
+}
+
+// The surface the colony lays itself out on. On the PSRAM path that is the
+// LVGL canvas (480x480 at 1:1 on every board that has the chat views); on the
+// direct path it is the panel itself.
+static void fleet_surface(int* w, int* h) {
+#if SPLASH_DIRECT_DRAW
+    const BoardCaps& c = board_caps();
+    *w = c.width; *h = c.height;
+#else
+    *w = canvas_w; *h = canvas_h;
+#endif
+}
+
+// Bigger creatures when there are fewer of them: two agents on a 480 panel
+// should not be two stamps in the corner. The cell is in SURFACE pixels per
+// art cell, and a core Clawd is ~24x18 art cells.
+static void fleet_grid(uint8_t n, int* cols, int* cell) {
+    if (n <= 2)       { *cols = 2; *cell = 8; }
+    else if (n <= 4)  { *cols = 2; *cell = 6; }
+    else if (n <= 6)  { *cols = 3; *cell = 5; }
+    else if (n <= 9)  { *cols = 3; *cell = 4; }
+    // Past nine the grid widens rather than the creatures shrinking inside a
+    // three-column layout: at four columns sixteen still measure 48x36, where
+    // cramming them into three would have taken them to 24x18. The cell here
+    // is only a ceiling -- fleet_layout lowers it until every creature fits.
+    else              { *cols = 4; *cell = 3; }
+}
+
+static void fleet_layout(void) {
+    fleet_relayout = false;
+    if (!splash_container) return;
+    int sw, sh;
+    fleet_surface(&sw, &sh);
+
+    int cols, cell;
+    fleet_grid(fleet_n, &cols, &cell);
+    const int slots  = fleet_n + (fleet_dropped ? 1 : 0);
+    const int rows   = (slots + cols - 1) / cols;
+    const int slot_w = sw / cols;
+    const int slot_h = (sh - FLEET_TOP - FLEET_BOTTOM) / (rows ? rows : 1);
+    // The height every creature is scaled to. Derived from the slot rather
+    // than from any one animation, so the fleet fills the room whatever mix
+    // of poses it happens to be in.
+    int art_h = slot_h - FLEET_LABEL_H - FLEET_NAME_GAP;
+    if (art_h < 8) art_h = 8;
+
+    // ONE cell for the whole fleet, not one per creature. The animations are
+    // authored at different sizes -- a Clawd holding a laptop is 34x23 art
+    // cells where a walking one is 24x18 -- and scaling each to a common
+    // height would shrink the wide ones to fit their slot and leave the fleet
+    // looking like a size chart. A shared cell keeps the authored proportions
+    // (the one with the laptop really is bigger) and is chosen as the largest
+    // that leaves EVERY creature inside its slot.
+    for (uint8_t i = 0; i < fleet_n; i++) {
+        const splash_anim_def_t* a = &splash_anims[fleet_anim_index(
+            fleet_anim_name(fleet[i].state, fleet_seed(fleet[i].label)))];
+        if (!a->w || !a->h) continue;
+        int fit_w = (slot_w - 8) / a->w;
+        int fit_h = art_h / a->h;
+        int fit = fit_w < fit_h ? fit_w : fit_h;
+        if (fit < cell) cell = fit;
+    }
+    if (cell < 1) cell = 1;
+
+    // Rows are only as tall as the tallest creature needs, and the whole block
+    // is centred. Bottom-anchoring inside full-height slots left the fleet
+    // pinned to the floor of each row with a third of the panel empty above
+    // it -- correct arithmetic, wrong picture.
+    int tall = 0;
+    for (uint8_t i = 0; i < fleet_n; i++) {
+        const splash_anim_def_t* a = &splash_anims[fleet_anim_index(
+            fleet_anim_name(fleet[i].state, fleet_seed(fleet[i].label)))];
+        if (a->h * cell > tall) tall = a->h * cell;
+    }
+    const int row_h = tall + FLEET_NAME_GAP + FLEET_LABEL_H;
+    int top = (sh - rows * row_h) / 2;
+    if (top < FLEET_TOP) top = FLEET_TOP;
+
+    for (uint8_t i = 0; i < SPLASH_FLEET_MAX; i++) {
+        if (i >= fleet_n) {
+            if (fleet_label[i]) lv_obj_add_flag(fleet_label[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        FleetActor* ac = &fleet_actor[i];
+        const uint32_t seed = fleet_seed(fleet[i].label);
+        ac->anim  = fleet_anim_index(fleet_anim_name(fleet[i].state, seed));
+        const splash_anim_def_t* a = &splash_anims[ac->anim];
+        ac->cell = cell;
+        // Start each creature at a different point in its own cycle, for the
+        // same reason the animations differ: a fleet in step looks mechanical.
+        ac->frozen  = (fleet[i].state == SPLASH_FLEET_IDLE);
+        if (!a->frame_count) {
+            ac->frame = 0;
+        } else if (ac->frozen) {
+            // Inside the loop, never frame 0 -- that is the shared pose every
+            // animation starts on, and holding it is what made them identical.
+            const uint16_t lo = a->loop_start;
+            const uint16_t hi = (a->loop_end > lo) ? a->loop_end : lo;
+            ac->frame = (uint16_t)(lo + (seed >> 8) % (uint16_t)(hi - lo + 1));
+        } else {
+            // Out of phase, so a row of workers is not a chorus line.
+            ac->frame = (uint16_t)(seed % a->frame_count);
+        }
+        ac->started = millis();
+        ac->w = a->w * cell;
+        ac->h = a->h * cell;
+
+        const int sx = (i % cols) * slot_w;
+        const int sy = top + (i / cols) * row_h;
+        ac->px = sx + (slot_w - ac->w) / 2;
+        // Feet on the slot's ground line, name underneath. Creatures are
+        // authored bottom-anchored, so aligning feet is what makes a row of
+        // different animations look like they are standing on one floor.
+        // Feet on the row's ground line whatever the creature's height, so a
+        // jumping one and a standing one share a floor instead of floating.
+        ac->py = sy + tall - ac->h;
+        if (ac->px < 0) ac->px = 0;
+        if (ac->py < 0) ac->py = 0;
+
+        if (!fleet_label[i]) {
+            fleet_label[i] = lv_label_create(splash_container);
+            lv_obj_set_style_text_font(fleet_label[i], &font_styrene_14, 0);
+            lv_label_set_long_mode(fleet_label[i], LV_LABEL_LONG_CLIP);
+            lv_obj_set_style_text_align(fleet_label[i], LV_TEXT_ALIGN_CENTER, 0);
+        }
+        lv_label_set_text(fleet_label[i], fleet[i].label);
+        lv_obj_set_style_text_color(fleet_label[i], fleet_label_color(fleet[i].state), 0);
+        lv_obj_set_width(fleet_label[i], slot_w);
+        lv_obj_set_pos(fleet_label[i], sx, sy + tall + FLEET_NAME_GAP);
+        lv_obj_remove_flag(fleet_label[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    // The overflow note takes the slot after the last creature. It is a label
+    // with nothing above it, which is exactly what it means: there are more
+    // agents and they are not drawn. The host sorts attention-first, so what
+    // is missing is what needed you least.
+    if (fleet_dropped) {
+        const uint8_t i = fleet_n;
+        const int sx = (i % cols) * slot_w;
+        const int sy = top + (i / cols) * row_h;
+        if (!fleet_label[i]) {
+            fleet_label[i] = lv_label_create(splash_container);
+            lv_obj_set_style_text_font(fleet_label[i], &font_styrene_14, 0);
+            lv_label_set_long_mode(fleet_label[i], LV_LABEL_LONG_CLIP);
+            lv_obj_set_style_text_align(fleet_label[i], LV_TEXT_ALIGN_CENTER, 0);
+        }
+        char more[16];
+        snprintf(more, sizeof(more), "+%u more", (unsigned)fleet_dropped);
+        lv_label_set_text(fleet_label[i], more);
+        lv_obj_set_style_text_color(fleet_label[i], THEME_DIM, 0);
+        lv_obj_set_width(fleet_label[i], slot_w);
+        lv_obj_set_pos(fleet_label[i], sx, sy + tall + FLEET_NAME_GAP);
+        lv_obj_remove_flag(fleet_label[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    fleet_repaint = true;
+}
+
+// Draw one creature's whole rect, background cells included -- which is what
+// erases the frame before it without a separate clear.
+static void fleet_draw(const FleetActor* ac) {
+    const splash_anim_def_t* a = &splash_anims[ac->anim];
+    if (!a->frame_count) return;
+    const int cell = ac->cell > 0 ? ac->cell : 1;
+    const uint8_t* src = &a->frames[(size_t)ac->frame * a->w * a->h];
+
+#if SPLASH_DIRECT_DRAW
+    if (!strip_buf) return;
+    const int bw = a->w * cell;
+    for (int r = 0; r < a->h; r++) {
+        for (int c = 0; c < a->w; c++) {
+            const uint8_t code = src[r * a->w + c];
+            const uint16_t col = code ? a->palette[code] : COL_EMPTY;
+            uint16_t* pcol = &strip_buf[c * cell];
+            for (int i = 0; i < cell; i++) pcol[i] = col;
+        }
+        for (int dy = 1; dy < cell; dy++)
+            memcpy(&strip_buf[dy * bw], strip_buf, (size_t)bw * 2);
+        display_hal_draw_bitmap(ac->px, ac->py + r * cell, bw, cell, strip_buf);
+    }
+#else
+    if (!canvas_buf) return;
+    for (int r = 0; r < a->h; r++) {
+        for (int dy = 0; dy < cell; dy++) {
+            const int y = ac->py + r * cell + dy;
+            if (y < 0 || y >= canvas_h) continue;
+            uint16_t* row = &canvas_buf[(size_t)y * canvas_w];
+            for (int c = 0; c < a->w; c++) {
+                const uint8_t code = src[r * a->w + c];
+                const uint16_t col = code ? a->palette[code] : COL_EMPTY;
+                for (int dx = 0; dx < cell; dx++) {
+                    const int x = ac->px + c * cell + dx;
+                    if (x >= 0 && x < canvas_w) row[x] = col;
+                }
+            }
+        }
+    }
+#endif
+}
+
+// Advance every creature on its own clock and redraw only the ones that moved.
+static void fleet_tick(void) {
+    if (fleet_relayout) fleet_layout();
+    const uint32_t now = millis();
+    if (fleet_repaint) fleet_clear_surface();
+    bool drew = fleet_repaint;
+
+    for (uint8_t i = 0; i < fleet_n; i++) {
+        FleetActor* ac = &fleet_actor[i];
+        const splash_anim_def_t* a = &splash_anims[ac->anim];
+        if (!a->frame_count) continue;
+        bool draw = fleet_repaint;
+        if (!ac->frozen && now - ac->started >= a->holds[ac->frame]) {
+            // Creatures stay in their LOOP: the intro and outro exist to enter
+            // and leave a scene, and nothing here enters or leaves -- an agent
+            // is working until the host says it is not.
+            uint16_t next = ac->frame + 1;
+            if (ac->frame >= a->loop_end || next >= a->frame_count)
+                next = a->loop_start;
+            ac->frame = next;
+            ac->started = now;
+            draw = true;
+        }
+        if (draw) { fleet_draw(ac); drew = true; }
+    }
+    fleet_repaint = false;
+
+#if !SPLASH_DIRECT_DRAW
+    if (drew && canvas) lv_obj_invalidate(canvas);
+#else
+    (void)drew;
+#endif
+}
+
+void splash_set_fleet(const SplashFleetMember *members, uint8_t n,
+                      uint8_t dropped) {
+    if (n > SPLASH_FLEET_MAX) {
+        dropped = (uint8_t)(dropped + (n - SPLASH_FLEET_MAX));
+        n = SPLASH_FLEET_MAX;
+    }
+    // A note about what is missing needs a slot of its own, so when anything
+    // was dropped the last creature gives one up. The same trade the card list
+    // makes (six rows, one spent on the overflow marker) and for the same
+    // reason: a fleet drawn one short is a smaller lie than a fleet that does
+    // not admit it is incomplete. Without this the marker vanished at exactly
+    // the size it exists for -- a full grid with more behind it.
+    if (dropped && n == SPLASH_FLEET_MAX) {
+        n--;
+        dropped++;
+    }
+    // Unchanged membership must not restart the animations: this is called on
+    // every payload, and a fleet that flinched every few seconds would be
+    // worse than no animation at all.
+    bool same = (n == fleet_n) && (dropped == fleet_dropped);
+    for (uint8_t i = 0; same && i < n; i++)
+        same = fleet[i].state == members[i].state &&
+               strncmp(fleet[i].label, members[i].label, sizeof(fleet[i].label)) == 0;
+    if (same) return;
+
+    for (uint8_t i = 0; i < n; i++) fleet[i] = members[i];
+    const bool was = fleet_n > 0;
+    fleet_n = n;
+    fleet_dropped = dropped;
+    fleet_relayout = true;
+    if (was != (fleet_n > 0)) {
+        // Crossed between the colony and the single creature: the whole
+        // surface changes meaning, so nothing on it can be trusted.
+#if SPLASH_DIRECT_DRAW
+        force_full = true;
+#endif
+        fleet_repaint = true;
+        for (uint8_t i = 0; i < SPLASH_FLEET_MAX; i++)
+            if (fleet_label[i]) lv_obj_add_flag(fleet_label[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 void splash_tick(void) {
     if (!active || SPLASH_ANIM_COUNT == 0) return;
     const uint32_t now = millis();
+
+    // The fleet takes the screen when there is one. Everything below is the
+    // single-creature splash, unchanged, and it is what a quiet desk still
+    // gets.
+    if (fleet_n > 0) {
+#if SPLASH_DIRECT_DRAW
+        // LVGL painted the container black on unhide; repaint the creatures
+        // over it now, the same deferral the single-creature path uses.
+        if (force_full) { force_full = false; fleet_repaint = true; }
+#endif
+        fleet_tick();
+        return;
+    }
 
 #if SPLASH_DIRECT_DRAW
     // Deferred full repaint after a (re)show — runs now that LVGL has drawn the
@@ -826,6 +1261,13 @@ void splash_tick(void) {
 }
 
 void splash_next(void) {
+    // The colony owns the surface. These two are the ways the SINGLE creature
+    // gets drawn from outside splash_tick() -- a usage rate-group change
+    // (main.cpp) and the PWR button -- and both paint a full-stage creature
+    // straight over the fleet AND over the LVGL name labels, which is what
+    // made the names vanish and a big Clawd loom behind the colony after a
+    // while. Nothing here has anything to pick while a fleet is up.
+    if (fleet_n > 0) return;
     if (SPLASH_ANIM_COUNT == 0) return;
     cur_anim = (cur_anim + 1) % SPLASH_ANIM_COUNT;
     cur_frame = 0;
@@ -838,6 +1280,13 @@ void splash_next(void) {
 }
 
 void splash_pick_for_current_rate(void) {
+    // The colony owns the surface. These two are the ways the SINGLE creature
+    // gets drawn from outside splash_tick() -- a usage rate-group change
+    // (main.cpp) and the PWR button -- and both paint a full-stage creature
+    // straight over the fleet AND over the LVGL name labels, which is what
+    // made the names vanish and a big Clawd loom behind the colony after a
+    // while. Nothing here has anything to pick while a fleet is up.
+    if (fleet_n > 0) return;
     if (SPLASH_ANIM_COUNT == 0) return;
     int g = usage_rate_group();
     if (g < 0 || g >= GROUP_COUNT) g = 0;

@@ -176,6 +176,37 @@ static void utf8_drop_partial_tail(char* s) {
 // (session_state_has_words) — and `remote` (12) is parsed by nothing here yet
 // and is skipped on purpose.
 // Returns false on a malformed payload — caller keeps the last good list.
+// The roster payload: {"fl":[["name",state],...],"more":N}. A different
+// payload on the same characteristic rather than a key on the session one --
+// see data.h for why they cannot share a write. Returns false for anything
+// without an "fl" array, which is how the two are told apart.
+static bool parse_roster(const char* json, Roster* out) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, json);
+    if (err) return false;
+    JsonArray fl = doc["fl"].as<JsonArray>();
+    if (fl.isNull()) return false;
+
+    out->count = 0;
+    out->dropped = (uint8_t)(doc["more"] | 0);
+    for (JsonArray m : fl) {
+        if (out->count >= ROSTER_MAX) {
+            // Host-sorted, so what is left is the least urgent -- but it is
+            // still counted, because a creature missing with nothing said
+            // about it is the one thing this must not do.
+            out->dropped++;
+            continue;
+        }
+        if (m.isNull() || m.size() < 2) continue;
+        RosterMember* r = &out->rows[out->count];
+        snprintf(r->label, sizeof(r->label), "%s", (const char*)(m[0] | ""));
+        utf8_drop_partial_tail(r->label);
+        r->state = (uint8_t)(m[1] | 0);
+        out->count++;
+    }
+    return true;
+}
+
 static bool parse_sessions(const char* json, SessionList* out) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
@@ -572,7 +603,10 @@ void loop() {
 
 #if BOARD_HAS_SESSION_VIEWS
     if (ble_has_session_data()) {
-        if (parse_sessions(ble_get_session_data(), &sessions)) {
+        static Roster roster;
+        if (parse_roster(ble_get_session_data(), &roster)) {
+            ui_update_roster(&roster);
+        } else if (parse_sessions(ble_get_session_data(), &sessions)) {
             // Claude counts as activity (§2.4): a session state change wakes
             // a sleeping panel and resets the sleep timer.
             idle_note_activity();

@@ -352,7 +352,13 @@ def test_maildrop_is_never_started_unless_asked(tmp_path):
 
 def test_ensure_maildrop_starts_one_and_waits_for_the_roster():
     """`claude --bg` returns before the roster file lands, and the roster IS
-    the liveness test everything else uses."""
+    the liveness test everything else uses.
+
+    The name it starts under is MINTED, not the base -- see
+    mint_maildrop_name. What ensure_maildrop then waits for is that exact
+    minted session, so a stranger appearing under the base name cannot be
+    mistaken for the one it just started.
+    """
     seen = {}
     appeared = {"n": 0}
 
@@ -363,15 +369,60 @@ def test_ensure_maildrop_starts_one_and_waits_for_the_roster():
 
     def _list():
         appeared["n"] += 1
-        return [roster()] if appeared["n"] > 2 else []
+        # Whatever it asked to start is what shows up on the roster.
+        return [roster(name=seen["argv"][3])] if appeared["n"] > 2 else []
 
     rec, action, why = report.ensure_maildrop(
         MAILDROP, sessions=[], create=True, runner=_run,
         sleep_fn=lambda s: None, list_fn=_list)
-    assert action == "started" and rec["name"] == MAILDROP
-    assert seen["argv"][1:5] == ["--bg", "-n", MAILDROP, "--model"]
+    minted = seen["argv"][3]
+    assert action == "started" and rec["name"] == minted
+    assert minted.startswith(MAILDROP + "-") and minted != MAILDROP
+    assert seen["argv"][1:3] == ["--bg", "-n"]
+    assert seen["argv"][4] == "--model"
     assert "--append-system-prompt" in seen["argv"]
     assert seen["cwd"] == report.maildrop_dir()
+
+
+def test_every_mail_drop_gets_a_name_nothing_else_can_hold():
+    """The collision this exists to make impossible: a drop that died in the
+    morning still carried `status: active` in the ACCOUNT listing, agents
+    resolved the shared name to that corpse, and five replies went into a
+    session nobody was reading. Refusing on ambiguity cannot catch it -- the
+    ambiguity is in somebody else's name space."""
+    a = report.mint_maildrop_name("clawdmeter-inbox")
+    b = report.mint_maildrop_name("clawdmeter-inbox")
+    assert a != b
+    assert a.startswith("clawdmeter-inbox-")
+
+
+def test_a_drop_is_found_by_its_base_name_however_it_was_minted():
+    """Nothing else knows the suffix, so everything else asks for the base:
+    the supervisor, the dispatcher, the config. Prefix matching is what makes
+    a minted name discoverable rather than a secret."""
+    live = roster(name="clawdmeter-inbox-9f2c1a77")
+    rec, why = report.find_maildrop("clawdmeter-inbox", [live])
+    assert rec is live and why is None
+
+
+def test_an_exactly_named_drop_still_wins():
+    """`--reply-to` and a pinned `report_maildrop` name one session on
+    purpose; a prefix match must not steal that."""
+    exact = roster(name="clawdmeter-inbox", started=1)
+    minted = roster(name="clawdmeter-inbox-9f2c1a77", started=2)
+    rec, why = report.find_maildrop("clawdmeter-inbox", [minted, exact])
+    assert rec is exact
+
+
+def test_two_live_drops_under_one_base_are_still_a_refusal():
+    """Minting should make this unreachable. If it fires anyway, something is
+    wrong that guessing would only hide -- and the message names both."""
+    a = roster(name="clawdmeter-inbox-aaaaaaaa", started=1)
+    b = roster(name="clawdmeter-inbox-bbbbbbbb", started=2)
+    rec, why = report.find_maildrop("clawdmeter-inbox", [a, b])
+    assert rec is None
+    assert "ambiguous" in why
+    assert "aaaaaaaa" in why and "bbbbbbbb" in why
 
 
 def test_ensure_maildrop_reports_a_start_that_never_appears():
@@ -935,3 +986,43 @@ def test_a_broadcast_without_the_rules_sends_nothing():
     ok, detail = report.broadcast_rules([], rules="")
     assert ok is False
     assert "missing from REPORT.md" in detail
+
+
+def test_a_disconnected_namesake_does_not_make_the_mail_drop_ambiguous():
+    """Measured: a mail drop replaced hours earlier still carried
+    status=active with connection_status=disconnected, and its name collided
+    with the fresh one that replaced it -- refusing a round over an ambiguity
+    that did not exist. A disconnected bridge is not in the name space an
+    agent resolves in, so it cannot be what a name resolves TO."""
+    rows = [
+        {"id": "cse_live", "environment_kind": report.BRIDGE_KIND,
+         "status": "active", "connection_status": "connected",
+         "title": "clawdmeter-inbox"},
+        {"id": "cse_ghost", "environment_kind": report.BRIDGE_KIND,
+         "status": "active", "connection_status": "disconnected",
+         "title": "clawdmeter-inbox"},
+    ]
+    sessions = [{"name": "clawdmeter-a1", "bridgeSessionId": "live",
+                 "sessionId": "s-1"}]
+    cands, dropped = report.reply_candidates(sessions, rows)
+    assert [c.name for c in cands] == ["clawdmeter-inbox"]
+    assert dropped == []
+
+
+def test_two_connected_namesakes_are_still_ambiguous():
+    """The guard it exists for stays: SendMessage resolves by name, so two
+    reachable sessions sharing one is a coin toss over which machine a round
+    lands on."""
+    rows = [
+        {"id": "cse_a", "environment_kind": report.BRIDGE_KIND,
+         "status": "active", "connection_status": "connected",
+         "title": "clawdmeter-inbox"},
+        {"id": "cse_b", "environment_kind": report.BRIDGE_KIND,
+         "status": "active", "connection_status": "connected",
+         "title": "clawdmeter-inbox"},
+    ]
+    sessions = [{"name": "clawdmeter-a1", "bridgeSessionId": "a",
+                 "sessionId": "s-1"}]
+    cands, dropped = report.reply_candidates(sessions, rows)
+    assert cands == []
+    assert "ambiguous" in dropped[0]["why"]

@@ -16,6 +16,12 @@ void idle_set_awake_brightness(uint8_t level);
 // activity, so callers don't need a separate idle_note_activity() call.
 bool idle_consume_wake_press(void);
 
+// How long since the last real input (touch, button, PWR). The idle module
+// already keeps this to decide when to fade the panel; the UI borrows it so
+// "nobody has touched this in a while" is answered in ONE place rather than by
+// a second timer that could disagree with the one driving the backlight.
+uint32_t idle_ms_since_activity(void);
+
 // Touch should NOT count as activity (avoids accidental wakes from pets,
 // sleeves, etc.). Callers use this to silently drop touch events while the
 // panel is dark.
