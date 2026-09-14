@@ -517,3 +517,107 @@ def test_a_launch_that_raises_does_not_stop_the_supervisor():
                           label="Mail drop", now_fn=lambda: 1000.0)
     assert sup.step() is False
     assert any("supervisor error" in m for m in said)
+
+
+# ---------------------------------------------------------------------------
+# TokenKeeper — the panel went blank three nights running
+# ---------------------------------------------------------------------------
+
+from daemon.tray_windows import TokenKeeper, TOKEN_LEAD_S, TOKEN_RETRY_S
+
+
+def _keeper(expiry, mtimes, log=None, ran=None, bounced=None):
+    """A keeper whose every seam is a list the test controls.
+
+    `mtimes` is popped per read, so a rung "working" is expressed as the
+    credentials file changing under it -- which is exactly how the real one
+    decides, and the only thing it can actually observe.
+    """
+    seq = list(mtimes)
+    return TokenKeeper(
+        expiry=lambda: expiry,
+        mtime=lambda: seq.pop(0) if seq else 0,
+        run=lambda args, timeout=60: (ran.append(tuple(args)) if ran is not None else None) or True,
+        bounce=lambda: (bounced.append(1) if bounced is not None else None) or True,
+        log_fn=(log.append if log is not None else (lambda m: None)),
+        now_fn=lambda: 1000.0,
+        sleep_fn=lambda s: None,
+    )
+
+
+def test_a_healthy_token_is_left_alone():
+    """Nothing refreshes a token that is fine, so poking at one is pure cost --
+    and this runs every 30 seconds."""
+    ran = []
+    k = _keeper(expiry=1000.0 + TOKEN_LEAD_S + 60, mtimes=[1, 1], ran=ran)
+    assert k.step(1000.0) is False
+    assert ran == []
+
+
+def test_the_cheapest_rung_that_works_wins():
+    """`auth status` costs nothing: no session, no quota. If the credentials
+    file moves under it, the ladder stops there."""
+    log, ran, bounced = [], [], []
+    k = _keeper(expiry=1000.0 + 60, mtimes=[10, 11], log=log, ran=ran, bounced=bounced)
+    assert k.step(1000.0) is True
+    assert ran == [("auth", "status")]
+    assert bounced == []                      # never got to the session start
+    assert any("auth status: renewed" in m for m in log)
+
+
+def test_it_falls_through_to_a_session_start():
+    """A session START is the one mechanism observed to work -- it is what a
+    human opening the CLI does."""
+    log, ran, bounced = [], [], []
+    k = _keeper(expiry=1000.0 + 60, mtimes=[10, 10, 12], log=log, ran=ran, bounced=bounced)
+    assert k.step(1000.0) is True
+    assert bounced == [1]
+    assert any("mail drop restart: renewed" in m for m in log)
+
+
+def test_an_already_expired_token_takes_the_same_ladder():
+    """"Before it dies" and "it is already dead" are the same question asked at
+    different times; a negative margin must not skip the fix."""
+    ran = []
+    k = _keeper(expiry=1000.0 - 3600, mtimes=[10, 11], ran=ran)
+    assert k.step(1000.0) is True
+    assert ran == [("auth", "status")]
+
+
+def test_it_does_not_hammer():
+    """Every rung spends something -- a process, a session, a turn. One ladder
+    per TOKEN_RETRY_S, however often the supervisor ticks."""
+    ran = []
+    k = _keeper(expiry=1000.0 + 60, mtimes=[10, 10, 10, 10], ran=ran)
+    k.step(1000.0)
+    before = len(ran)
+    k.step(1000.0 + TOKEN_RETRY_S - 1)
+    assert len(ran) == before
+    k.last_try = 0.0                          # as if the window had passed
+    k.step(1000.0 + TOKEN_RETRY_S + 1)
+    assert len(ran) > before
+
+
+def test_a_rung_that_raises_does_not_end_the_ladder():
+    """The point of a ladder is that a broken rung is survivable."""
+    log, bounced = [], []
+    def boom(args, timeout=60):
+        raise OSError("claude not found")
+    k = TokenKeeper(expiry=lambda: 1060.0, mtime=iter([10, 12]).__next__,
+                    run=boom, bounce=lambda: bounced.append(1) or True,
+                    log_fn=log.append, now_fn=lambda: 1000.0,
+                    sleep_fn=lambda s: None)
+    assert k.step(1000.0) is True
+    assert bounced == [1]
+
+
+def test_an_unreadable_credentials_file_leaves_it_idle():
+    """Total by construction: this runs on the supervisor thread, and a keeper
+    that raises takes the fleet and mail drop watchers down with it."""
+    ran = []
+    k = TokenKeeper(expiry=lambda: None, mtime=lambda: None,
+                    run=lambda a, timeout=60: ran.append(a) or True,
+                    bounce=lambda: True, now_fn=lambda: 1000.0,
+                    sleep_fn=lambda s: None)
+    assert k.step(1000.0) is False
+    assert ran == []

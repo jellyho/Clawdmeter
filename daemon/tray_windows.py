@@ -19,6 +19,7 @@ Usage::
 Run: python -m pytest daemon/tests/test_windows_tray.py -x -q
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -229,6 +230,148 @@ def _fleet_is_alive(now=None) -> bool:
     return fleet.is_alive(now=now)
 
 
+# ---------------------------------------------------------------------------
+# TokenKeeper — keep the OAuth token alive before it dies, not after
+# ---------------------------------------------------------------------------
+#
+# THE PROBLEM, seen three times on this desk. The daemon never refreshes the
+# token itself, on purpose: refreshing is Claude Code's job, and racing its
+# rotation is how you feed the OAuth endpoint a 429. It just re-reads
+# ~/.claude/.credentials.json every cycle. But the access token lives eight
+# hours and Claude Code only refreshes it WHEN IT RUNS -- so a night without
+# touching the CLI leaves the panel showing "No data" until a human opens a
+# session. Merely HAVING a session up does not help: the mail drop was alive
+# through every one of those outages.
+#
+# So something has to use Claude Code on a schedule. This is that something,
+# and it runs BEFORE expiry rather than after a 401, so the panel never goes
+# blank in the first place.
+#
+# WHY A LADDER. What actually triggers a refresh can only be observed while the
+# token is near expiry -- with a fresh one, nothing refreshes anything, so no
+# amount of testing today settles it (`claude auth status` provably does NOT
+# touch the file when the token is healthy). Rather than guess, it tries the
+# cheapest thing first and checks whether the credentials file was rewritten:
+#
+#   1. `claude auth status`   free, no session, no quota
+#   2. restart the mail drop  a session START, which is what a human opening
+#                             the CLI does -- the one mechanism known to work
+#   3. `claude -p`            an actual API call; certain, costs a few tokens
+#
+# It stops at the first rung that moves the file's mtime and says which one it
+# was, so the log answers the question this code could not.
+TOKEN_LEAD_S = 30 * 60      # start trying this long before expiry
+TOKEN_RETRY_S = 10 * 60     # never hammer: one ladder run per this interval
+TOKEN_SETTLE_S = 3.0        # how long to wait for a rung to rewrite the file
+
+
+def _credentials_path():
+    return os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
+
+
+def _token_expiry(path=None):
+    """Epoch seconds the access token dies, or None if unreadable.
+
+    Total: a credentials file that is missing, half-written or shaped
+    differently must leave the keeper idle, never raise into the supervisor
+    thread.
+    """
+    try:
+        with open(path or _credentials_path(), "r", encoding="utf-8-sig") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    o = doc.get("claudeAiOauth") if isinstance(doc, dict) else None
+    o = o if isinstance(o, dict) else (doc if isinstance(doc, dict) else {})
+    exp = o.get("expiresAt")
+    if not isinstance(exp, (int, float)):
+        return None
+    return exp / 1000.0 if exp > 1e11 else float(exp)
+
+
+def _credentials_mtime(path=None):
+    try:
+        return os.path.getmtime(path or _credentials_path())
+    except OSError:
+        return None
+
+
+def _run_claude(args, timeout=60):
+    """Run the CLI windowless. True when it exited 0."""
+    import daemon.clawdmeter_report as report
+    argv = [report.claude_bin()] + list(args)
+    kwargs = {"capture_output": True, "text": True, "timeout": timeout,
+              "encoding": "utf-8", "errors": "replace"}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        return subprocess.run(argv, **kwargs).returncode == 0
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+
+class TokenKeeper:
+    """Nudge Claude Code into refreshing its token before the panel notices."""
+
+    def __init__(self, expiry=None, mtime=None, run=None, bounce=None,
+                 log_fn=None, now_fn=time.time, sleep_fn=time.sleep):
+        self._expiry = expiry or _token_expiry
+        self._mtime = mtime or _credentials_mtime
+        self._run = run or _run_claude
+        self._bounce = bounce or self._default_bounce
+        self._log = log_fn or (lambda msg: None)
+        self._now = now_fn
+        self._sleep = sleep_fn
+        self.last_try = 0.0
+
+    @staticmethod
+    def _default_bounce():
+        """Start a mail drop, which is a Claude Code session START."""
+        import daemon.clawdmeter_report as report
+        name = report.maildrop_from_config()
+        rec, _action, _why = report.ensure_maildrop(name, create=True)
+        return rec is not None
+
+    def _rungs(self):
+        return (("auth status", lambda: self._run(["auth", "status"], 60)),
+                ("mail drop restart", self._bounce),
+                ("one-shot", lambda: self._run(
+                    ["-p", "ok", "--model", "claude-haiku-4-5-20251001"], 120)))
+
+    def step(self, now=None):
+        """One check. True when a rung actually refreshed the token."""
+        now = self._now() if now is None else now
+        try:
+            exp = self._expiry()
+            if exp is None or exp - now > TOKEN_LEAD_S:
+                return False                      # plenty of life left
+            if now - self.last_try < TOKEN_RETRY_S:
+                return False
+            self.last_try = now
+
+            before = self._mtime()
+            left = int(max(0, exp - now))
+            self._log(f"Token expires in {left}s — nudging Claude Code to renew it")
+            for name, rung in self._rungs():
+                try:
+                    rung()
+                except Exception as e:            # a rung must not end the ladder
+                    self._log(f"  {name}: failed ({e!r})")
+                    continue
+                self._sleep(TOKEN_SETTLE_S)
+                after = self._mtime()
+                if after is not None and after != before:
+                    self._log(f"  {name}: renewed the token")
+                    return True
+                self._log(f"  {name}: no change")
+            self._log("Token not renewed — the panel will show no data until "
+                      "a Claude Code session runs")
+            return False
+        except Exception as e:                    # same guard as the supervisor
+            self._log(f"TokenKeeper error: {e!r}")
+            return False
+
+
 def _maildrop_autostart_enabled() -> bool:
     """Armed only when the owner asked for a mail drop to be kept up.
 
@@ -423,11 +566,14 @@ def main() -> None:
                           is_enabled=_maildrop_autostart_enabled,
                           is_alive=_maildrop_is_alive,
                           launch=launch_maildrop)
+    # Nothing else on this machine keeps the OAuth token alive overnight.
+    token_keeper = TokenKeeper(log_fn=daemon_log)
 
     def _run_fleet_supervisor() -> None:
         while not _quit_requested.wait(timeout=FLEET_CHECK_S):
             fleet_sup.step()
             drop_sup.step()
+            token_keeper.step()
 
     threading.Thread(target=_run_fleet_supervisor, daemon=True).start()
 

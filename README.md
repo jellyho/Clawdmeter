@@ -9,8 +9,6 @@ busier when your usage rate climbs. It also shows the Claude Code sessions that
 need you — including agents on other machines — and lets you answer them from
 the panel.
 
-<img width="1179" height="994" alt="Usage meter" src="https://github.com/user-attachments/assets/83e54aea-0932-428f-94aa-b3ede3a360aa" />
-
 ## Screens
 
 Screens are tabs. **Swipe horizontally to move between them** — left for the next tab, right for the previous, wrapping at both ends. On the splash and usage screens a tap still flips between the two; the sessions and settings tabs are read and tapped instead, so you swipe off those.
