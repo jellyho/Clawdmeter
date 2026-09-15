@@ -7,9 +7,13 @@ patch("daemon.autostart_windows.winreg", ...) so they run on any platform.
 
 Run: python -m pytest daemon/tests/test_windows_autostart.py -x -q
 """
+import os
+import sys
 from unittest.mock import MagicMock, patch, call
 
 import pytest
+
+import daemon.autostart_windows as autostart
 
 
 # ---------------------------------------------------------------------------
@@ -316,3 +320,70 @@ def test_the_poller_uses_a_name_of_its_own():
     import daemon.clawdmeter_fleet as fleet
     import daemon.tray_windows as tray
     assert fleet.SINGLETON_MUTEX_NAME != tray._SINGLETON_MUTEX_NAME
+
+
+# ---------------------------------------------------------------------------
+# The Startup folder — the Run values did not fire, twice
+# ---------------------------------------------------------------------------
+
+def test_the_startup_folder_is_a_second_way_in(monkeypatch, tmp_path):
+    """The Run values are present and marked enabled in StartupApproved, and
+    across two reboots nothing launched and nothing was logged. This is a
+    different mechanism with the same reach, and both firing is harmless --
+    every one of these processes holds a single-instance mutex."""
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        # Pretend PowerShell created the file, which is what the caller checks.
+        cmd = argv[-1]
+        path = cmd.split("CreateShortcut('")[1].split("')")[0]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "wb").close()
+        return type("P", (), {"returncode": 0})()
+
+    done = autostart.enable_startup_folder(runner=fake_run)
+    assert done == ["Clawdmeter", "Clawdmeter Fleet"]
+    assert autostart.startup_folder_state() == {
+        "Clawdmeter": True, "Clawdmeter Fleet": True}
+    # PowerShell, not pywin32: it is absent from both interpreters here and is
+    # not a dependency of this project.
+    assert calls and calls[0][0] == "powershell"
+
+
+def test_a_shortcut_points_at_the_base_interpreter(monkeypatch, tmp_path):
+    """Same rule the Run value follows and for the same field bug: the venv's
+    pythonw is a redirector that re-launches the CONSOLE build and pops a black
+    window at logon (SC#1)."""
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["cmd"] = argv[-1]
+        return type("P", (), {"returncode": 0})()
+
+    autostart.enable_startup_folder(
+        shortcuts={"Clawdmeter": "tray_windows.py"}, runner=fake_run)
+    assert os.path.join(sys.base_exec_prefix, "pythonw.exe") in seen["cmd"]
+    assert "tray_windows.py" in seen["cmd"]
+    assert ".venv" not in seen["cmd"]
+
+
+def test_removing_the_shortcuts_is_idempotent(monkeypatch, tmp_path):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    os.makedirs(autostart.startup_dir(), exist_ok=True)
+    open(autostart.shortcut_path("Clawdmeter"), "wb").close()
+    assert autostart.disable_startup_folder() == 1
+    assert autostart.disable_startup_folder() == 0
+    assert autostart.startup_folder_state()["Clawdmeter"] is False
+
+
+def test_a_powershell_that_will_not_run_is_reported_not_raised(monkeypatch, tmp_path):
+    """Autostart setup must not take the installer down with it."""
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+
+    def boom(argv, **kw):
+        raise OSError("powershell missing")
+
+    assert autostart.enable_startup_folder(runner=boom) == []

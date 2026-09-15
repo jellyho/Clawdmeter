@@ -113,14 +113,20 @@ Log "Dependencies installed"
 # RESEARCH Anti-Pattern).
 $TrayScript = Join-Path $RepoRoot "daemon\tray_windows.py"
 
-Log "Registering autostart (HKCU\Software\Microsoft\Windows\CurrentVersion\Run) ..."
-# Invoke the autostart helper via the just-created venv python so sys.executable
-# resolves to the venv's pythonw.exe (the path that will be written to the registry).
+Log "Registering autostart (Run value + Startup folder) ..."
+# BOTH mechanisms, deliberately. The Run value is correct and marked enabled in
+# StartupApproved, and on one machine it silently did not fire across two
+# reboots -- nothing launched, nothing logged, and no trail to chase because
+# the failure happens before any of our code runs. The Startup folder is a
+# second way in that needs no elevation (a Scheduled Task is refused without
+# it) and is a file the owner can see and delete. Both firing is harmless:
+# every one of these processes holds a single-instance mutex.
 & $PythonExe -c @"
 import sys, os
 sys.path.insert(0, r'$RepoRoot')
 import daemon.autostart_windows as a
 a.enable(tray_script=r'$TrayScript')
+print('startup folder:', a.enable_startup_folder())
 "@
 if ($LASTEXITCODE -ne 0) { throw "Autostart registration failed (exit $LASTEXITCODE)" }
 Log "Autostart registered - Clawdmeter will launch automatically at next logon"

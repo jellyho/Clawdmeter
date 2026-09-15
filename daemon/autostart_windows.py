@@ -36,6 +36,7 @@ than in any single process:
 """
 
 import os
+import subprocess
 import sys
 import time
 
@@ -252,6 +253,115 @@ def is_fleet_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 _ERROR_ALREADY_EXISTS = 183
+
+
+# ---------------------------------------------------------------------------
+# The Startup folder — a second, independent way in
+# ---------------------------------------------------------------------------
+#
+# WHY THERE ARE TWO. The HKCU Run values above are correct, present, and marked
+# enabled in StartupApproved -- and on this machine they did not run. Twice,
+# across two reboots, nothing launched and nothing was logged: the tray never
+# reached its first log line. The same command run by hand from
+# C:\Windows\System32 -- the working directory a logon launch gets -- starts
+# and connects fine, so neither the scripts nor the cwd is the problem.
+#
+# Whatever the cause, a Run value that silently does not fire leaves no trail:
+# there is no console under pythonw, and the failure happens before any of our
+# code can log. The Startup FOLDER is a different mechanism with the same reach
+# and two advantages -- it needs no elevation (a Scheduled Task does on this
+# box; `schtasks /Create` answers "Access is denied") and it is a file the
+# owner can see, open and delete without a registry editor.
+#
+# Belt and braces on purpose. Both firing is harmless: each of these processes
+# holds a single-instance mutex (acquire_single_instance below), so a second
+# copy exits silently instead of becoming a second producer.
+_SHORTCUTS = {
+    "Clawdmeter": "tray_windows.py",
+    "Clawdmeter Fleet": "clawdmeter_fleet.py",
+}
+
+
+def startup_dir() -> str:
+    """The per-user Startup folder. Windows runs everything in it at logon."""
+    base = os.environ.get("APPDATA") or os.path.join(
+        os.path.expanduser("~"), "AppData", "Roaming")
+    return os.path.join(base, "Microsoft", "Windows", "Start Menu",
+                        "Programs", "Startup")
+
+
+def shortcut_path(label: str) -> str:
+    return os.path.join(startup_dir(), f"{label}.lnk")
+
+
+def _script_path(script: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), script)
+
+
+def _write_shortcut(path: str, target: str, args: str, workdir: str,
+                    runner=None) -> bool:
+    """Create one .lnk. True on success.
+
+    Shells out to PowerShell rather than importing win32com: pywin32 is not a
+    dependency of this project and is absent from both interpreters here, while
+    PowerShell is on every Windows box. A .lnk rather than a .cmd because a
+    batch file flashes a console at logon even when what it launches is
+    windowless -- the exact thing D-08 exists to prevent.
+    """
+    ps = (
+        "$w = New-Object -ComObject WScript.Shell; "
+        f"$s = $w.CreateShortcut('{path}'); "
+        f"$s.TargetPath = '{target}'; "
+        f"$s.Arguments = '{args}'; "
+        f"$s.WorkingDirectory = '{workdir}'; "
+        "$s.Save()"
+    )
+    runner = subprocess.run if runner is None else runner
+    kwargs = {"capture_output": True, "text": True, "timeout": 60}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = runner(["powershell", "-NoProfile", "-NonInteractive",
+                       "-Command", ps], **kwargs)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(proc, "returncode", 1) == 0
+
+
+def enable_startup_folder(shortcuts=None, runner=None) -> list:
+    """Write the Startup shortcuts. Returns the labels actually written.
+
+    Overwrites unconditionally, so this doubles as the repair for a shortcut
+    left pointing at a checkout that has since moved.
+    """
+    os.makedirs(startup_dir(), exist_ok=True)
+    pythonw = os.path.join(sys.base_exec_prefix, "pythonw.exe")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    done = []
+    for label, script in (shortcuts or _SHORTCUTS).items():
+        if _write_shortcut(shortcut_path(label), pythonw,
+                           f'"{_script_path(script)}"', repo, runner):
+            done.append(label)
+    return done
+
+
+def disable_startup_folder(shortcuts=None) -> int:
+    """Remove the shortcuts. Returns how many were actually there."""
+    gone = 0
+    for label in (shortcuts or _SHORTCUTS):
+        try:
+            os.remove(shortcut_path(label))
+            gone += 1
+        except OSError:
+            pass
+    return gone
+
+
+def startup_folder_state(shortcuts=None) -> dict:
+    """{label: present?} -- the two are independent, and "half installed" is a
+    state somebody debugging this needs to be able to see."""
+    return {label: os.path.exists(shortcut_path(label))
+            for label in (shortcuts or _SHORTCUTS)}
 
 
 def acquire_single_instance(name: str):
