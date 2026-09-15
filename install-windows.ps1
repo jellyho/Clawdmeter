@@ -126,7 +126,7 @@ import sys, os
 sys.path.insert(0, r'$RepoRoot')
 import daemon.autostart_windows as a
 a.enable(tray_script=r'$TrayScript')
-print('startup folder:', a.enable_startup_folder())
+print('startup folder:', a.sync_startup_folder())
 "@
 if ($LASTEXITCODE -ne 0) { throw "Autostart registration failed (exit $LASTEXITCODE)" }
 Log "Autostart registered - Clawdmeter will launch automatically at next logon"

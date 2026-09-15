@@ -333,6 +333,10 @@ def enable_startup_folder(shortcuts=None, runner=None) -> list:
 
     Overwrites unconditionally, so this doubles as the repair for a shortcut
     left pointing at a checkout that has since moved.
+
+    Callers normally want sync_startup_folder() instead: this one writes what
+    it is told, and the fleet poller is an OPT-IN that must never be switched
+    on as a side effect of installing the tray.
     """
     os.makedirs(startup_dir(), exist_ok=True)
     pythonw = os.path.join(sys.base_exec_prefix, "pythonw.exe")
@@ -362,6 +366,32 @@ def startup_folder_state(shortcuts=None) -> dict:
     state somebody debugging this needs to be able to see."""
     return {label: os.path.exists(shortcut_path(label))
             for label in (shortcuts or _SHORTCUTS)}
+
+
+def sync_startup_folder(runner=None) -> dict:
+    """Make the Startup folder MIRROR the Run values. Returns what changed.
+
+    The rule is the whole design: the folder never decides anything on its own,
+    it only carries out what the Run values already say. So installing the tray
+    cannot switch on the fleet poller, turning the poller off removes its
+    shortcut too, and there is exactly one place -- the Run values -- where
+    "is this enabled" is answered.
+
+    Idempotent, and it REWRITES rather than skips what is already there, which
+    makes it the repair for a shortcut pointing at a checkout that has moved.
+    Safe to call on every tray start, which is what makes autostart self-
+    healing rather than something an owner has to re-run an installer for.
+    """
+    want = {}
+    if is_enabled():
+        want["Clawdmeter"] = "tray_windows.py"
+    if is_fleet_enabled():
+        want["Clawdmeter Fleet"] = "clawdmeter_fleet.py"
+
+    stale = [label for label in _SHORTCUTS if label not in want]
+    removed = disable_startup_folder(stale) if stale else 0
+    written = enable_startup_folder(want, runner) if want else []
+    return {"written": written, "removed": removed}
 
 
 def acquire_single_instance(name: str):

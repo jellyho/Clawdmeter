@@ -387,3 +387,63 @@ def test_a_powershell_that_will_not_run_is_reported_not_raised(monkeypatch, tmp_
         raise OSError("powershell missing")
 
     assert autostart.enable_startup_folder(runner=boom) == []
+
+
+def _fake_ps(calls):
+    """A PowerShell stand-in that actually creates the file it is told to."""
+    def run(argv, **kw):
+        calls.append(argv)
+        path = argv[-1].split("CreateShortcut('")[1].split("')")[0]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "wb").close()
+        return type("P", (), {"returncode": 0})()
+    return run
+
+
+def test_the_folder_mirrors_the_run_values(monkeypatch, tmp_path):
+    """The rule that makes this safe: the folder never decides anything, it
+    carries out what the Run values already say. Installing the tray must not
+    switch on the fleet poller, which is a separate opt-in."""
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(autostart, "is_enabled", lambda: True)
+    monkeypatch.setattr(autostart, "is_fleet_enabled", lambda: False)
+    calls = []
+    out = autostart.sync_startup_folder(runner=_fake_ps(calls))
+    assert out["written"] == ["Clawdmeter"]
+    assert autostart.startup_folder_state() == {
+        "Clawdmeter": True, "Clawdmeter Fleet": False}
+
+
+def test_turning_the_poller_off_takes_its_shortcut_with_it(monkeypatch, tmp_path):
+    """Otherwise the folder would keep restarting something the owner turned
+    off in the one place that is supposed to answer that question."""
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    os.makedirs(autostart.startup_dir(), exist_ok=True)
+    open(autostart.shortcut_path("Clawdmeter Fleet"), "wb").close()
+    monkeypatch.setattr(autostart, "is_enabled", lambda: True)
+    monkeypatch.setattr(autostart, "is_fleet_enabled", lambda: False)
+    out = autostart.sync_startup_folder(runner=_fake_ps([]))
+    assert out["removed"] == 1
+    assert autostart.startup_folder_state()["Clawdmeter Fleet"] is False
+
+
+def test_syncing_rewrites_rather_than_skips(monkeypatch, tmp_path):
+    """It is the repair for a shortcut left pointing at a checkout that moved,
+    so "already there" is not a reason to leave it alone."""
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    os.makedirs(autostart.startup_dir(), exist_ok=True)
+    open(autostart.shortcut_path("Clawdmeter"), "wb").close()
+    monkeypatch.setattr(autostart, "is_enabled", lambda: True)
+    monkeypatch.setattr(autostart, "is_fleet_enabled", lambda: False)
+    calls = []
+    autostart.sync_startup_folder(runner=_fake_ps(calls))
+    assert calls, "an existing shortcut must still be rewritten"
+
+
+def test_nothing_enabled_writes_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(autostart, "is_enabled", lambda: False)
+    monkeypatch.setattr(autostart, "is_fleet_enabled", lambda: False)
+    calls = []
+    out = autostart.sync_startup_folder(runner=_fake_ps(calls))
+    assert out["written"] == [] and calls == []

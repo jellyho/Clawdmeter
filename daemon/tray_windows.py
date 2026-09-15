@@ -512,6 +512,20 @@ def main() -> None:
     from daemon.claude_usage_daemon_windows import main as daemon_main, log as daemon_log
     from daemon.icon_assets import load_logo_rgba, build_state_icons
 
+    # Make sure we come back next logon. The Run value alone stopped firing on
+    # one machine -- twice, with nothing launched and nothing logged -- so the
+    # Startup folder shadows it, and reconciling here means a moved checkout or
+    # a shortcut somebody deleted repairs itself the next time the tray runs,
+    # rather than waiting for an installer nobody re-runs. Mirrors the Run
+    # values and decides nothing itself, so it cannot switch the fleet poller
+    # on behind the owner's back.
+    try:
+        _synced = autostart.sync_startup_folder()
+        if _synced["written"] or _synced["removed"]:
+            daemon_log(f"Autostart shortcuts synced: {_synced}")
+    except Exception as _e:          # never block startup over housekeeping
+        daemon_log(f"Could not sync autostart shortcuts: {_e!r}")
+
     # Build per-state icons once at startup; swap icon.icon per tick (never recomposite).
     base = load_logo_rgba(os.path.join(_REPO_ROOT, "firmware", "src", "logo.h"))
     images = build_state_icons(base)
