@@ -107,6 +107,11 @@ DISMISS_TTL = 3600.0    # matches fleet.DISMISS_TTL_S
 DISMISS_KEEP = 64       # the panel shows six rows; this is generous
 
 API_URL = "https://api.anthropic.com/v1/messages"
+# The plan-limits endpoint Claude Code's /usage screen reads: per-limit
+# percentages and reset times as JSON, including the model-scoped weekly
+# limits the response headers do not carry. A GET, so polling it spends no
+# quota. poll_api tries it first and falls back to the headers of API_URL.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 API_HEADERS_TEMPLATE = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20",
@@ -262,7 +267,125 @@ def add_clock_fields(payload: dict) -> None:
     payload["tf"] = tf
 
 
+def _iso_reset_minutes(iso: str | None, now: float) -> int:
+    """Minutes until an ISO-8601 reset time; 0 when missing, past or garbage."""
+    if not iso:
+        return 0
+    try:
+        ts = datetime.datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return 0
+    mins = (ts - now) / 60.0
+    return int(round(mins)) if mins > 0 else 0
+
+
+def _limit_pct(limit: dict) -> int:
+    try:
+        return max(0, min(100, int(round(float(limit.get("percent") or 0)))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _scope_name(limit: dict) -> str:
+    """The display name of a scoped limit ("Fable"), or "" when it has none."""
+    scope = limit.get("scope") or {}
+    model = scope.get("model") or {}
+    name = model.get("display_name") or (scope.get("surface") or {}).get("display_name") or ""
+    return str(name).strip()
+
+
+def usage_payload_from_limits(body: dict, now: float | None = None) -> dict | None:
+    """Map the /api/oauth/usage body onto the device's two gauges.
+
+    Since the 5-hour window went away, a plan carries one weekly limit over
+    everything (`weekly_all`) and weekly limits scoped to one model
+    (`weekly_scoped`, today Fable). Slot 1 is the all-models week, slot 2 the
+    first model-scoped week; each slot names itself on the wire (`l1`/`l2`,
+    tags `t1`/`t2`) so the firmware stops hardcoding "Current"/"Weekly" and a
+    renamed model needs no reflash. No scoped limit -> slot 2 is left out and
+    the device hides it. `sw` is slot 1's window in minutes, which rescales the
+    usage-rate tiers (a week fills 33.6x slower than five hours did).
+
+    Returns None when the body has no weekly limit at all, so the caller falls
+    back to the header poll (and its Enterprise handling).
+    """
+    if now is None:
+        now = time.time()
+    limits = body.get("limits") if isinstance(body, dict) else None
+    if not isinstance(limits, list):
+        return None
+    weekly = next((l for l in limits if isinstance(l, dict) and l.get("kind") == "weekly_all"), None)
+    if weekly is None:
+        return None
+    payload = {
+        "s": _limit_pct(weekly),
+        "sr": _iso_reset_minutes(weekly.get("resets_at"), now),
+        "st": "limited" if _limit_pct(weekly) >= 100 else "allowed",
+        "acct": "pro",
+        "l1": "Weekly",
+        "t1": "7d",
+        "sw": 7 * 24 * 60,
+        "ok": True,
+    }
+    scoped = next((l for l in limits if isinstance(l, dict)
+                   and l.get("kind") == "weekly_scoped" and _scope_name(l)), None)
+    if scoped is not None:
+        name = _scope_name(scoped)[:11]   # firmware label field is 12 B
+        payload["w"] = _limit_pct(scoped)
+        payload["wr"] = _iso_reset_minutes(scoped.get("resets_at"), now)
+        payload["l2"] = name
+        payload["t2"] = name[:1].upper()
+    return payload
+
+
+async def poll_usage(token: str) -> dict | None:
+    """GET the plan-limits endpoint Claude Code's /usage reads.
+
+    Costs no quota (the header poll spends a Haiku message every tick).
+    Raises AuthError on 401/403 like poll_api; returns None on anything else
+    that is not a usable body, so poll_api can fall back to the headers.
+    """
+    headers = {
+        "anthropic-beta": API_HEADERS_TEMPLATE["anthropic-beta"],
+        "User-Agent": API_HEADERS_TEMPLATE["User-Agent"],
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            resp = await http.get(USAGE_URL, headers=headers)
+    except httpx.HTTPError as e:
+        log(f"usage endpoint failed: {e}")
+        return None
+    if resp.status_code in (401, 403):
+        log(f"usage endpoint HTTP {resp.status_code}: {resp.text[:200]}")
+        raise AuthError(resp.status_code)
+    if resp.status_code != 200:
+        log(f"usage endpoint HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        log("usage endpoint returned non-JSON")
+        return None
+    payload = usage_payload_from_limits(body)
+    if payload is None:
+        return None
+    add_chime_field(payload)
+    add_clock_fields(payload)
+    return payload
+
+
 async def poll_api(token: str) -> dict | None:
+    """One usage sample: the limits endpoint first, the rate-limit headers if
+    that is unavailable (old plans, Enterprise, the endpoint refusing)."""
+    payload = await poll_usage(token)
+    if payload is not None:
+        return payload
+    return await poll_headers(token)
+
+
+async def poll_headers(token: str) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
     try:
@@ -309,6 +432,21 @@ async def poll_api(token: str) -> dict | None:
             "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
             "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
             "acct": "pro",
+            "ok": True,
+        }
+    elif resp.headers.get("anthropic-ratelimit-unified-7d-utilization"):
+        # No 5-hour window any more: the week is the only limit the headers
+        # carry (model-scoped weeks are only on USAGE_URL). One gauge, named.
+        # Without this branch a Pro/Max account fell into the Enterprise one
+        # below and showed a "Spending" gauge reading a header it never gets.
+        payload = {
+            "s": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
+            "sr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
+            "st": hdr("anthropic-ratelimit-unified-7d-status", "unknown"),
+            "acct": "pro",
+            "l1": "Weekly",
+            "t1": "7d",
+            "sw": 7 * 24 * 60,
             "ok": True,
         }
     else:

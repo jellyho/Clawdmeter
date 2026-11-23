@@ -1,11 +1,27 @@
 #pragma once
 #include <Arduino.h>
 
+// Two gauges, and the host names them. The field names below are the wire's
+// history: slot 1 was the 5-hour session and slot 2 the week. Claude dropped
+// the 5-hour window, so a current host fills slot 1 with the all-models week
+// and slot 2 with a model-scoped week (today "Fable"), and says so in
+// l1/l2/t1/t2. A host that sends no labels is the old one, and gets the old
+// names. `sw` is slot 1's window length, which the usage-rate tiers scale by.
+#define USAGE_LABEL_MAX 12
+#define USAGE_TAG_MAX   4
+#define USAGE_LEGACY_WINDOW_MINS 300
+
 struct UsageData {
-    float session_pct;       // utilization 0-100 (5h window Pro/Max; spending % Enterprise)
-    int session_reset_mins;  // minutes until reset
-    float weekly_pct;        // 7-day utilization (Pro/Max only; 0 for Enterprise)
-    int weekly_reset_mins;   // minutes until weekly reset (Pro/Max only)
+    float session_pct;       // slot 1, 0-100: all-models week (was the 5h window); spending % Enterprise
+    int session_reset_mins;  // minutes until slot 1 resets
+    float weekly_pct;        // slot 2, 0-100: model-scoped week (was the 7-day); 0 for Enterprise
+    int weekly_reset_mins;   // minutes until slot 2 resets
+    bool has_slot2;          // false when the host sent no slot 2 ("w" absent) -> hidden
+    int  window_mins;        // slot 1's window ("sw"); USAGE_LEGACY_WINDOW_MINS when absent
+    char label1[USAGE_LABEL_MAX];   // panel title, slot 1 ("l1", default "Current")
+    char label2[USAGE_LABEL_MAX];   // panel title, slot 2 ("l2", default "Weekly")
+    char tag1[USAGE_TAG_MAX];       // quota-strip tag, slot 1 ("t1", default "5h")
+    char tag2[USAGE_TAG_MAX];       // quota-strip tag, slot 2 ("t2", default "7d")
     char status[16];         // "allowed", "limited", etc.
     bool chime;              // play the session-reset chime; false unless daemon opts in
     bool enterprise;         // true = Enterprise spending-limit account

@@ -381,7 +381,19 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 
 ## Daemon / host side
 
-Bash daemon (`daemon/claude-usage-daemon.sh`) reads OAuth token, polls Anthropic API, sends JSON over BLE GATT. Run with `systemctl --user start claude-usage-daemon`. The unit file's `ExecStart` is the absolute path to the script — repoint it when switching between the worktree and the main checkout.
+Bash daemon (`daemon/claude-usage-daemon.sh`) reads OAuth token, polls Anthropic API, sends JSON over BLE GATT.
+
+**The 5-hour window is gone (2026-11).** Plans now have a weekly limit over
+all models plus weekly limits scoped to one model (Fable). The Windows daemon
+reads them from `GET /api/oauth/usage` (the endpoint Claude Code's `/usage`
+reads; its `limits` list has `weekly_all` + `weekly_scoped`, and it spends no
+quota) and falls back to the rate-limit headers, which now carry only `7d-*`.
+The two gauges keep their wire keys (`s`/`sr` = all-models week, `w`/`wr` =
+scoped week) but the host now names them: `l1`/`l2` panel titles, `t1`/`t2`
+strip tags, `sw` = slot-1 window in minutes (rescales the usage-rate tiers).
+No `w` → the firmware hides slot 2. Missing labels → old names ("Current"/
+"Weekly"), so an old host still reads right. The macOS / bash daemons are
+still on the header path and have not been moved over. Run with `systemctl --user start claude-usage-daemon`. The unit file's `ExecStart` is the absolute path to the script — repoint it when switching between the worktree and the main checkout.
 
 **Session rows and agent reports:** `daemon/FLEET.md` covers the remote-fleet
 poll and the cross-session message inbox; `daemon/REPORT.md` covers **agent

@@ -13,7 +13,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from daemon.claude_usage_daemon_windows import AuthError, poll_api
+from daemon.claude_usage_daemon_windows import AuthError
+from daemon.claude_usage_daemon_windows import poll_headers as poll_api  # the header path; the limits endpoint has its own tests (test_windows_usage.py)
 
 
 # ---------------------------------------------------------------------------

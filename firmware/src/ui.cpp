@@ -656,7 +656,7 @@ static void update_session_view(void);     // sessions-tab resolver
 // column, 10px bars, and a 14px(+4) gap down to the first card.
 #define CHAT_ROW_H        30    // strip band height; text/bar vcentered in it
 #define CHAT_ROW_BAR_H    10
-#define CHAT_ROW_LBL_W    40    // "5h"/"7d" column
+#define CHAT_ROW_LBL_W    40    // slot tag column ("7d"/"F"; "5h"/"7d" on an old host)
 #define CHAT_ROW_PCT_W    72    // percentage column (right-aligned, fixed)
 #define CHAT_ROW_COL_GAP  12    // label|bar|pct column gap
 #define CHAT_ROW_HALF_GAP 20    // between the 5h and 7d halves
@@ -680,7 +680,7 @@ static void update_session_view(void);     // sessions-tab resolver
 // which is the row the user came to this tab to read — and it is hidden
 // entirely when nothing is below the fold (chat_fade_update).
 #define CHAT_FADE_H       16
-// ONE-CHAT: two boxes — the 5h quota panel (exact RESTING "Current" panel)
+// ONE-CHAT: two boxes — the slot-1 quota panel (exact RESTING top panel)
 // on top, the chat card below it.
 
 // One chat card's widget set. Cards keep stable identity: each card widget is
@@ -2416,8 +2416,14 @@ static void session_quota_refresh(void) {
 
 
     // SEVERAL-CHATS one-line strip.
-    set_label_if_changed(cq_tag[0], d->enterprise ? "$"  : "5h");
-    set_label_if_changed(cq_tag[1], d->enterprise ? "pd" : "7d");
+    set_label_if_changed(cq_tag[0], d->enterprise ? "$"  : d->tag1);
+    set_label_if_changed(cq_tag[1], d->enterprise ? "pd" : d->tag2);
+    const bool slot2 = d->enterprise || d->has_slot2;
+    lv_obj_t* slot2_objs[] = {cq_tag[1], cq_bar[1], cq_pct[1]};
+    for (lv_obj_t* o : slot2_objs) {
+        if (slot2) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+        else       lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    }
     set_label_if_changed(cq_pct[0], pct0);
     set_label_if_changed(cq_pct[1], pct1);
     lv_bar_set_value(cq_bar[0], s_pct, LV_ANIM_OFF);
@@ -3486,12 +3492,20 @@ void ui_update(const UsageData* data) {
         if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
-        lv_label_set_text(lbl_session_label, "Current");
+        // The host names both panels (data.h): "Weekly" / "Fable" today,
+        // "Current" / "Weekly" from a host that predates the change.
+        lv_label_set_text(lbl_session_label, data->label1);
+        lv_label_set_text(lbl_weekly_label, data->label2);
         lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
-        if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
+        // No model-scoped limit on this plan → no second panel, rather than
+        // a confident 0% under a name that means nothing.
+        if (panel_weekly) {
+            if (data->has_slot2) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
+            else                 lv_obj_add_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     char buf[48];

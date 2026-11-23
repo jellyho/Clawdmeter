@@ -44,7 +44,7 @@
 #          5 Grep 6 Glob 7 Task 8 WebFetch 9 WebSearch  ·  ctx/tok -1 = unknown
 # Jump keys 1-9 reach the first nine session cases; the message, report and
 # quota blocks follow in order (step with the arrows to reach them).
-{"name":"fresh session","hold_ms":3000,"s":3.0,"sr":295,"w":12.0,"wr":9000,"st":"allowed","ok":true,"t":1785474000,"tf":24}
+{"name":"fresh week","hold_ms":3000,"s":3.0,"sr":10050,"w":1.0,"wr":10050,"st":"allowed","ok":true,"t":1785474000,"tf":24,"l1":"Weekly","t1":"7d","l2":"Fable","t2":"F","sw":10080}
 {"name":"one chat working","hold_ms":3000,"ss":[["a1","clawdmeter",4,31,8,1,1,1,0,2,5,62]]}
 {"name":"three chats busy","hold_ms":3000,"ss":[["a1","clawdmeter",2,44,3,1,0,0,1,3,6,88],["b2","raincheck-api",4,27,11,2,5,2,0,0,0,54],["c3","dotfiles",1,-1,240,3,0,0,0,0,0,-1]]}
 {"name":"needs permission","hold_ms":4000,"ss":[["b2","raincheck-api",6,52,14,2,1,1,0,1,4,104],["a1","clawdmeter",4,44,6,1,3,1,0,3,6,88],["c3","dotfiles",1,9,300,3,0,0,0,0,0,18]]}
@@ -71,10 +71,10 @@
 {"name":"stale + live mail and a report","hold_ms":5000,"ss":[["79","ORCHESTRATOR",11,-1,42,0,0,0,0,0,0,-1,-1,"can you take a look at the C6 build?"],["mp","WORKER-ALPHA",13,-1,88,0,0,0,0,0,0,-1,-1,"rebase done - force-push to main?"],["z0","FLEET DATA STALE",17,-1,33120,0,0,0,0,0,0,-1,-1,"auth expired - log in to claude"]]}
 {"name":"one remote agent needs you","hold_ms":4000,"ss":[["91","ACRFT-C-WM",6,-1,42,0,1,0,0,0,0,-1,1]]}
 {"name":"nothing needs you","hold_ms":3000,"ss":[]}
-{"name":"steady use","hold_ms":3000,"s":42.0,"sr":180,"w":33.0,"wr":7900,"st":"allowed","ok":true}
-{"name":"warning zone","hold_ms":3000,"s":78.0,"sr":75,"w":55.0,"wr":6400,"st":"allowed","ok":true}
-{"name":"maxed out","hold_ms":4000,"s":98.0,"sr":12,"w":88.0,"wr":5200,"st":"limited","ok":true}
-{"name":"session reset + chime","hold_ms":4000,"s":2.0,"sr":298,"w":88.0,"wr":5100,"st":"allowed","c":true,"ok":true}
+{"name":"steady use","hold_ms":3000,"s":42.0,"sr":6200,"w":30.0,"wr":6200,"st":"allowed","ok":true,"l1":"Weekly","t1":"7d","l2":"Fable","t2":"F","sw":10080}
+{"name":"warning zone","hold_ms":3000,"s":78.0,"sr":2900,"w":64.0,"wr":2900,"st":"allowed","ok":true,"l1":"Weekly","t1":"7d","l2":"Fable","t2":"F","sw":10080}
+{"name":"maxed out","hold_ms":4000,"s":98.0,"sr":300,"w":91.0,"wr":300,"st":"limited","ok":true,"l1":"Weekly","t1":"7d","l2":"Fable","t2":"F","sw":10080}
+{"name":"weekly reset + chime","hold_ms":4000,"s":2.0,"sr":10070,"w":0.0,"wr":10070,"st":"allowed","c":true,"ok":true,"l1":"Weekly","t1":"7d","l2":"Fable","t2":"F","sw":10080}
 {"name":"weekly nearly gone","hold_ms":3000,"s":25.0,"sr":250,"w":96.0,"wr":300,"st":"allowed","ok":true}
 {"name":"enterprise on pace","hold_ms":3000,"s":37.0,"sr":-1,"acct":"ent","tp":40,"pd":30,"rd":"Aug 15","st":"allowed","ok":true}
 {"name":"enterprise over pace","hold_ms":4000,"s":88.0,"sr":-1,"acct":"ent","tp":52,"pd":30,"rd":"Aug 15","st":"allowed","ok":true}

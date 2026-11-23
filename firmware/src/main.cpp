@@ -128,6 +128,13 @@ static bool parse_json(const char* json, UsageData* out) {
     out->session_reset_mins = doc["sr"] | -1;
     out->weekly_pct = doc["w"] | 0.0f;
     out->weekly_reset_mins = doc["wr"] | -1;
+    out->has_slot2 = !doc["w"].isNull();
+    out->window_mins = doc["sw"] | USAGE_LEGACY_WINDOW_MINS;
+    if (out->window_mins < USAGE_LEGACY_WINDOW_MINS) out->window_mins = USAGE_LEGACY_WINDOW_MINS;
+    strlcpy(out->label1, doc["l1"] | "Current", sizeof(out->label1));
+    strlcpy(out->label2, doc["l2"] | "Weekly",  sizeof(out->label2));
+    strlcpy(out->tag1,   doc["t1"] | "5h",      sizeof(out->tag1));
+    strlcpy(out->tag2,   doc["t2"] | "7d",      sizeof(out->tag2));
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->chime = doc["c"] | false;   // absent (old daemon / chime off) → stay silent
     const char* acct = doc["acct"] | "pro";
@@ -578,9 +585,11 @@ void loop() {
     if (ble_has_data()) {
         if (parse_json(ble_get_data(), &usage)) {
             int g_before = usage_rate_group();
+            usage_rate_set_window(usage.window_mins);
             bool session_reset = usage_rate_sample(usage.session_pct);
             int g_after = usage_rate_group();
-            // 5-hour session limit refilled → chime so the user knows they can
+            // Slot-1 limit refilled (the week now; the 5-hour window on an
+            // old host) → chime so the user knows they can
             // use Claude again (no-op on boards without a buzzer). Gated on the
             // daemon's opt-in `chime` config AND the on-device Sound setting —
             // either can silence it. The `buzz` serial cmd ignores both; it is
